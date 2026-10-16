@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+.runtime/
+.vscode/
+output/
+marker_detection/
+marker_debug/
+*.zip

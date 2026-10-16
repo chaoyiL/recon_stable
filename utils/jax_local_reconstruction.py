@@ -6,6 +6,7 @@ from typing import Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
+from utils.color_protection import resolve_zero_color_radii, signed_color_protection_factors
 
 Array=jax.Array
 
@@ -238,10 +239,12 @@ def lookup_slopes_jax(
     *,
     zero_color_inner_radius: float = 0.,
     zero_color_outer_radius: float = 0.,
+    zero_color_negative_inner_radius: float | None = None,
+    zero_color_negative_outer_radius: float | None = None,
     trusted_no_contact_mask: Array | None = None,
     trusted_no_contact_confidence: float = 1.,
 ) -> tuple[Array,Array,Array]:
-    """对完整 RGB LUT 作三线性查询，并在零色差附近平滑衰减坡度。"""
+    """查询 LUT；零坡度保护内区使用零坡度、置信度 1 的无接触先验。"""
     colors=jnp.asarray(color_residual,jnp.float32)
     valid=(jnp.asarray(valid_mask,jnp.bool_)
            &jnp.all(jnp.isfinite(colors),axis=-1))
@@ -275,13 +278,11 @@ def lookup_slopes_jax(
         variance=variance+weight*(
             node_variance+jnp.sum((value-slopes)**2,axis=-1))
     confidence=1/(1+variance/jnp.asarray(sigma_ref2,jnp.float32))
-    if zero_color_outer_radius>0:
-        intensity=jnp.max(jnp.abs(colors),axis=-1)
-        transition=jnp.clip(
-            (intensity-zero_color_inner_radius)/
-            (zero_color_outer_radius-zero_color_inner_radius),0,1)
-        attenuation=transition**2*(3-2*transition)
-        slopes=slopes*attenuation[...,None]
+    radii=resolve_zero_color_radii(zero_color_inner_radius, zero_color_outer_radius,
+                                    zero_color_negative_inner_radius, zero_color_negative_outer_radius)
+    attenuation,zero_slope=signed_color_protection_factors(colors, *radii, array_module=jnp)
+    slopes=slopes*attenuation[...,None]
+    confidence=jnp.where(valid & zero_slope,1.,confidence)
     slopes=jnp.where(trusted[...,None],0,slopes)
     confidence=jnp.where(
         trusted,jnp.maximum(confidence,trusted_no_contact_confidence),confidence)
@@ -540,6 +541,8 @@ def reconstruct_local_surface_jax(
     *,
     zero_color_inner_radius: float = 0.,
     zero_color_outer_radius: float = 0.,
+    zero_color_negative_inner_radius: float | None = None,
+    zero_color_negative_outer_radius: float | None = None,
     trusted_no_contact_mask: Array | None = None,
     trusted_no_contact_confidence: float = 1.,
     displacement_zero_lambda_per_mm2: float = 0.,
@@ -549,7 +552,7 @@ def reconstruct_local_surface_jax(
     spectral_initialization_iterations: int = 0,
     linear_solver: str = "lsmr",
 ) -> tuple[Array,...]:
-    """频域冷启动/上一帧优选后，以 GPU LSMR 精修法向位移。"""
+    """频域冷启动/上一帧优选后求解等权颜色方程；置信度仅供诊断。"""
     points=jnp.asarray(xyz,jnp.float32)
     colors=jnp.asarray(color_residual_grid,jnp.float32)
     valid=(jnp.asarray(valid_mask,jnp.bool_)
@@ -563,6 +566,8 @@ def reconstruct_local_surface_jax(
         valid,
         zero_color_inner_radius=zero_color_inner_radius,
         zero_color_outer_radius=zero_color_outer_radius,
+        zero_color_negative_inner_radius=zero_color_negative_inner_radius,
+        zero_color_negative_outer_radius=zero_color_negative_outer_radius,
         trusted_no_contact_mask=trusted_no_contact,
         trusted_no_contact_confidence=trusted_no_contact_confidence)
     (valid,geometry_valid,interior,normal,frame,jacobian,metric_inverse,
@@ -574,16 +579,12 @@ def reconstruct_local_surface_jax(
     curvature=jnp.einsum(
         "...ca,...ab,...b->...c",jacobian,metric_inverse,shape_parameter)
     gamma=jnp.einsum("...ca,...c->...a",frame,curvature)
-    equation_mask=geometry_valid&(confidence>0)
+    equation_mask=geometry_valid
     active_mask=interior
-    equation_weight=jnp.sqrt(jnp.maximum(area*confidence,0))*equation_mask
-    zero_displacement_weight=(
-        jnp.sqrt(jnp.maximum(
-            area*displacement_zero_lambda_per_mm2,0))
+    zero_displacement_scale=(
+        jnp.sqrt(jnp.maximum(jnp.asarray(
+            displacement_zero_lambda_per_mm2,points.dtype),0))
         *trusted_no_contact*active_mask)
-    equation_count=jnp.maximum(jnp.sum(equation_mask),1)
-    closure_weight=jnp.sqrt(
-        jnp.sum(equation_weight*equation_weight)/equation_count)
     closure_coefficients=[]
     for parity_i in (0,1):
         for parity_j in (0,1):
@@ -621,9 +622,9 @@ def reconstruct_local_surface_jax(
             gamma*active[...,None]
             +.5*k_matrix[...,0]*(right-left)[...,None]
             +.5*k_matrix[...,1]*(down-up)[...,None])
-        gradient=equation_weight[...,None]*gradient
-        zero_displacement=(zero_displacement_weight*active)[...,None]
-        closure_values=closure_weight*jnp.einsum(
+        gradient=jnp.where(equation_mask[...,None],gradient,0)
+        zero_displacement=(zero_displacement_scale*active)[...,None]
+        closure_values=jnp.einsum(
             "kij,ij->k",closure_coefficients,active)
         closure_image=jnp.zeros(
             (*displacement.shape,4),displacement.dtype).at[0,0].set(
@@ -632,25 +633,25 @@ def reconstruct_local_surface_jax(
             [gradient,zero_displacement,closure_image],axis=-1)
 
     def rmatvec(values: Array) -> Array:
-        weighted=equation_weight[...,None]*values[...,:2]
-        center=jnp.sum(weighted*gamma,axis=-1)
-        horizontal=.5*jnp.sum(weighted*k_matrix[...,0],axis=-1)
-        vertical=.5*jnp.sum(weighted*k_matrix[...,1],axis=-1)
+        gradient_values=jnp.where(equation_mask[...,None],values[...,:2],0)
+        center=jnp.sum(gradient_values*gamma,axis=-1)
+        horizontal=.5*jnp.sum(gradient_values*k_matrix[...,0],axis=-1)
+        vertical=.5*jnp.sum(gradient_values*k_matrix[...,1],axis=-1)
         horizontal_adjoint=(
             jnp.pad(horizontal[:,:-1],((0,0),(1,0)))
             -jnp.pad(horizontal[:,1:],((0,0),(0,1))))
         vertical_adjoint=(
             jnp.pad(vertical[:-1,:],((1,0),(0,0)))
             -jnp.pad(vertical[1:,:],((0,1),(0,0))))
-        zero_adjoint=zero_displacement_weight*values[...,2]
-        closure_adjoint=closure_weight*jnp.einsum(
+        zero_adjoint=zero_displacement_scale*values[...,2]
+        closure_adjoint=jnp.einsum(
             "k,kij->ij",values[0,0,3:7],closure_coefficients)
         return jnp.where(
             active_mask,center+horizontal_adjoint+vertical_adjoint
             +zero_adjoint+closure_adjoint,0)
 
     target=jnp.concatenate([
-        equation_weight[...,None]*slopes,
+        jnp.where(equation_mask[...,None],slopes,0),
         jnp.zeros((*slopes.shape[:2],1),slopes.dtype),
         jnp.zeros((*slopes.shape[:2],4),slopes.dtype)],axis=-1)
     previous_initial=jnp.where(
@@ -674,15 +675,15 @@ def reconstruct_local_surface_jax(
             matvec,rmatvec,target,initial,atol=lsmr_atol,btol=lsmr_btol,
             max_iterations=maximum)
     elif linear_solver=="spectral_pcg":
-        weight_squared=equation_weight*equation_weight
+        equation_valid=equation_mask.astype(points.dtype)
         scale_count=jnp.maximum(jnp.sum(equation_mask),1)
         horizontal_scale=.25*jnp.sum(
-            weight_squared*jnp.sum(k_matrix[...,0]**2,axis=-1))/scale_count
+            equation_valid*jnp.sum(k_matrix[...,0]**2,axis=-1))/scale_count
         vertical_scale=.25*jnp.sum(
-            weight_squared*jnp.sum(k_matrix[...,1]**2,axis=-1))/scale_count
+            equation_valid*jnp.sum(k_matrix[...,1]**2,axis=-1))/scale_count
         diagonal_shift=jnp.sum(
-            weight_squared*jnp.sum(gamma*gamma,axis=-1)
-            +zero_displacement_weight*zero_displacement_weight)/scale_count
+            equation_valid*jnp.sum(gamma*gamma,axis=-1)
+            +zero_displacement_scale*zero_displacement_scale)/scale_count
         displacement,istop,iterations,residual_norm=(
             matrix_free_spectral_pcg_jax(
                 matvec,rmatvec,target,initial,active_mask,
