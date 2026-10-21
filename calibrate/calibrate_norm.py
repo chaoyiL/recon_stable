@@ -25,11 +25,13 @@ def main():
     args = parser.parse_args()
     config_path = Path(args.config).expanduser().resolve()
     raw = load_config(config_path).get('normal_calibration')
+    
     if not isinstance(raw, dict):
         parser.error('config.yaml 缺少 normal_calibration 配置段')
     mode = 'samples' if args.input else ('images' if args.images else raw.get('input_mode', 'samples'))
     if mode not in {'images', 'samples'}:
         parser.error('normal_calibration.input_mode must be images or samples')
+
     stage = args.stage or ('all' if mode == 'images' else 'fit')
     if mode == 'samples' and stage != 'fit':
         parser.error('外部样本模式只支持 --stage fit')
@@ -49,9 +51,13 @@ def main():
             return
     if stage in {'samples', 'all'}:
         run_samples(settings)
+
     if stage in {'fit', 'all'}:
+        # 拟合最终的 lookup table
         report = fit_and_validate_samples(settings.input_file, settings)
         print(f"法向 LUT 已保存: {settings.output}；validation_status={report['status']}")
+        if report['status'] == 'passed':
+            print(f"参考采样网格已更新: {settings.work_dir/'lut_material_grid.npz'}")
 
 
 if __name__ == '__main__':

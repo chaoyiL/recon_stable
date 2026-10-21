@@ -1,48 +1,59 @@
-"""Callback-driven, three-panel OpenCV region editor. No calibration imports."""
+"""Callback-driven, three-panel region editor. No calibration imports."""
 from copy import deepcopy
 from dataclasses import asdict
-from textwrap import wrap
+from typing import Callable
 import cv2
 import numpy as np
-from utils.region_annotations import BOUNDARY_SAMPLE_COUNT, EDITOR_VERTEX_COUNT, region_boundary_points
-
-
-def _window_closed(window: str) -> bool:
-    try:
-        return cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1
-    except cv2.error as error:
-        # Qt may delete its GUI receiver when the last native window closes.
-        if error.code == cv2.Error.StsNullPtr:
-            return True
-        raise
+from utils.region_annotations import (BOUNDARY_SAMPLE_COUNT, EDITOR_VERTEX_COUNT,
+                                      RegionAnnotation, region_boundary_points)
+from utils.annotation_window import AnnotationWindow, compose_annotation_panels
 
 
 def edit_regions(regions, *, panel_callback, recompute_callback, save_callback,
-                 editable_panel: int = 0):
+                 editable_panel: int = 0, panel_widths: tuple[int, int, int] = (640, 640, 640),
+                 panel_height: int = 480,
+                 maximum_circle_radius: Callable[[RegionAnnotation], float] | None = None):
     """Edit original-pixel geometry. Return False after saving an Escape draft.
 
-    Callbacks receive the annotation. panel_callback returns three BGR images;
+    Callbacks receive the annotation. panel_callback returns three AnnotationPanel objects;
     editable_panel selects the image receiving mouse edits (0, 1 or 2). It must
     use the original image dimensions and pixel coordinates, before display scaling.
+    panel_widths and panel_height control the display space, preserving image aspect ratios.
     recompute_callback raises ValueError/RuntimeError on invalid geometry; errors
     may carry a display-only preview and a multiline display_message.
+    maximum_circle_radius supplies a positive radius limit in original pixels.
+    It is reevaluated after edits, undo and recompute, including rejected previews.
     """
     if editable_panel not in (0, 1, 2):
         raise ValueError('editable_panel must be 0, 1 or 2')
-    panel_left = 640*editable_panel
-    window = 'Contact boundary | z undo, g recompute, Enter accept, x skip, Esc draft'
-    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    panel_left = sum(panel_widths[:editable_panel])
+    window = AnnotationWindow('Contact boundary | z undo, g recompute, Enter accept, x skip, Esc draft')
     try:
         for region in regions:
             if region.shape == 'circle':
-                status = 'Circle | drag inside: move | drag edge: radius | wheel scale | c center | z undo'
+                status = 'Circle | drag inside: move | drag edge: radius | wheel: radius only | c center | z undo'
             else:
                 status = 'Drag: move/resize | p polygon | wheel scale | a/d rotate | c center | z undo'
             cached = None
             dirty = True
             history = []
             state = dict(mode=None, point=None, vertex=None, scale=1., center_mode=False,
-                         drag_before=None, drag_recorded=False)
+                         origin=(panel_left, 0), drag_before=None, drag_recorded=False)
+
+            def constrain_circle():
+                nonlocal status
+                if region.shape != 'circle' or maximum_circle_radius is None:
+                    return False
+                maximum = float(maximum_circle_radius(region))
+                if not np.isfinite(maximum) or maximum <= 0:
+                    raise ValueError('Maximum circle radius must be positive and finite')
+                if region.semi_axes_px[0] <= maximum:
+                    return False
+                region.semi_axes_px = (maximum, maximum)
+                status = f'Circle diameter limited to {2*maximum:.2f} px. g: recompute'
+                return True
+
+            constrain_circle()
 
             def stop_drag():
                 if state['drag_recorded'] and state['drag_before'] == asdict(region):
@@ -51,7 +62,9 @@ def edit_regions(regions, *, panel_callback, recompute_callback, save_callback,
 
             def record_change(before, *, dragging=False):
                 nonlocal dirty, cached, status
+                limited = constrain_circle()
                 if before == asdict(region):
+                    dirty |= limited
                     return
                 # Keep one snapshot for the whole drag, independent of mouse-event count.
                 if not dragging or not state['drag_recorded']:
@@ -59,15 +72,16 @@ def edit_regions(regions, *, panel_callback, recompute_callback, save_callback,
                     if dragging:
                         state['drag_recorded'] = True
                 dirty, cached = True, None
-                status = 'Edited. z: undo | g: recompute | Enter: accept'
+                if not limited:
+                    status = 'Edited. z: undo | g: recompute | Enter: accept'
 
             def mouse(event, x, y, flags, userdata):
                 if event == cv2.EVENT_LBUTTONUP:
                     stop_drag()
                     return
-                if not panel_left <= x < panel_left+640:
+                if not panel_left <= x < panel_left+panel_widths[editable_panel]:
                     return
-                pixel = np.array([x-panel_left, y], float)/state['scale']
+                pixel = (np.array([x, y], float)-state['origin'])/state['scale']
                 if np.any(pixel < 0) or np.any(pixel >= region.image_size):
                     return
                 if event == cv2.EVENT_LBUTTONDOWN:
@@ -119,30 +133,18 @@ def edit_regions(regions, *, panel_callback, recompute_callback, save_callback,
                         region.contour_px = (region.center_px+(np.asarray(region.contour_px)-region.center_px)*factor).tolist()
                     record_change(before)
 
-            cv2.setMouseCallback(window, mouse)
+            window.set_mouse_callback(mouse)
             while True:
                 if dirty:
                     panels = panel_callback(region, cached, status)
-                    canvas = []
-                    for i, panel in enumerate(panels):
-                        h, w = panel.shape[:2]
-                        scale = min(640/w, 480/h)
-                        if i == editable_panel:
-                            state['scale'] = scale
-                        target = np.zeros((560, 640, 3), np.uint8)
-                        resized = cv2.resize(panel, (round(w*scale), round(h*scale)))
-                        target[:resized.shape[0], :resized.shape[1]] = resized
-                        canvas.append(target)
-                    display = np.concatenate(canvas, axis=1)
-                    lines = [line for paragraph in status.splitlines()
-                             for line in (wrap(paragraph, width=180) or [''])]
-                    for i, line in enumerate(lines[:4]):
-                        cv2.putText(display, line, (8, 495+18*i), cv2.FONT_HERSHEY_SIMPLEX,
-                                    .5, (255, 255, 255), 1)
-                    cv2.imshow(window, display)
+                    display = compose_annotation_panels(
+                        panels, panel_widths, panel_height, status)
+                    state['scale'] = display.scales[editable_panel]
+                    state['origin'] = display.origins[editable_panel]
+                    window.show_image(display.image, display.labels)
                     dirty = False
-                key = cv2.waitKey(30) & 0xff
-                if key == 27 or _window_closed(window):
+                key = window.wait_key(30)
+                if key == 27 or window.is_closed:
                     region.status = 'draft'
                     save_callback()
                     return False
@@ -162,6 +164,7 @@ def edit_regions(regions, *, panel_callback, recompute_callback, save_callback,
                             setattr(region, name, deepcopy(value))
                         cached = None
                         status = 'Last edit undone. z: undo again | g: recompute'
+                        constrain_circle()
                     else:
                         status = 'No edits to undo in this image'
                     dirty = True
@@ -169,9 +172,14 @@ def edit_regions(regions, *, panel_callback, recompute_callback, save_callback,
                     print(f'{region.image}: recomputing calibration...', flush=True)
                     try:
                         cached = recompute_callback(region)
-                        status = 'Final geometry accepted. Enter saves and continues.'
+                        limited = constrain_circle()
+                        if limited:
+                            # A smaller limit changes the boundary used by the returned fit.
+                            cached = None
+                        else:
+                            status = 'Final geometry accepted. Enter saves and continues.'
                         print(f'{region.image}: {status}', flush=True)
-                        if key in (10, 13):
+                        if not limited and key in (10, 13):
                             region.status = 'accepted'
                             save_callback()
                             break
@@ -179,6 +187,10 @@ def edit_regions(regions, *, panel_callback, recompute_callback, save_callback,
                         region.status = 'draft'
                         status = getattr(exc, 'display_message', str(exc))
                         cached = getattr(exc, 'preview', None)
+                        error_message = status
+                        if constrain_circle():
+                            cached = None
+                            status = f'{error_message}\n{status}'
                         print(f'{region.image}: {status}', flush=True)
                         save_callback()
                     dirty = True
@@ -204,8 +216,5 @@ def edit_regions(regions, *, panel_callback, recompute_callback, save_callback,
                         region.contour_px = ((np.asarray(region.contour_px)-region.center_px) @ rotation.T+region.center_px).tolist()
                     record_change(before)
     finally:
-        try:
-            cv2.destroyWindow(window)
-        except cv2.error:
-            pass  # A user may already have closed the native window.
+        window.close()
     return True

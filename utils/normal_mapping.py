@@ -130,12 +130,11 @@ def build_normal_lut(
     slopes: np.ndarray,
     *,
     size: int = 64,
-    minimum_samples_per_node: int = 5,
     maximum_rms_angle_degrees: float = 5.0,
 ) -> NormalCalibration:
-    """建立完整的有符号 RGB→局部坡度三线性查找表。"""
-    color = np.asarray(colors, np.float64).reshape(-1, 3)
-    slope = np.asarray(slopes, np.float64).reshape(-1, 2)
+    """建立有符号 RGB→局部坡度 LUT；保留 MAD 后满足角度阈值的非空节点。"""
+    color = np.asarray(colors, np.float64).reshape(-1, 3) # 颜色
+    slope = np.asarray(slopes, np.float64).reshape(-1, 2) # 坡度
     if color.shape[0] != slope.shape[0]:
         raise ValueError("Color and slope sample counts differ")
     finite = np.all(np.isfinite(color), axis=1) & np.all(np.isfinite(slope), axis=1)
@@ -143,9 +142,10 @@ def build_normal_lut(
     slope = slope[finite]
     if color.shape[0] != slope.shape[0] or color.shape[0] < 1:
         raise ValueError("颜色与坡度样本必须非空且逐点对应")
-    if size < 2 or minimum_samples_per_node < 1 or maximum_rms_angle_degrees <= 0:
-        raise ValueError("LUT 尺寸、最小样本数和角度阈值必须为正")
+    if size < 2 or maximum_rms_angle_degrees <= 0:
+        raise ValueError("LUT 尺寸和角度阈值必须为正")
 
+    # 计算归一化颜色坐标
     color_min = np.minimum(np.min(color, axis=0), 0)
     color_max = np.maximum(np.max(color, axis=0), 0)
     span = color_max - color_min
@@ -163,13 +163,12 @@ def build_normal_lut(
     variance = np.zeros((size, size, size), np.float64)
     sample_counts = np.zeros((size, size, size), np.int32)
     original_valid = np.zeros((size, size, size), np.bool_)
-    maximum_rms = np.deg2rad(maximum_rms_angle_degrees)
+
+    maximum_rms = np.deg2rad(maximum_rms_angle_degrees) # 传入阈值
     starts = np.r_[0, np.flatnonzero(np.diff(flat_nodes)) + 1]
     ends = np.r_[starts[1:], flat_nodes.size]
     for start, end in zip(starts, ends, strict=True):
         values = slope[start:end]
-        if values.shape[0] < minimum_samples_per_node:
-            continue
         normals, _ = local_slopes_to_normals(values, np.array([0., 0., 1.]), np.eye(3)[:, :2])
         mean = np.sum(normals, axis=0)
         mean /= np.maximum(np.linalg.norm(mean), 1e-12)
@@ -178,8 +177,6 @@ def build_normal_lut(
         mad = 1.4826 * np.median(np.abs(angles - median))
         kept = angles <= median + 3 * mad + 1e-12
         values = values[kept]
-        if values.shape[0] < minimum_samples_per_node:
-            continue
         normals = normals[kept]
         mean_normal = np.sum(normals, axis=0)
         mean_normal /= np.maximum(np.linalg.norm(mean_normal), 1e-12)
@@ -196,7 +193,7 @@ def build_normal_lut(
 
     valid_coordinates = np.argwhere(original_valid)
     if not valid_coordinates.size:
-        raise ValueError("没有满足样本数和角度误差要求的 LUT 节点")
+        raise ValueError("没有满足角度误差要求的 LUT 节点")
     sigma_ref2 = max(float(np.median(variance[original_valid])), 1e-8)
     missing = np.argwhere(~original_valid)
     tree = cKDTree(valid_coordinates / (size - 1))
@@ -238,6 +235,41 @@ def build_normal_lut(
         sample_counts=sample_counts,
     )
 
+
+
+def find_ambiguous_color_pairs(
+    colors: np.ndarray,
+    slopes: np.ndarray,
+    *,
+    color_distance_threshold: float = .01,
+    normal_angle_threshold_degrees: float = 20.,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return conflicting unordered sample pairs, RGB distances and angles.
+
+    colors is Nx3 signed linear RGB; slopes is Nx2 dimensionless local p/q.
+    A pair conflicts when RGB L2 distance <= the color threshold and the angle
+    between normalize([-p, -q, 1]) exceeds the degree threshold. Both samples
+    share the LUT's local frame convention, regardless of their image or position.
+    Every pair is considered once (i < j), including pairs within one image.
+    """
+    colors = np.asarray(colors, np.float64)
+    slopes = np.asarray(slopes, np.float64)
+    if colors.ndim != 2 or colors.shape[1] != 3 or slopes.shape != (len(colors), 2):
+        raise ValueError('Expected paired Nx3 colors and Nx2 slopes')
+    if not np.isfinite(colors).all() or not np.isfinite(slopes).all():
+        raise ValueError('Ambiguity samples must be finite')
+    if (not np.isfinite([color_distance_threshold, normal_angle_threshold_degrees]).all()
+            or color_distance_threshold < 0 or not 0 <= normal_angle_threshold_degrees <= 180):
+        raise ValueError('Color threshold must be nonnegative; normal angle must be in [0, 180] degrees')
+    pairs = cKDTree(colors).query_pairs(color_distance_threshold, output_type='ndarray')
+    normals, _ = local_slopes_to_normals(slopes, np.array([0., 0., 1.]), np.eye(3)[:, :2])
+    first, second = normals[pairs[:, 0]], normals[pairs[:, 1]]
+    angles = np.degrees(np.arctan2(np.linalg.norm(np.cross(first, second), axis=-1),
+                                   np.sum(first * second, axis=-1)))
+    selected = angles > normal_angle_threshold_degrees
+    pairs = pairs[selected]
+    distances = np.linalg.norm(colors[pairs[:, 0]] - colors[pairs[:, 1]], axis=-1)
+    return pairs, distances, angles[selected]
 
 
 def lookup_slopes_raw(color_residual, calibration, valid_mask=None):

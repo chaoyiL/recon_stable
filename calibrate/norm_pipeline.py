@@ -2,6 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, replace
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import csv
 import glob
 import json
@@ -11,7 +12,7 @@ import cv2
 import numpy as np
 from utils.config import load_config
 from utils.surface_coordinates import (ArcLengthChart, COORDINATE_KIND, FRAME_CONVENTION, load_arclength_chart,
-                                       save_arclength_chart)
+                                       save_arclength_chart, build_material_sampling_grid)
 from utils.surface_geometry import (ParametricSurface, compute_surface_geometry, normals_to_local_slopes,
                                     local_slopes_to_normals)
 from utils.surface_projection import CameraModel, invert_surface_projection, unproject_rays
@@ -29,7 +30,6 @@ from reconstruction.surface_reconstruction.run_reconstruction import SurfaceReco
 from reconstruction.surface_reconstruction.markers import InnerRegion, marker_reference_sizes, build_marker_image_mask
 
 
-CONTACT_INNER_MARGIN_PX = 3
 CONTACT_OUTER_MARGIN_PX = 20
 MINIMUM_BOUNDARY_VALID_COUNT = 96
 MAXIMUM_BOUNDARY_MISSING_RUN = 32
@@ -64,7 +64,6 @@ class CalibrationSettings:
     sphere_side: str | None = None
     boundary_model: str | None = None
     lut_size: int = 64
-    minimum_samples_per_node: int = 5
     maximum_rms_angle_degrees: float = 5.
     background_max_abs: float = .01
     background_min_fraction: float = .1
@@ -74,7 +73,7 @@ class CalibrationSettings:
 
     def __post_init__(self):
         positive = (self.maximum_rms_angle_degrees, self.validation_rms_degrees)
-        if not np.isfinite(positive).all() or min(positive) <= 0 or self.lut_size < 2 or self.minimum_samples_per_node < 1:
+        if not np.isfinite(positive).all() or min(positive) <= 0 or self.lut_size < 2:
             raise ValueError('Invalid LUT settings')
         if (not 0 < self.validation_fraction < 1 or not 0 <= self.background_max_abs
                 or not np.isfinite(self.background_max_abs) or not 0 < self.background_min_fraction <= 1
@@ -95,8 +94,7 @@ class CalibrationSettings:
         return 1 if self.sphere_side == 'positive_normal' else -1
 
     def lut_options(self):
-        return dict(size=self.lut_size, minimum_samples_per_node=self.minimum_samples_per_node,
-                    maximum_rms_angle_degrees=self.maximum_rms_angle_degrees)
+        return dict(size=self.lut_size, maximum_rms_angle_degrees=self.maximum_rms_angle_degrees)
 
 
 def parse_settings(config_path, overrides=None):
@@ -118,7 +116,7 @@ def parse_settings(config_path, overrides=None):
         images=patterns, reference_image=_path(reference, base, 'reference_image') if reference else None,
         sphere_radius_mm=raw.get('sphere_radius_mm'), sphere_side=raw.get('sphere_side'),
         boundary_model=raw.get('boundary_model'),
-        lut_size=int(raw.get('lut_size', 64)), minimum_samples_per_node=int(raw.get('minimum_samples_per_node', 5)),
+        lut_size=int(raw.get('lut_size', 64)),
         maximum_rms_angle_degrees=float(raw.get('maximum_rms_angle_degrees', 5)),
         **{key: float(checks[key]) for key in ('background_max_abs', 'background_min_fraction',
            'validation_fraction', 'validation_rms_degrees', 'maximum_out_of_range_fraction') if key in checks})
@@ -418,12 +416,12 @@ def make_sphere_labels(frame, annotation, sphere, settings, *, center_frame=None
     _, points, roots_valid = intersect_sphere_rays(np.zeros(3), rays, sphere)
     normals = -settings.side*sphere_normals(points[..., root_index, :], sphere)
     slopes, finite = normals_to_local_slopes(normals, geometry['normal'], geometry['frame'])
-    masks = region_masks(annotation, frame.original_bgr.shape, inner_margin_px=CONTACT_INNER_MARGIN_PX, outer_margin_px=CONTACT_OUTER_MARGIN_PX)
-    interior = sample_mask_to_surface(masks['interior'], grid.uv)
+    masks = region_masks(annotation, frame.original_bgr.shape, outer_margin_px=CONTACT_OUTER_MARGIN_PX)
+    contact = sample_mask_to_surface(masks['contact'], grid.uv)
     valid = (ray_valid & roots_valid[..., root_index] & finite & geometry['valid']
-             & ((normals @ n0) > .1) & interior)
+             & ((normals @ n0) > .1) & contact)
     return dict(slope_grid=slopes.astype(np.float32), normal_gt_grid=normals.astype(np.float32),
-                sphere_label_valid=valid, contact_interior=interior,
+                sphere_label_valid=valid, contact_mask=contact,
                 sphere_center_xyz=sphere.center, sphere_radius_mm=sphere.radius_mm,
                 sphere_root_sign=root_sign, sphere_side=settings.sphere_side,
                 boundary_model=settings.boundary_model)
@@ -441,7 +439,7 @@ def finalize_image(prepared: FrameCalibrationData, reference: FrameCalibrationDa
             or not np.array_equal(prepared.camera.distortion, reference.camera.distortion)):
         raise FrameCalibrationError('coordinate_chart_invalid', 'Prepared/reference camera mismatch')
     try:
-        masks = region_masks(annotation, prepared.original_bgr.shape, inner_margin_px=CONTACT_INNER_MARGIN_PX, outer_margin_px=CONTACT_OUTER_MARGIN_PX)
+        masks = region_masks(annotation, prepared.original_bgr.shape, outer_margin_px=CONTACT_OUTER_MARGIN_PX)
     except ValueError as exc:
         raise FrameCalibrationError('annotation_missing', str(exc)) from exc
     provider = _provider_from_frame(prepared)
@@ -480,7 +478,7 @@ def finalize_image(prepared: FrameCalibrationData, reference: FrameCalibrationDa
         labels = make_sphere_labels(final, annotation, sphere, settings, center_frame=center_frame,
                                     center_sigma_mm=sigma, geometry=geometry)
         valid = (colors['geometry_valid_mask'] & colors['photometric_valid_mask']
-                 & labels['contact_interior'] & labels['sphere_label_valid'])
+                 & labels['contact_mask'] & labels['sphere_label_valid'])
         metrics['sample_count'] = int(valid.sum())
         record.update(**labels, sample_valid_mask=valid,
                       reference_normals=geometry['normal'].astype(np.float32),
@@ -550,8 +548,50 @@ def export_normal_samples(frame_records, settings, output_path):
     return _save_npz(output_path, **values)
 
 
+def _reference_sampling_grid_values(settings, metadata):
+    reference = load_frame_calibration_data(settings.work_dir/'reference_surface.npz')
+    expected = dict(coordinate_kind=COORDINATE_KIND, coordinate_chart_id=reference.chart.chart_id,
+                    frame_convention=FRAME_CONVENTION, residual_domain='material_grid', color_space='linear_rgb')
+    for key, value in expected.items():
+        if metadata.get(key) != value:
+            raise ValueError(f'LUT/reference {key} mismatch; regenerate samples from this reference')
+    if Path(metadata['reference_image']).resolve() != reference.source_image.resolve():
+        raise ValueError('LUT/reference image mismatch; regenerate samples from this reference')
+    shape = reference.systems.observation.xyz.shape[:2]
+    values = build_material_sampling_grid(reference.surface, reference.chart, shape,
+                                          reference.template_xy_mm, reference.camera)
+    values.update(reference_image=np.asarray(str(reference.source_image)),
+                  coordinate_chart_file=np.asarray(os.path.relpath(reference.chart_file, settings.work_dir)))
+    return values
+
+
+def update_material_sampling_grid(settings: CalibrationSettings) -> Path:
+    """Regenerate the published image LUT's grid from its matching reference cache."""
+    calibration = NormalCalibration.load(settings.output)
+    if calibration.metadata.get('validation_status') != 'passed':
+        raise ValueError('Sampling grid regeneration requires a validated image LUT')
+    values = _reference_sampling_grid_values(settings, calibration.metadata)
+    return _save_npz(settings.work_dir/'lut_material_grid.npz', **values)
+
+
+def _publish_image_calibration(settings, calibration, total_sample_count):
+    values = _reference_sampling_grid_values(settings, calibration.metadata)
+    grid_path = settings.work_dir/'lut_material_grid.npz'
+    settings.output.parent.mkdir(parents=True, exist_ok=True)
+    # Finish both files before replacing either published artifact. Each staged
+    # file stays on its destination filesystem so replacement uses rename.
+    with TemporaryDirectory(prefix='.normal-grid-', dir=settings.work_dir) as grid_dir, \
+         TemporaryDirectory(prefix='.normal-lut-', dir=settings.output.parent) as lut_dir:
+        staged_grid = _save_npz(Path(grid_dir)/grid_path.name, **values)
+        staged_lut = calibration.save(Path(lut_dir)/settings.output.name, total_sample_count=total_sample_count)
+        staged_grid.replace(grid_path)
+        staged_lut.replace(settings.output)
+
+
 def _fit_and_validate_samples(sample_path, settings):
     with np.load(sample_path, allow_pickle=False) as data:
+
+        # 颜色，坡度加载以及维度检查
         colors = np.asarray(data['color_residual_samples'], np.float32)
         slopes = np.asarray(data['slope_samples'], np.float32)
         if colors.ndim != 2 or colors.shape[1] != 3 or slopes.shape != (len(colors), 2) or not len(colors):
@@ -567,6 +607,8 @@ def _fit_and_validate_samples(sample_path, settings):
             return report
         if int(data['format_version']) != 1:
             raise ValueError('Grouped image samples require format_version=1')
+        
+        # 超参数检查
         required = ('coordinate_kind', 'coordinate_chart_id', 'coordinate_chart_file', 'frame_convention',
                     'residual_domain', 'color_space', 'reference_image', 'sphere_radius_mm', 'sphere_side', 'boundary_model')
         metadata = {key: data[key].item() for key in required}
@@ -575,6 +617,8 @@ def _fit_and_validate_samples(sample_path, settings):
                                   boundary_model='zero_boundary_displacement').items():
             if metadata[key] != expected:
                 raise ValueError(f'Invalid sample declaration: {key}')
+        
+        # 选取验证样本与标定样本？
         image_index = np.asarray(data['image_index'])
         keys = np.asarray(data['image_paths']).astype(str)
         if (image_index.shape != (len(colors),) or image_index.dtype.kind not in 'iu'
@@ -589,6 +633,8 @@ def _fit_and_validate_samples(sample_path, settings):
         held_out = shuffled[:count]
         validation_mask = np.isin(image_index, held_out)
         training_mask = ~validation_mask
+
+        # 标定
         calibration = build_normal_lut(colors[training_mask], slopes[training_mask], **settings.lut_options())
         common = dict(metadata, validation_status='training_only',
                       training_images=keys[shuffled[count:]].tolist(), validation_images=keys[held_out].tolist())
@@ -632,7 +678,7 @@ def _fit_and_validate_samples(sample_path, settings):
         final = build_normal_lut(colors, slopes, **settings.lut_options())
         metadata.update(validation_status='passed', validation=report,
                         coordinate_chart_file=os.path.relpath(chart_path, settings.output.resolve().parent))
-        replace(final, metadata=metadata).save(settings.output, total_sample_count=len(colors))
+        _publish_image_calibration(settings, replace(final, metadata=metadata), len(colors))
         return report
 
 
@@ -645,12 +691,21 @@ class _LUTValidationFailure(ValueError):
 
 def fit_and_validate_samples(sample_path, settings):
     try:
-        return _fit_and_validate_samples(sample_path, settings)
+        report = _fit_and_validate_samples(sample_path, settings)
     except (OSError, KeyError, ValueError) as exc:
         if not isinstance(exc, _LUTValidationFailure):
             _save_json(settings.work_dir/'verification'/'validation.json',
                        dict(status='failed', reason='input_or_fit_failed', message=str(exc)))
         raise
+    if report['status'] == 'passed':
+        from calibrate.visualize_norm import generate_calibration_visualizations
+        try:
+            output = generate_calibration_visualizations(settings.output, sample_path, settings.work_dir)
+        except Exception as exc:
+            # Plotting failure must not relabel an already published, validated LUT as failed.
+            raise RuntimeError(f'法向 LUT 和采样网格已保存，但可视化生成失败: {exc}') from exc
+        print(f'法向标定可视化已保存: {output}')
+    return report
 
 
 def load_manifest(settings):

@@ -7,9 +7,22 @@ from utils.region_annotations import (BOUNDARY_SAMPLE_COUNT, RegionAnnotation, l
                                       region_boundary_points)
 from utils.color_difference import signed_difference_preview
 from utils.annotation_editor import edit_regions
+from utils.annotation_window import AnnotationPanel, compose_annotation_panels, render_annotation_preview
 from utils.surface_sampling import rasterize_surface_grid
+from utils.surface_projection import projected_circle_radius_px
 
 ContactAnnotation = RegionAnnotation
+ANNOTATION_PANEL_WIDTHS = (640, 960, 280)
+ANNOTATION_PANEL_HEIGHT = 720
+
+
+def _maximum_circle_radius_px(frame, sphere_radius_mm, center_px):
+    grid = frame.systems.observation
+    depth = grid.xyz[..., 2]
+    valid = grid.valid_mask & np.isfinite(depth) & (depth > 0)
+    if not valid.any():
+        raise ValueError('A valid positive surface depth is required to limit the annotation circle')
+    return projected_circle_radius_px(center_px, sphere_radius_mm, float(depth[valid].max()), frame.camera)
 
 
 def _color_image_preview(frame, record):
@@ -29,7 +42,8 @@ def _color_image_preview(frame, record):
     return color
 
 
-def calibration_panels(frame, annotation, record=None, message='', *, color_image=None):
+def calibration_panels(frame, annotation, record=None, message='', *, color_image=None,
+                       maximum_circle_radius_px=None):
     record = {} if record is None else record
     display_frame = record.get('frame', frame)
     original = frame.original_bgr.copy()
@@ -60,18 +74,22 @@ def calibration_panels(frame, annotation, record=None, message='', *, color_imag
     else:
         color_lines = ['Color preview unavailable', 'g: recompute; see status below']
     color_lines.append('Edit boundary here | wheel: radius | c: center | z: undo')
+    if maximum_circle_radius_px is not None:
+        color_lines.append(f'Circle diameter: {2*annotation.semi_axes_px[0]:.2f} px | '
+                           f'maximum: {2*maximum_circle_radius_px:.2f} px')
     if 'normal_gt_grid' in record:
         normal = np.rint(np.clip(.5+.5*record['normal_gt_grid'][..., ::-1], 0, 1)*255).astype(np.uint8)
         normal[~record['sample_valid_mask']] = 0
         normal_lines = [f"Sphere normals | samples: {metrics['sample_count']}",
-                        f"Boundary RMS: {metrics['sphere_boundary_rms']:.3f}",
+                        'Camera XYZ normals | RGB = (nx, ny, nz)',
+                        f"Boundary RMS (sigma): {metrics['sphere_boundary_rms']:.3f}",
                         f"Reprojection: {metrics.get('reprojection_rms_px', 0):.3f}px",
                         f"{record['sphere_side']} root {record['sphere_root_sign']:+d}"]
     else:
         z = grid.xyz[..., 2]
         valid = grid.valid_mask
         normal = np.zeros((*valid.shape, 3), np.uint8)
-        normal_lines = [f'{stage} overall depth', 'Sphere normals not available']
+        normal_lines = [f'{stage} overall depth | camera Z (mm)', 'Sphere normals not available']
         if valid.any():
             values = np.clip((z-z[valid].min())/max(float(np.ptp(z[valid])), 1e-6), 0, 1)
             normal = cv2.applyColorMap(np.rint(values*255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
@@ -89,46 +107,16 @@ def calibration_panels(frame, annotation, record=None, message='', *, color_imag
     elif 'normal_gt_grid' in record:
         normal_lines.insert(0, 'CHECKS PASSED | Enter: accept')
 
-    def grid_panel(image, lines, *, original_pixels=False):
-        h, w = image.shape[:2]
-        scale = min(640/w, 480/h)
-        if original_pixels:
-            # Let the editor perform display scaling so mouse edits retain source pixels.
-            panel = image
-            text_scale = 1/scale
-        else:
-            panel = np.zeros((480, 640, 3), np.uint8)
-            resized = cv2.resize(image, (round(w*scale), round(h*scale)))
-            panel[:resized.shape[0], :resized.shape[1]] = resized
-            text_scale = 1.
-        for i, line in enumerate(lines):
-            position = (round(8*text_scale), round((22+22*i)*text_scale))
-            cv2.putText(panel, line, position, cv2.FONT_HERSHEY_SIMPLEX,
-                        .5*text_scale, (0, 0, 0), max(1, round(3*text_scale)))
-            text_color = (0, 100, 255) if line.startswith('REJECTED') else (255, 255, 255)
-            cv2.putText(panel, line, position, cv2.FONT_HERSHEY_SIMPLEX,
-                        .5*text_scale, text_color, max(1, round(text_scale)))
-        return panel
-
-    return original, grid_panel(color, color_lines, original_pixels=True), grid_panel(normal, normal_lines)
+    return (AnnotationPanel(original), AnnotationPanel(color, tuple(color_lines)),
+            AnnotationPanel(normal, tuple(normal_lines), header=True))
 
 
 def _save_panels(panels, path, message=''):
-    resized = []
-    for panel in panels:
-        h, w = panel.shape[:2]
-        scale = min(640/w, 480/h)
-        canvas = np.zeros((480, 640, 3), np.uint8)
-        image = cv2.resize(panel, (round(w*scale), round(h*scale)))
-        canvas[:image.shape[0], :image.shape[1]] = image
-        resized.append(canvas)
+    display = compose_annotation_panels(
+        panels, ANNOTATION_PANEL_WIDTHS, ANNOTATION_PANEL_HEIGHT, message)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    canvas = np.concatenate(resized, axis=1)
-    if message:
-        cv2.rectangle(canvas, (0, 445), (1920, 480), (0, 0, 0), -1)
-        cv2.putText(canvas, message[:230], (8, 468), cv2.FONT_HERSHEY_SIMPLEX, .55, (255, 255, 255), 1)
-    if not cv2.imwrite(str(path), canvas):
+    if not cv2.imwrite(str(path), render_annotation_preview(display)):
         raise RuntimeError(f'Cannot save preview: {path}')
 
 
@@ -144,7 +132,7 @@ def save_status_preview(frame, source_path, annotation, path, message):
         image = cv2.imread(str(source_path), cv2.IMREAD_COLOR)
         if image is None:
             image = np.zeros((480, 640, 3), np.uint8)
-        panels = (image, np.zeros_like(image), np.zeros_like(image))
+        panels = tuple(AnnotationPanel(panel) for panel in (image, np.zeros_like(image), np.zeros_like(image)))
     _save_panels(panels, path, message)
 
 
@@ -188,6 +176,21 @@ def annotate_images(settings, *, edit=False):
         except FrameCalibrationError as error:
             initial_preview['preview_errors'] = [str(error)]
         preview_record, color_image = None, None
+        limit_frame = frame
+
+        def maximum_radius(region):
+            return _maximum_circle_radius_px(limit_frame, settings.sphere_radius_mm, region.center_px)
+
+        def recompute(region):
+            nonlocal limit_frame
+            try:
+                record = finalize_image(frame, reference, region, settings, diagnostic_preview=True)
+            except FrameCalibrationError as error:
+                if error.preview is not None:
+                    limit_frame = error.preview['frame']
+                raise
+            limit_frame = record['frame']
+            return record
 
         def panels(region, record, message):
             nonlocal preview_record, color_image
@@ -196,13 +199,13 @@ def annotate_images(settings, *, edit=False):
                 # Geometry and colors change on recompute, not while dragging the annotation.
                 color_image = _color_image_preview(record.get('frame', frame), record)
                 preview_record = record
-            return calibration_panels(frame, region, record, message, color_image=color_image)
+            return calibration_panels(frame, region, record, message, color_image=color_image,
+                                      maximum_circle_radius_px=maximum_radius(region))
 
         completed = edit_regions([annotation],
-            editable_panel=1,
+            editable_panel=1, panel_widths=ANNOTATION_PANEL_WIDTHS, panel_height=ANNOTATION_PANEL_HEIGHT,
             panel_callback=panels,
-            recompute_callback=lambda region: finalize_image(
-                frame, reference, region, settings, diagnostic_preview=True),
+            recompute_callback=recompute, maximum_circle_radius=maximum_radius,
             save_callback=lambda: save_regions(settings.annotations_file, regions, image_root=root))
         if not completed:
             return False

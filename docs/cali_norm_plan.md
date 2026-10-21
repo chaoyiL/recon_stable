@@ -203,9 +203,11 @@ source_valid = surface_mask & ~marker_image_mask & unsaturated
 | 曲面色差 | 映射回原图像素位置的曲面域 RGB 色差、有效域、最终 sample mask；直接编辑接触轮廓和中心 |
 | 几何预览 | 整体曲面、球面法向/坡度、拟合误差或失败原因 |
 
-在中间色差图上按圆形接触边界标注，只编辑圆心和半径；拖动圆周及滚轮缩放始终保持圆形，不提供椭圆半轴调整、旋转或多边形转换。左侧原图同步显示轮廓供对照。色差图必须映射回原图像素位置，鼠标坐标需扣除面板偏移并除以显示缩放；保存原图像素坐标。旧椭圆与多边形标注保留读取兼容，重新打开编辑时以相同圆心和等面积圆初始化，重新确认后保存。
+在中间色差图上按圆形接触边界标注，只编辑圆心和半径；拖动圆周及滚轮调整半径始终保持圆形，滚轮不缩放画面，不提供椭圆半轴调整、旋转或多边形转换。左侧原图同步显示轮廓供对照。三栏宽度为 640、960、280 像素，图像区高 720 像素，各图等比例显示；说明文字采用 22 像素字号和 30 像素行距，独立于源图绘制并按实际字宽换行，底部预留四行状态区。标注窗口与保存预览使用相同布局，避免文字随源图反复缩放而模糊。色差图必须映射回原图像素位置，鼠标坐标需扣除面板偏移并除以显示缩放；保存原图像素坐标。旧椭圆与多边形标注保留读取兼容，重新打开编辑时以相同圆心和等面积圆初始化，重新确认后保存。
 
 标注语义固定为 `contact_boundary`：胶皮与球接触区域的边界。中心是接触区内部的代表点，不是球心投影。普通 ROI、可见球轮廓不能自动充当接触边界。
+
+已实现标注圆物理尺寸上限：取有效曲面的最大正相机 `Z_max`（mm），将配置中的球半径 `R`（mm）换算成原图像素半径上限。无畸变时为 `r_max = min(fx, fy) * R / Z_max`；实际实现用含畸变的相机模型，在当前圆心对应的 `Z_max` 平面投影半径 `R` 的相机平行圆盘，128 个均匀边界方向到圆心的最小像素距离即为上限。初始使用 prepared 曲面，重算后更新为最近得到的最终曲面。初始圆、拖动、滚轮和撤回均裁到该上限，面板显示当前及最大直径；重算引起收缩时清除过期结果，重新计算通过才可接受。没有有效正深度时报错。共用投影计算放在 `utils/surface_projection.py:projected_circle_radius_px`，通用编辑器只接收半径上限回调，不依赖标定状态。
 
 按键固定：`g` 重算当前标注的最终几何与标签；`Enter` 重算通过后接受并下一张；`x` 标记跳过；`Esc` 保存草稿并退出。失败显示原因，保留草稿。已有 accepted 标注默认复用，只有 `--edit` 才重新编辑。
 
@@ -290,7 +292,7 @@ n_gt = -sigma*(P-C)/R
 
 先在接触中心射线上选根：候选须满足 `n_gt·n0_center>0.1` 且 `sigma*(P-A)·n0_center<=center_sigma_mm`。在合格候选中选离 A 最近者；距离差不超过 center_sigma_mm 时视为分支不确定。
 
-将选中的 minus/plus 分支锁定到整张图，不逐点切根或翻转法向。每点还须位于接触内缩区，并满足 `n_gt·n0_center>0.1`、`n_gt·n0(point)>0.1`。
+将选中的 minus/plus 分支锁定到整张图，不逐点切根或翻转法向。每点还须位于原始标注圆盘内，不缩小半径或内缩边界，并满足 `n_gt·n0_center>0.1`、`n_gt·n0(point)>0.1`。
 
 最后按最终规则 st 网格的共用局部基转换为坡度：
 
@@ -310,13 +312,15 @@ n_gt = normalize(n0-p*e1-q*e2)
 sample_valid =
     geometry_valid
     & photometric_valid
-    & contact_interior
+    & contact_mask
     & sphere_label_valid
 ```
 
 用同一个扁平 bool 索引提取 `N×3` 色差、`N×2` 坡度、st、原生参数和 image_index，再拼接。不能分别过滤颜色与标签。
 
 复用现有 `build_normal_lut` 的节点计数、MAD、方差、缺节点补全和零点锚定。映射输出保存为局部坡度；需要法向时用共用转换函数还原。
+
+已实现：取消 MAD 前后的最小样本数门槛，并移除对应参数和配置。MAD 保留非空样本后，仅按节点内部法向夹角 RMS 检查一致性；单样本及少于 5 个样本的节点均可参与建表。
 
 按图片分组留出，而不是随机拆散像素：
 
@@ -328,6 +332,14 @@ sample_valid =
 6. 原始验证色差中，任一通道超出训练颜色范围的样本比例 ≤0.05。即使查询会 clip，也按 clip 前数据统计，角度误差包含这些样本。
 
 先保存训练 LUT 与验证报告。通过后用全部 accepted 图片重建最终 LUT 并原子保存；失败不覆盖已有最终输出。只有旧两数组的外部样本模式可以保留，但必须标为未做整图验证，不能冒充本流程产物。
+
+已实现配套采样网格更新：图片 `fit` 每次验证通过后，读取同批 `reference_surface.npz` 及其参考弧长图，校验参考图和坐标编号与待发布 LUT 一致。以 reference 的 observation 行列数生成规则 st，调用同一 `sample_surface_grid` 反解原生材料参数，写入 `work_dir/lut_material_grid.npz`；不读取旧网格，不继承旧分辨率。两个临时文件写完后再分别替换最终 LUT 与网格。验证、reference 检查或临时写入失败时保留已发布产物；旧两数组样本不生成网格。
+
+已实现标定后可视化：发布成功后，`calibrate/visualize_norm.py` 使用本批 LUT、聚合样本及 `frames/overall` 缓存，在 `work_dir/visualization/` 生成逐图色差与 p/q 对照、RGB 色差到 p/q 的三维映射、三个零通道 LUT 切片和整批汇总。逐图预测调用最终 LUT 的原始插值；独立留出统计调用同批 `_train.npz`，复用已有局部坡度转法向函数计算角误差。显示回投复用 `rasterize_surface_grid`，统计始终使用原材料网格样本。所有输入校验坐标身份；空间样本还检查与训练样本逐点一致，不混入遗留缓存。可视化失败不改写已发布 LUT 的验证状态；完整报告生成后才替换旧报告。没有图片分组的旧两数组模式不生成该报告。
+
+已实现 p/q 不良映射图：使用拟合及剔除前的全部配对样本，以 KDTree 查询有符号线性 RGB 欧氏距离 ≤0.01 的所有无序样本对，包含同图与跨图。将 p/q 转成公共局部基下的单位法向 `normalize([-p,-q,1])`，夹角 >20° 的样本对为冲突对，两端点均在 p/q 图中标红。一个点可参与多个冲突对，点数与对数分别统计；不只选最近邻。两个阈值可通过可视化 CLI 调整。图片仅输出 PNG，另保存全部冲突索引、逐对距离与角度、不良点 mask 的 NPZ，汇总 JSON 记录阈值和统计。这些诊断不改变 LUT 拟合或筛选规则。
+
+已实现失败模型诊断：独立绘图入口接受包含失败验证报告的 `validation_status=failed` 诊断 LUT，所有图表明确标记失败且未发布。汇总同时记录验证状态、验证报告、有效节点数及保留样本数；留出统计仍使用配套 `_train.npz`。这不会放宽验证或发布门槛。
 
 ## 7. 推理端复用同一约定
 
@@ -368,6 +380,7 @@ h_i = sqrt(mean_j(||Q_j-Q_i||²))
 | `utils/sphere_geometry.py` | 固定半径球心拟合、射线双根、球冠选择、球外法向 |
 | `utils/region_annotations.py` | 区域数据、读写、边界采样、mask 与边距 |
 | `utils/annotation_editor.py` | 通用面板和形状编辑；通过回调重算、保存 |
+| `utils/annotation_window.py` | 固定图像范围的 Matplotlib/PyQt5 窗口，滚轮只转交给形状编辑 |
 | `utils/color_difference.py` | BGR8/线性 RGB 转换、曲面数组有符号差、显示转换 |
 | `utils/normal_mapping.py` | 提取 LUT 数据、构建与原始查询；保留兼容导出 |
 | `calibrate/manual_norm_regions.py` | 为通用编辑器配置接触语义、三面板与重算回调 |
@@ -471,7 +484,7 @@ def sphere_normals(points, sphere): ...
 def load_regions(path, image_root=None): ...
 def save_regions(path, regions, *, image_root): ...
 def region_boundary_points(region, count=128): ...
-def region_masks(region, image_shape, *, inner_margin_px, outer_margin_px): ...
+def region_masks(region, image_shape, *, outer_margin_px): ...
 def edit_regions(regions, *, panel_callback, recompute_callback, save_callback,
                  editable_panel=0): ...
 ```
@@ -501,10 +514,16 @@ def fit_ball_center(frame, annotation, settings): ...
 def make_sphere_labels(frame, annotation, sphere, settings): ...
 def export_normal_samples(frame_records, settings, output_path): ...
 def fit_and_validate_samples(sample_path, settings): ...
+def update_material_sampling_grid(settings: CalibrationSettings) -> Path: ...
+def generate_calibration_visualizations(calibration_file, sample_file, work_dir,
+                                       output_dir=None, *, color_distance_threshold=0.01,
+                                       normal_angle_threshold_degrees=20.0) -> Path: ...
 
-def build_normal_lut(colors, slopes, *, size=64, minimum_samples_per_node=5,
+def build_normal_lut(colors, slopes, *, size=64,
                      maximum_rms_angle_degrees=5.0) -> NormalCalibration: ...
 def lookup_slopes_raw(color_residual, calibration, valid_mask=None): ...
+def find_ambiguous_color_pairs(colors, slopes, *, color_distance_threshold=0.01,
+                               normal_angle_threshold_degrees=20.0): ...
 ```
 
 `FrameCalibrationData` 是编排层数据，包含图片身份、原图、区域 mask、跟踪观测、模板与参考 marker 尺寸、曲面系数和适配器、camera、chart、chart_file、三套坐标、geometry_stage、fit_info。底层函数只接收从中拆出的数组或通用对象。
@@ -526,7 +545,7 @@ def lookup_slopes_raw(color_residual, calibration, valid_mask=None): ...
 | prepare | 原图、底色、相机、模板 | reference、坐标图、prepared、manifest | 无 |
 | annotate | prepared、球半径和球心侧 | 标注文件、最终几何预览 | 缺标注或 --edit 时 |
 | samples | prepared、accepted 标注 | 最终整体曲面、颜色/标签、聚合样本、逐图报告 | 无 |
-| fit | 聚合样本 | 训练 LUT、验证报告、通过后的最终 LUT | 无 |
+| fit | 聚合样本、同批 reference 几何/坐标图及 frames/overall 缓存 | 训练 LUT、验证报告、通过后的最终 LUT、新采样网格及可视化 | 无 |
 | all | 上述源输入 | 按顺序执行全部阶段 | 仅标注阶段 |
 
 `prepare` 不要求球半径；`annotate/samples` 要求明确的几何输入。`samples/fit` 不初始化 GUI，fit 不读取原图。
@@ -546,7 +565,6 @@ normal_calibration:
   input_file: assets/normal_calibration/normal_samples.npz
   output: assets/normal_calibration/normal_lut.npz
   lut_size: 64
-  minimum_samples_per_node: 5
   maximum_rms_angle_degrees: 5.0
   checks:
     background_max_abs: 0.01
@@ -585,6 +603,7 @@ assets/normal_calibration/
   normal_samples.npz
   normal_lut_train.npz
   normal_lut.npz
+  lut_material_grid.npz
   verification/000000.png
   verification/report.csv
   verification/validation.json
@@ -668,7 +687,7 @@ image_root 相对 YAML 所在目录解析。region 的 image_size 与实际图�
 | 曲面逆投影 | least_squares 最多 50 次评估，ftol/xtol/gtol=1e-10；原生归一化参数按 1e-4 去重；同变量差分步长 1e-5，边界单边差分 |
 | marker 光度屏蔽 | 搜索半径至少为参考 bbox 半对角线+2 px，并取不小于 ceil(0.35×中位 marker 间距)；中心匹配唯一组件，否则用该保守半径圆盘；结果外扩 1 px（3×3 核） |
 | 球面判别式 | 小于 -1e-9 mm² 无效；仅将此容差内的小负值归零 |
-| 接触区域 | 边界 128 点、至少 96 点有效、连续缺失 ≤32；内缩 3 px，外扩 20 px |
+| 接触区域 | 边界 128 点、至少 96 点有效、连续缺失 ≤32；使用原始标注圆盘，不内缩；外扩 20 px 仅用于拟合及背景排除 |
 
 按依赖顺序实施：
 

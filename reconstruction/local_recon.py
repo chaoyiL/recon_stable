@@ -308,6 +308,25 @@ def _optional_configured_path(
     return path if path.is_absolute() else config_base/path
 
 
+def default_reconstruction_output(
+    config_path: str | Path, output_dir: object, filename: str,
+) -> Path:
+    """Resolve a default result NPZ under the configured output directory's pc/ subfolder."""
+    if not isinstance(output_dir, str) or not output_dir.strip():
+        raise ValueError('reconstruction.output_dir 必须是非空路径')
+    directory = Path(output_dir).expanduser()
+    if not directory.is_absolute():
+        directory = Path(config_path).expanduser().parent / directory
+    return directory / 'pc' / filename
+
+
+def default_reconstruction_preview(output: str | Path) -> Path:
+    """Keep previews outside pc/; explicit NPZ paths elsewhere retain adjacent previews."""
+    output = Path(output).expanduser()
+    directory = output.parent.parent if output.parent.name == 'pc' else output.parent
+    return directory / output.with_suffix('.png').name
+
+
 def load_local_reconstruction_settings(
     config_path: str | Path,
     *,
@@ -344,7 +363,11 @@ def load_local_reconstruction_settings(
         output_override,raw.get("output_file"),config_base=source.parent,
         name="output_file")
     if output_file is None:
-        output_file=input_file.with_name(
+        reconstruction=all_config.get('reconstruction', {})
+        if not isinstance(reconstruction, dict):
+            raise ValueError('reconstruction 必须是映射')
+        output_file=default_reconstruction_output(
+            source, reconstruction.get('output_dir', 'assets/reconstruction'),
             input_file.stem+"_local_reconstruction.npz")
     atol=(float(raw.get("lsmr_atol",1e-7)) if lsmr_atol_override is None
           else float(lsmr_atol_override))
@@ -778,12 +801,12 @@ def save_reconstruction_result(
     result: LocalReconstructionResult, output: str | Path, *,
     preview_output: str | Path | None = None, show: bool = False,
 ) -> Path:
-    """Save the existing local-result NPZ schema and its two-panel preview."""
+    """Save the local-result NPZ and preview, keeping PNGs outside the pc/ folder."""
     output = result.save(output)
     print(f"局部重建完成: {output}；unknown={int(np.count_nonzero(~result.boundary_mask & result.valid_mask))} "
           f"iterations={result.solver_iterations} residual={result.solver_residual_norm:.6g}")
     from reconstruction.viewer import view_reconstruction
-    view_reconstruction(output, image_output=preview_output or output.with_suffix('.png'), show=show)
+    view_reconstruction(output, image_output=preview_output or default_reconstruction_preview(output), show=show)
     return output
 
 
@@ -801,14 +824,14 @@ def local_main() -> None:
     parser.add_argument(
         "--calibration",help="覆盖 local_reconstruction.calibration_file")
     parser.add_argument(
-        "--output",help="输出 NPZ；默认在输入文件旁自动添加 _local_reconstruction")
+        "--output",help="输出 NPZ；默认保存到 reconstruction.output_dir/pc")
     parser.add_argument("--lsmr-atol",type=float,help="覆盖 LSMR atol")
     parser.add_argument("--lsmr-btol",type=float,help="覆盖 LSMR btol")
     parser.add_argument(
         "--lsmr-max-iterations",type=int,help="覆盖 LSMR 最大迭代次数")
     parser.add_argument("--show",action="store_true",help="重建完成后显示结果窗口")
     parser.add_argument(
-        "--preview-output",help="预览图路径；重建时默认在输出 NPZ 旁保存同名 PNG")
+        "--preview-output",help="预览图路径；默认将 pc/ 内 NPZ 的同名 PNG 保存到上一级目录")
     args=parser.parse_args()
     if args.view is not None:
         if args.output is not None:

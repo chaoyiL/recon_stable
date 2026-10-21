@@ -5,9 +5,10 @@ Run: python -m unittest discover -s tests -p test_norm_calibration_pipeline.py
 from dataclasses import asdict, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 import json
 import unittest
-from unittest.mock import DEFAULT, Mock, patch
+from unittest.mock import Mock, patch
 import cv2
 import numpy as np
 import yaml
@@ -16,12 +17,14 @@ from utils.surface_coordinates import (ArcLengthChart, build_arclength_chart, sa
 from utils.surface_sampling import (bilinear_sample, sample_linear_rgb_to_surface,
                                     sample_mask_to_surface, rasterize_surface_grid)
 from utils.surface_geometry import compute_surface_geometry, normals_to_local_slopes, local_slopes_to_normals
-from utils.surface_projection import CameraModel, project_points, unproject_rays, invert_surface_projection
+from utils.surface_projection import (CameraModel, project_points, unproject_rays, invert_surface_projection,
+                                      projected_circle_radius_px)
 from utils.sphere_geometry import (Sphere, fit_sphere_center, intersect_sphere_rays,
                                    select_sphere_cap, sphere_normals)
 from utils.region_annotations import (RegionAnnotation, region_boundary_points, region_masks,
                                       save_regions, load_regions)
-from utils.normal_mapping import NormalCalibration, build_normal_lut
+from utils.normal_mapping import NormalCalibration, build_normal_lut, find_ambiguous_color_pairs
+from utils.annotation_window import AnnotationPanel
 from reconstruction.surface_reconstruction.surface import SurfaceModel, BicubicSurfaceAdapter
 from reconstruction.surface_reconstruction.markers import find_inner_region, find_inner_roi, build_marker_image_mask
 from utils.reconstruction_interface import CoordinateGridSpec, MaterialCoordinateSpecs
@@ -29,6 +32,147 @@ from calibrate.norm_pipeline import (CalibrationSettings, FrameCalibrationData, 
     _save_frame, _save_json, load_frame_calibration_data, run_samples, fit_and_validate_samples,
     compute_frame_colors, FrameCalibrationError, run_prepare, parse_settings)
 from reconstruction.local_recon import reconstruct_local_surface, _load_reconstruction_input, lookup_slopes
+from calibrate.analyze_ambiguities import (classify_normal_neighborhood, compare_branch_context,
+                                         classify_branch_support, aggregate_branch_classification,
+                                         predict_conditioned_normals)
+
+
+def _normals_at_angles(angles):
+    angles = np.radians(angles)
+    return np.column_stack((np.sin(angles), np.zeros(len(angles)), np.cos(angles)))
+
+
+class NormalNeighbourhoods(unittest.TestCase):
+    def test_continuous_chain_is_not_split_into_multiple_modes(self):
+        normals = _normals_at_angles([0, 8, 16, 24, 32, 40])
+        result = classify_normal_neighborhood(normals, np.arange(6))
+        self.assertEqual(result['kind'], 'connected_spread')
+        self.assertEqual(result['sizes'], [6])
+
+    def test_supported_separate_groups_and_a_sparse_alternative_are_distinct(self):
+        result = classify_normal_neighborhood(_normals_at_angles([-2, 0, 2, 38, 40, 42]),
+                                             np.array([0, 0, 1, 2, 3, 3]))
+        self.assertEqual(result['kind'], 'multiple_supported_components')
+        self.assertEqual(result['sizes'], [3, 3])
+        self.assertEqual(result['image_counts'], [2, 2])
+        self.assertEqual(len(result['separated_components']), 1)
+        result = classify_normal_neighborhood(_normals_at_angles([-5, -3, -1, 1, 3, 5, 40]),
+                                             np.arange(7))
+        self.assertEqual(result['kind'], 'dominant_with_sparse_alternative')
+        self.assertEqual(result['sizes'], [6, 1])
+
+    def test_two_disagreeing_points_are_not_enough_to_identify_an_outlier(self):
+        result = classify_normal_neighborhood(_normals_at_angles([0, 40]), np.array([0, 1]))
+        self.assertEqual(result['kind'], 'sparse')
+
+
+class BranchContinuation(unittest.TestCase):
+    def setUp(self):
+        self.colors = np.array([[0., 0, 0], [.005, 0, 0], [.002, 0, 0],
+                                [.020, 0, 0], [.022, 0, 0], [.025, 0, 0]])
+        self.normals = _normals_at_angles([0, 50, 0, 2, 5, 48])
+        self.images = np.array([0, 1, 2, 2, 3, 4])
+
+    def test_both_branches_can_have_context_without_six_inner_samples(self):
+        result = compare_branch_context(self.colors, self.normals, self.images,
+                                        np.array([0, 1]), np.arange(6))
+        self.assertEqual(result[0]['support_indices'], [3, 4])
+        self.assertEqual(result[1]['support_indices'], [5])
+        self.assertEqual(result[0]['support_image_count'], 2)
+        self.assertEqual(result[1]['other_image_count'], 1)
+
+    def test_anchors_and_both_original_neighbourhoods_cannot_support_themselves(self):
+        result = compare_branch_context(self.colors, self.normals, self.images,
+                                        np.array([0, 1]), np.arange(3))
+        self.assertEqual([row['support_count'] for row in result], [0, 0])
+        self.assertIsNone(result[0]['minimum_context_normal_angle_degrees'])
+
+    def test_missing_outer_support_is_recorded_without_automatically_rejecting_a_branch(self):
+        result = compare_branch_context(self.colors, self.normals, self.images,
+                                        np.array([0, 1]), np.arange(5))
+        self.assertEqual([row['support_count'] for row in result], [2, 0])
+        self.assertAlmostEqual(result[1]['minimum_context_normal_angle_degrees'], 45.)
+        self.assertNotIn('rejected', result[1])
+
+
+class ExpandedBranchClassification(unittest.TestCase):
+    def test_two_inner_samples_can_be_classified_using_outer_branches(self):
+        colors = np.array([[0., 0, 0], [.005, 0, 0], [.020, 0, 0],
+                           [.022, 0, 0], [.025, 0, 0]])
+        normals = _normals_at_angles([0, 50, 2, 5, 48])
+        branches = compare_branch_context(colors, normals, np.arange(5), np.array([0, 1]), np.arange(5))
+        # Both original color balls contain only the two anchors. Outer evidence
+        # is 2:1; dropping the sparsely sampled alternative would lose a branch.
+        counts = [branch['support_count'] for branch in branches]
+        self.assertEqual(classify_branch_support(counts), 2)
+        branches = compare_branch_context(colors, normals, np.arange(5), np.array([0, 1]), np.arange(4))
+        self.assertEqual(classify_branch_support([branch['support_count'] for branch in branches]), 1)
+
+    def test_dominance_boundary_and_missing_evidence_remain_explicit(self):
+        kinds = classify_branch_support([[8, 2], [2, 8], [3, 1], [1, 1], [1, 0], [0, 0]])
+        np.testing.assert_array_equal(kinds, [1, 1, 2, 2, 1, 0])
+        self.assertEqual(classify_branch_support([8, 2], dominance_fraction=.9), 2)
+
+    def test_a_point_overlapping_one_partner_is_not_hidden_by_dominant_other_pairs(self):
+        pairs = np.array([[0, 1], [0, 2], [0, 3], [4, 5]])
+        kinds = classify_branch_support([[10, 0], [10, 0], [4, 4], [0, 0]])
+        actual = aggregate_branch_classification(pairs, kinds, 7)
+        np.testing.assert_array_equal(actual, [2, 1, 1, 2, 0, 0, -1])
+
+    def test_invalid_support_and_dominance_threshold_are_rejected(self):
+        for counts in ([1, 2, 3], [np.nan, 1], [-1, 2]):
+            with self.assertRaises(ValueError):
+                classify_branch_support(counts)
+        for threshold in (.5, 1.1, np.nan):
+            with self.assertRaises(ValueError):
+                classify_branch_support([1, 1], dominance_fraction=threshold)
+
+
+class ConditionedNormalAverage(unittest.TestCase):
+    def test_position_can_select_a_branch_when_colors_are_identical(self):
+        colors = np.zeros((2, 3))
+        positions = np.array([[0., 0.], [1., 1.]])
+        normals = _normals_at_angles([0, 45])
+        predicted = predict_conditioned_normals(colors, positions, normals, colors[:1], positions[:1],
+                                               position_weight=.2, neighbours=2)
+        np.testing.assert_allclose(predicted, normals[:1], atol=1e-12)
+        mixed = predict_conditioned_normals(colors, positions, normals, colors[:1], positions[:1],
+                                           position_weight=0., neighbours=2)
+        self.assertGreater(float(np.linalg.norm(mixed-predicted)), .1)
+        np.testing.assert_allclose(np.linalg.norm(mixed, axis=-1), 1.)
+
+
+class ColorSlopeAmbiguities(unittest.TestCase):
+    def test_all_close_pairs_are_checked_even_when_the_nearest_neighbour_agrees(self):
+        colors = np.array([[0., 0, 0], [.001, 0, 0], [.009, 0, 0], [.03, 0, 0]])
+        slopes = np.array([[0., 0], [0., 0], [1., 0], [0., 0]])
+        pairs, distances, angles = find_ambiguous_color_pairs(colors, slopes,
+            color_distance_threshold=.01, normal_angle_threshold_degrees=20.)
+        self.assertEqual(set(map(tuple, pairs)), {(0, 2), (1, 2)})
+        np.testing.assert_allclose(np.sort(distances), [.008, .009])
+        np.testing.assert_allclose(angles, 45.)
+
+    def test_color_boundary_is_inclusive_and_identical_slopes_do_not_conflict(self):
+        colors = np.array([[0., 0, 0], [.01, 0, 0]])
+        pairs, _, _ = find_ambiguous_color_pairs(colors, [[0., 0], [1., 0]],
+            color_distance_threshold=.01, normal_angle_threshold_degrees=20.)
+        np.testing.assert_array_equal(pairs, [[0, 1]])
+        for threshold in (0., 180.):
+            pairs, _, _ = find_ambiguous_color_pairs(np.zeros((2, 3)), [[.3, -.2], [.3, -.2]],
+                color_distance_threshold=0., normal_angle_threshold_degrees=threshold)
+            self.assertEqual(pairs.shape, (0, 2))
+
+    def test_empty_samples_and_invalid_inputs(self):
+        pairs, distances, angles = find_ambiguous_color_pairs(np.empty((0, 3)), np.empty((0, 2)))
+        self.assertEqual(pairs.shape, (0, 2))
+        self.assertEqual(distances.shape, (0,))
+        self.assertEqual(angles.shape, (0,))
+        with self.assertRaisesRegex(ValueError, 'paired'):
+            find_ambiguous_color_pairs(np.zeros((2, 3)), np.zeros((1, 2)))
+        with self.assertRaisesRegex(ValueError, 'finite'):
+            find_ambiguous_color_pairs([[np.nan, 0., 0.]], [[0., 0.]])
+        with self.assertRaisesRegex(ValueError, 'threshold'):
+            find_ambiguous_color_pairs([[0., 0., 0.]], [[0., 0.]], color_distance_threshold=-1.)
 
 
 class AnalyticPatch:
@@ -54,6 +198,35 @@ class AnalyticPatch:
             return (np.column_stack((1+.2*b, .3*a*b, 1.6*a+.3*b*b)),
                     np.column_stack((.2*a, 1+.15*a*a, .6*a*b)))
         return np.column_stack((o*self.stretch, z, 2*a)), np.column_stack((z, o, z))
+
+
+class ProjectedCircleLimit(unittest.TestCase):
+    def test_projected_radius_uses_the_smaller_focal_scale_and_real_depth(self):
+        camera = CameraModel(np.array([[400., 0, 320], [0, 600., 240], [0, 0, 1.]]), np.zeros(5), (480, 640))
+        # Moving the disk does not change pinhole magnification, even at the image edge.
+        for center in ((320., 240.), (639., 240.)):
+            self.assertAlmostEqual(projected_circle_radius_px(center, 3., 100., camera), 12.)
+            self.assertAlmostEqual(projected_circle_radius_px(center, 3., 200., camera), 6.)
+        with self.assertRaises(ValueError):
+            projected_circle_radius_px((320., 240.), 3., 0., camera)
+
+    def test_projected_radius_includes_radial_distortion(self):
+        camera = CameraModel(np.array([[500., 0, 320], [0, 500., 240], [0, 0, 1.]]),
+                             np.array([-.2, 0, 0, 0, 0]), (480, 640))
+        self.assertAlmostEqual(projected_circle_radius_px((320., 240.), 3., 100., camera),
+                               15.*(1-.2*.03**2))
+
+    def test_annotation_limit_uses_maximum_valid_positive_camera_z(self):
+        from calibrate.manual_norm_regions import _maximum_circle_radius_px
+        camera = CameraModel(np.array([[400., 0, 320], [0, 600., 240], [0, 0, 1.]]), np.zeros(5), (480, 640))
+        xyz = np.zeros((2, 3, 3))
+        xyz[..., 2] = [[50., 100., 400.], [np.nan, -10., 0.]]
+        grid = SimpleNamespace(xyz=xyz, valid_mask=np.array([[True, True, False], [True, True, True]]))
+        frame = SimpleNamespace(camera=camera, systems=SimpleNamespace(observation=grid))
+        self.assertAlmostEqual(_maximum_circle_radius_px(frame, 3., (320., 240.)), 12.)
+        grid.valid_mask[:] = False
+        with self.assertRaisesRegex(ValueError, 'positive surface depth'):
+            _maximum_circle_radius_px(frame, 3., (320., 240.))
 
 
 class ArcLengthAndCoordinates(unittest.TestCase):
@@ -473,7 +646,7 @@ def synthetic_batch(directory):
     settings = CalibrationSettings(work, work/'normal_samples.npz', work/'normal_lut.npz',
         work/'manual_regions.yaml', sphere_radius_mm=10., sphere_side='positive_normal',
         boundary_model='zero_boundary_displacement',
-        lut_size=12, minimum_samples_per_node=1)
+        lut_size=12)
     camera = CameraModel(np.array([[650, 0, 320], [0, 650, 240], [0, 0, 1.]]), np.zeros(5), (480, 640))
     template = np.array([(a, b) for b in np.linspace(0, 42, 8) for a in np.linspace(0, 15, 6)])
     model = SurfaceModel(template, camera.matrix, camera.distortion)
@@ -554,11 +727,11 @@ class HeadlessPipelineAndReuse(unittest.TestCase):
         boundary = region_boundary_points(circle)
         np.testing.assert_allclose(np.linalg.norm(boundary-circle.center_px, axis=1), 12., atol=1e-12)
         np.testing.assert_allclose(boundary[::32], [[52, 30], [40, 42], [28, 30], [40, 18]])
-        masks = region_masks(circle, (60, 80, 3), inner_margin_px=3, outer_margin_px=5)
+        masks = region_masks(circle, (60, 80, 3), outer_margin_px=5)
         self.assertTrue(masks['contact'][30, 40])
+        self.assertTrue(masks['contact'][30, 51])
         self.assertFalse(masks['contact'][30, 55])
         self.assertTrue(masks['exclusion'][30, 55])
-        self.assertTrue(np.all(masks['interior'] <= masks['contact']))
         with TemporaryDirectory() as directory:
             path = Path(directory)/'regions.yaml'
             save_regions(path, [circle], image_root=directory)
@@ -603,12 +776,34 @@ class HeadlessPipelineAndReuse(unittest.TestCase):
             loaded = load_regions(settings.annotations_file, image_root=directory)
             self.assertTrue(all(row.shape == 'circle' and row.status == 'accepted' for row in loaded.values()))
 
+    def test_calibration_editor_updates_size_limit_from_recomputed_geometry(self):
+        from calibrate.manual_norm_regions import annotate_images
+        with TemporaryDirectory() as directory:
+            settings, reference, _ = synthetic_batch(directory)
+            deeper_grid = replace(reference.systems.observation, xyz=reference.systems.observation.xyz*2)
+            deeper = replace(reference, systems=replace(reference.systems, observation=deeper_grid))
+
+            def inspect_limit(regions_to_edit, *, maximum_circle_radius, recompute_callback,
+                              panel_callback, **callbacks):
+                region = regions_to_edit[0]
+                initial = maximum_circle_radius(region)
+                self.assertAlmostEqual(initial, 65.)
+                recompute_callback(region)
+                self.assertAlmostEqual(maximum_circle_radius(region), initial/2)
+                panels = panel_callback(region, None, 'initial')
+                self.assertTrue(any('maximum:' in line for line in panels[1].captions))
+                return False
+
+            with patch('calibrate.norm_pipeline.finalize_image', return_value={'frame': deeper}), \
+                 patch('calibrate.manual_norm_regions.edit_regions', side_effect=inspect_limit):
+                self.assertFalse(annotate_images(settings, edit=True))
+
     def test_color_preview_matches_original_marker_positions_and_spacing(self):
         from calibrate.manual_norm_regions import calibration_panels
         with TemporaryDirectory() as directory:
             settings, reference, _ = synthetic_batch(directory)
             record = compute_frame_colors(reference, reference, settings)
-            middle = calibration_panels(reference, None, record)[1]
+            middle = calibration_panels(reference, None, record)[1].image
             # Image-space positions must stay fixed even though the surface grid is 100x48.
             for pixel in reference.tracking['pixels'][6:-6]:
                 x, y = np.rint(pixel).astype(int)
@@ -629,24 +824,29 @@ class HeadlessPipelineAndReuse(unittest.TestCase):
                 shape='circle', semi_axes_px=(60., 60.))
             cached_color = np.full((*shape, 3), 17, np.uint8)
             panels = calibration_panels(frame, circle, color_image=cached_color)
-            self.assertEqual(panels[1].shape, cached_color.shape)
+            self.assertEqual(panels[1].image.shape, cached_color.shape)
+            self.assertTrue(panels[1].captions)
             for panel in panels[:2]:
-                np.testing.assert_array_equal(panel[400, 860], [0, 255, 0])
-                np.testing.assert_array_equal(panel[400, 800], [0, 0, 255])
+                np.testing.assert_array_equal(panel.image[400, 860], [0, 255, 0])
+                np.testing.assert_array_equal(panel.image[400, 800], [0, 0, 255])
+            np.testing.assert_array_equal(panels[1].image[:100], 17)
             self.assertTrue(np.all(cached_color == 17))
             circle.center_px = (800., 480.)
-            middle = calibration_panels(frame, circle, color_image=cached_color)[1]
+            middle = calibration_panels(frame, circle, color_image=cached_color)[1].image
             np.testing.assert_array_equal(middle[400, 860], [17, 17, 17])
             np.testing.assert_array_equal(middle[480, 860], [0, 255, 0])
             self.assertTrue(np.all(cached_color == 17))
 
     def _run_annotation_editor(self, region, events, recompute=None, save_callback=None,
-                               window_properties=None, editable_panel=0, panel_images=None):
+                               close_window=False, editable_panel=0, panel_images=None,
+                               panel_widths=(640, 640, 640), panel_height=480,
+                               maximum_circle_radius=None):
         from utils.annotation_editor import edit_regions
         events = iter(events)
         previews, saved = [], []
         panel = np.zeros((480, 640, 3), np.uint8)
-        panel_images = (panel, panel, panel) if panel_images is None else panel_images
+        panel_images = tuple(AnnotationPanel(image) for image in
+                             ((panel, panel, panel) if panel_images is None else panel_images))
 
         def render(current, cached, status):
             previews.append((asdict(current), cached))
@@ -657,25 +857,62 @@ class HeadlessPipelineAndReuse(unittest.TestCase):
                 save_callback()
             saved.append(asdict(region))
 
-        with patch.multiple('utils.annotation_editor.cv2', namedWindow=DEFAULT,
-                            setMouseCallback=DEFAULT, imshow=DEFAULT, waitKey=DEFAULT,
-                            getWindowProperty=DEFAULT, destroyWindow=DEFAULT) as gui:
-            gui['getWindowProperty'].return_value = 1
-            gui['getWindowProperty'].side_effect = window_properties
+        with patch('utils.annotation_editor.AnnotationWindow') as factory:
+            window = factory.return_value
+            window.is_closed = False
 
             def dispatch(delay):
                 event = next(events)
                 if isinstance(event, int):
                     return event
-                mouse = gui['setMouseCallback'].call_args.args[1]
+                mouse = window.set_mouse_callback.call_args.args[0]
                 event(mouse, previews)
+                window.is_closed = close_window
                 return -1
 
-            gui['waitKey'].side_effect = dispatch
+            window.wait_key.side_effect = dispatch
             result = edit_regions([region], panel_callback=render,
                 recompute_callback=recompute or (lambda current: object()),
-                save_callback=save, editable_panel=editable_panel)
+                save_callback=save, editable_panel=editable_panel,
+                panel_widths=panel_widths, panel_height=panel_height,
+                maximum_circle_radius=maximum_circle_radius)
         return result, saved
+
+    def test_enlarged_calibration_panel_preserves_circle_edit_coordinates(self):
+        from calibrate.manual_norm_regions import ANNOTATION_PANEL_WIDTHS, ANNOTATION_PANEL_HEIGHT
+        region = RegionAnnotation('circle.png', (640, 480), center_px=(200., 200.),
+            shape='circle', semi_axes_px=(40., 40.))
+        initial = asdict(region)
+
+        def wheel(mouse, previews):
+            mouse(cv2.EVENT_MOUSEWHEEL, 940, 300, 1, None)
+            np.testing.assert_allclose(region.semi_axes_px, (42., 42.))
+            self.assertEqual(region.center_px, (200., 200.))
+
+        def move_and_resize(mouse, previews):
+            self.assertEqual(asdict(region), initial)
+            mouse(cv2.EVENT_LBUTTONDOWN, 940, 300, 0, None)
+            mouse(cv2.EVENT_MOUSEMOVE, 970, 315, 0, None)
+            mouse(cv2.EVENT_LBUTTONUP, 970, 315, 0, None)
+            self.assertEqual(region.center_px, (220., 210.))
+            mouse(cv2.EVENT_LBUTTONDOWN, 1030, 315, 0, None)
+            mouse(cv2.EVENT_MOUSEMOVE, 1060, 315, 0, None)
+            mouse(cv2.EVENT_LBUTTONUP, 1060, 315, 0, None)
+            np.testing.assert_allclose(region.semi_axes_px, (60., 60.))
+            before = asdict(region)
+            for x, y in ((200, 300), (1700, 300), (1000, 730)):
+                mouse(cv2.EVENT_MOUSEWHEEL, x, y, 1, None)
+                mouse(cv2.EVENT_LBUTTONDOWN, x, y, 0, None)
+                mouse(cv2.EVENT_MOUSEMOVE, x+5, y+5, 0, None)
+                mouse(cv2.EVENT_LBUTTONUP, x+5, y+5, 0, None)
+            self.assertEqual(asdict(region), before)
+
+        result, saved = self._run_annotation_editor(region,
+            [wheel, ord('z'), move_and_resize, 13], editable_panel=1,
+            panel_widths=ANNOTATION_PANEL_WIDTHS, panel_height=ANNOTATION_PANEL_HEIGHT)
+        self.assertTrue(result)
+        self.assertEqual(saved[-1]['center_px'], (220., 210.))
+        np.testing.assert_allclose(saved[-1]['semi_axes_px'], (60., 60.))
 
     def test_middle_panel_edits_account_for_offset_scale_and_padding(self):
         region = RegionAnnotation('circle.png', (1280, 720), center_px=(400., 300.),
@@ -774,6 +1011,80 @@ class HeadlessPipelineAndReuse(unittest.TestCase):
         self.assertTrue(result)
         self.assertEqual(saved[-1], dict(initial, status='accepted'))
 
+    def test_circle_editor_limits_initial_radius_drag_wheel_move_and_undo(self):
+        region = RegionAnnotation('circle.png', (640, 480), center_px=(200., 200.),
+                                  shape='circle', semi_axes_px=(80., 80.))
+
+        def limited_edits(mouse, previews):
+            np.testing.assert_array_equal(previews[-1][0]['semi_axes_px'], (40., 40.))
+            mouse(cv2.EVENT_MOUSEWHEEL, 200, 200, 1, None)
+            mouse(cv2.EVENT_LBUTTONDOWN, 240, 200, 0, None)
+            mouse(cv2.EVENT_MOUSEMOVE, 320, 200, 0, None)
+            mouse(cv2.EVENT_LBUTTONUP, 320, 200, 0, None)
+            np.testing.assert_array_equal(region.semi_axes_px, (40., 40.))
+
+        def smaller_radius(mouse, previews):
+            mouse(cv2.EVENT_MOUSEWHEEL, 200, 200, -1, None)
+            np.testing.assert_allclose(region.semi_axes_px, (40./1.05,)*2)
+
+        def move_to_smaller_limit(mouse, previews):
+            np.testing.assert_array_equal(region.semi_axes_px, (40., 40.))
+            mouse(cv2.EVENT_LBUTTONDOWN, 200, 200, 0, None)
+            mouse(cv2.EVENT_MOUSEMOVE, 300, 200, 0, None)
+            mouse(cv2.EVENT_LBUTTONUP, 300, 200, 0, None)
+            np.testing.assert_array_equal(region.semi_axes_px, (25., 25.))
+
+        def restored(mouse, previews):
+            self.assertEqual(region.center_px, (200., 200.))
+            np.testing.assert_array_equal(region.semi_axes_px, (40., 40.))
+
+        result, saved = self._run_annotation_editor(region,
+            [limited_edits, smaller_radius, ord('z'), move_to_smaller_limit, ord('z'), restored, 13],
+            maximum_circle_radius=lambda current: 40. if current.center_px[0] < 250 else 25.)
+        self.assertTrue(result)
+        np.testing.assert_array_equal(saved[-1]['semi_axes_px'], (40., 40.))
+
+    def test_recomputed_limit_requires_a_new_fit_before_accepting_the_clipped_circle(self):
+        region = RegionAnnotation('circle.png', (640, 480), center_px=(200., 200.),
+                                  shape='circle', semi_axes_px=(40., 40.))
+        maximum = 50.
+        fitted_radii = []
+
+        def recompute(current):
+            nonlocal maximum
+            fitted_radii.append(current.semi_axes_px[0])
+            maximum = 30.
+            return object()
+
+        def clipped_without_stale_preview(mouse, previews):
+            np.testing.assert_array_equal(region.semi_axes_px, (30., 30.))
+            self.assertIsNone(previews[-1][1])
+            self.assertEqual(region.status, 'draft')
+
+        result, saved = self._run_annotation_editor(region,
+            [13, clipped_without_stale_preview, 13], recompute,
+            maximum_circle_radius=lambda current: maximum)
+        self.assertTrue(result)
+        self.assertEqual(fitted_radii, [40., 30.])
+        self.assertEqual(len(saved), 1)
+        np.testing.assert_array_equal(saved[0]['semi_axes_px'], (30., 30.))
+
+    def test_rejected_recompute_limits_the_radius_before_saving_a_draft(self):
+        region = RegionAnnotation('circle.png', (640, 480), center_px=(200., 200.),
+                                  shape='circle', semi_axes_px=(40., 40.))
+        maximum = 50.
+
+        def recompute(current):
+            nonlocal maximum
+            maximum = 30.
+            raise FrameCalibrationError('sphere_fit_failed', 'invalid fit', preview={'diagnostic': True})
+
+        result, saved = self._run_annotation_editor(region, [ord('g'), 27], recompute,
+                                                   maximum_circle_radius=lambda current: maximum)
+        self.assertFalse(result)
+        self.assertTrue(all(item['status'] == 'draft' and item['semi_axes_px'] == (30., 30.)
+                            for item in saved))
+
     def test_annotation_rejected_preview_remains_visible_and_cannot_be_accepted(self):
         region = RegionAnnotation('image.png', (640, 480), center_px=(260., 240.))
         preview = {'colors': 'diagnostics'}
@@ -809,7 +1120,7 @@ class HeadlessPipelineAndReuse(unittest.TestCase):
             def inspect_initial_editor(regions_to_edit, *, panel_callback, **callbacks):
                 panels = panel_callback(regions_to_edit[0], None, 'initial preview')
                 # Away from text: actual material-grid colors must already be visible.
-                self.assertTrue(panels[1][120:400, 240:400].any())
+                self.assertTrue(panels[1].image[120:400, 240:400].any())
                 return False
 
             with patch('calibrate.manual_norm_regions.edit_regions', side_effect=inspect_initial_editor) as editor:
@@ -831,9 +1142,10 @@ class HeadlessPipelineAndReuse(unittest.TestCase):
             self.assertGreater(preview['metrics']['sample_count'], 0)
             self.assertIn('normal_gt_grid', preview)
             panels = calibration_panels(prepared, annotation, preview)
-            self.assertTrue(panels[1][150:350, 240:400].any())
-            self.assertTrue(panels[2][150:350, :200].any())
-            self.assertFalse(np.array_equal(panels[2], initial_panels[2]))
+            self.assertTrue(panels[1].image[150:350, 240:400].any())
+            self.assertTrue(panels[2].image.any())
+            self.assertTrue(panels[2].captions[0].startswith('REJECTED'))
+            self.assertFalse(np.array_equal(panels[2].image, initial_panels[2].image))
             with self.assertRaises(FrameCalibrationError):
                 _write_final_record(preview, reference, settings)
             with self.assertRaises(FrameCalibrationError):
@@ -857,41 +1169,85 @@ class HeadlessPipelineAndReuse(unittest.TestCase):
             self.assertEqual(preview['frame'].geometry_stage, 'final')
             self.assertNotIn('normal_gt_grid', preview)
             panels = calibration_panels(prepared, annotation, preview)
-            self.assertTrue(panels[1][120:400, 240:400].any())
-            self.assertTrue(panels[2][120:400, :200].any())
+            self.assertTrue(panels[1].image[120:400, 240:400].any())
+            self.assertTrue(panels[2].image.any())
 
     def test_annotation_window_close_saves_current_draft(self):
-        missing_window = cv2.error('NULL guiReceiver (please create a window)')
-        missing_window.code = cv2.Error.StsNullPtr
-        for window_state in (0., missing_window):
-            with self.subTest(window_state=window_state), TemporaryDirectory() as directory:
-                region = RegionAnnotation('image.png', (640, 480), center_px=(260., 240.))
-                path = Path(directory)/'regions.yaml'
-                recompute = Mock()
+        with TemporaryDirectory() as directory:
+            region = RegionAnnotation('image.png', (640, 480), center_px=(260., 240.))
+            path = Path(directory)/'regions.yaml'
+            recompute = Mock()
 
-                def drag(mouse, previews):
-                    mouse(cv2.EVENT_LBUTTONDOWN, 260, 240, 0, None)
-                    mouse(cv2.EVENT_MOUSEMOVE, 271, 245, 0, None)
-                    mouse(cv2.EVENT_LBUTTONUP, 271, 245, 0, None)
+            def drag(mouse, previews):
+                mouse(cv2.EVENT_LBUTTONDOWN, 260, 240, 0, None)
+                mouse(cv2.EVENT_MOUSEMOVE, 271, 245, 0, None)
+                mouse(cv2.EVENT_LBUTTONUP, 271, 245, 0, None)
 
-                result, saved = self._run_annotation_editor(region, [drag], recompute,
-                    save_callback=lambda: save_regions(path, [region], image_root=directory),
-                    window_properties=[window_state])
-                self.assertFalse(result)
-                self.assertEqual(len(saved), 1)
-                loaded = load_regions(path, image_root=directory)['image.png']
-                self.assertEqual(loaded.status, 'draft')
-                self.assertEqual(loaded.center_px, [271., 245.])
-                recompute.assert_not_called()
+            result, saved = self._run_annotation_editor(region, [drag], recompute,
+                save_callback=lambda: save_regions(path, [region], image_root=directory),
+                close_window=True)
+            self.assertFalse(result)
+            self.assertEqual(len(saved), 1)
+            loaded = load_regions(path, image_root=directory)['image.png']
+            self.assertEqual(loaded.status, 'draft')
+            self.assertEqual(loaded.center_px, [271., 245.])
+            recompute.assert_not_called()
 
-    def test_annotation_window_check_preserves_unrelated_gui_errors(self):
-        from utils.annotation_editor import _window_closed
-        unexpected = cv2.error('Unrelated HighGUI failure')
-        unexpected.code = cv2.Error.StsError
-        with patch('utils.annotation_editor.cv2.getWindowProperty', side_effect=unexpected):
-            with self.assertRaises(cv2.error) as raised:
-                _window_closed('test-window')
-        self.assertIs(raised.exception, unexpected)
+    def test_annotation_window_scroll_preserves_view_and_canvas_coordinates(self):
+        from matplotlib.backend_bases import MouseEvent, KeyEvent, CloseEvent
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+        from utils.annotation_window import (AnnotationWindow, compose_annotation_panels,
+                                             render_annotation_preview, FONT_SIZE_PX)
+
+        canvas = FigureCanvasAgg(Figure(figsize=(12, 4)))
+        manager = Mock(canvas=canvas)
+        screen = manager.window.screen().availableGeometry()
+        screen.width.return_value, screen.height.return_value = 1920, 1080
+        with patch('utils.annotation_window._create_figure_manager', return_value=manager):
+            window = AnnotationWindow('test-window')
+        mouse = Mock()
+        window.set_mouse_callback(mouse)
+        source = np.full((480, 640, 3), (20, 40, 60), np.uint8)
+        display = compose_annotation_panels(
+            (AnnotationPanel(source), AnnotationPanel(source, ('Edit boundary here | wheel: radius',)),
+             AnnotationPanel(source, ('Reference overall depth | camera Z (mm)',), header=True)),
+            (640, 960, 280), 720, 'z: undo | g: recompute | Enter: accept')
+        image = display.image
+        window.show_image(image, display.labels)
+        canvas.draw()
+        axes = canvas.figure.axes[0]
+        limits = axes.get_xlim(), axes.get_ylim()
+        for size in ((12, 4), (6, 7)):
+            canvas.figure.set_size_inches(*size)
+            canvas.callbacks.process('resize_event', Mock())
+            canvas.draw()
+            # The window rasterizes separate font glyphs at its current pixel resolution.
+            scale = axes.transData.get_matrix()[0, 0]
+            renderer = canvas.get_renderer()
+            for text in axes.texts:
+                self.assertAlmostEqual(text.get_fontsize()*canvas.figure.dpi/72, FONT_SIZE_PX*scale)
+                box = text.get_window_extent(renderer)
+                self.assertLessEqual(box.x1, axes.bbox.x1+1)
+            for step in (1, -1):
+                x, y = axes.transData.transform((840, 150))
+                MouseEvent('scroll_event', canvas, x, y, step=step)._process()
+                mouse.assert_called_with(cv2.EVENT_MOUSEWHEEL, 840, 150, step, None)
+                self.assertEqual((axes.get_xlim(), axes.get_ylim()), limits)
+                np.testing.assert_array_equal(axes.images[0].get_array(), image[..., ::-1])
+        preview = render_annotation_preview(display)
+        self.assertEqual(preview.shape, image.shape)
+        self.assertFalse(image[720:].any())
+        self.assertTrue(preview[720:].any())
+        np.testing.assert_array_equal(source, np.full_like(source, (20, 40, 60)))
+        self.assertFalse(axes.get_navigate())
+        MouseEvent('button_release_event', canvas, -10, -10, button=1)._process()
+        mouse.assert_called_with(cv2.EVENT_LBUTTONUP, -1, -1, 0, None)
+        KeyEvent('key_press_event', canvas, key='z')._process()
+        self.assertEqual(window.wait_key(30), ord('z'))
+        CloseEvent('close_event', canvas)._process()
+        self.assertTrue(window.is_closed)
+        window.close()
 
     def test_annotation_yaml_roundtrip_numpy_coordinates(self):
         ellipse = RegionAnnotation('ellipse.png', (np.int64(640), np.int32(480)),
@@ -1092,13 +1448,14 @@ class HeadlessPipelineAndReuse(unittest.TestCase):
                 self.assertTrue((root/str(data['coordinate_chart_file'])).exists())
 
     def test_samples_fit_cache_provider_and_metadata(self):
+        from reconstruction.pipeline import load_sampling_grid
         with TemporaryDirectory() as directory:
             settings, reference, regions = synthetic_batch(directory)
             loaded = load_frame_calibration_data(settings.work_dir/'prepared/000000.npz')
             np.testing.assert_array_equal(loaded.coefficients, reference.coefficients)
             # A non-bicubic analytic surface uses the same chart/grid primitives.
-            patch = AnalyticPatch('cylinder')
-            grid = sample_surface_grid(patch, build_arclength_chart(patch), 10, 12)
+            analytic_surface = AnalyticPatch('cylinder')
+            grid = sample_surface_grid(analytic_surface, build_arclength_chart(analytic_surface), 10, 12)
             self.assertEqual(grid.xyz.shape, (10, 12, 3))
             provider = _provider_from_frame(loaded)
             provider.reset()
@@ -1112,11 +1469,25 @@ class HeadlessPipelineAndReuse(unittest.TestCase):
                 self.assertGreater(record['metrics']['sample_count'], 0)
                 self.assertLess(record['frame'].marker_fit_valid.sum(), 48)
                 self.assertEqual(record['frame'].tracking['valid'].sum(), 48)
-            report = fit_and_validate_samples(settings.input_file, settings)
+                frame = record['frame']
+                contact = region_masks(regions[frame.image_key], frame.original_bgr.shape,
+                                       outer_margin_px=20)['contact']
+                np.testing.assert_array_equal(record['contact_mask'],
+                    sample_mask_to_surface(contact, frame.systems.observation.uv))
+            grid_path = settings.work_dir/'lut_material_grid.npz'
+            grid_path.write_bytes(b'obsolete grid must not be read')
+            with patch('cv2.imread', side_effect=AssertionError('fit must use cached reference geometry')):
+                report = fit_and_validate_samples(settings.input_file, settings)
             self.assertEqual(report['status'], 'passed')
             lut = NormalCalibration.load(settings.output)
             self.assertEqual(lut.metadata['validation_status'], 'passed')
             self.assertEqual(lut.metadata['coordinate_chart_id'], reference.chart.chart_id)
+            shape = reference.systems.observation.xyz.shape[:2]
+            frozen = load_sampling_grid(grid_path, lut, reference.surface, reference.camera, shape)
+            direct = load_sampling_grid(reference.chart_file, lut, reference.surface, reference.camera, shape)
+            np.testing.assert_array_equal(frozen.parameters, direct.parameters)
+            np.testing.assert_array_equal(frozen.st, direct.st)
+            self.assertEqual(frozen.chart_id, lut.metadata['coordinate_chart_id'])
             frame_path = settings.work_dir/'frames/000000.npz'
             xyz, colors, geometry, photo, trusted = _load_reconstruction_input(frame_path, lut.metadata)
             self.assertTrue(np.any(geometry & ~photo))
@@ -1133,6 +1504,33 @@ class HeadlessPipelineAndReuse(unittest.TestCase):
             self.assertEqual(set(regions_back), set(regions))
             self.assertTrue((settings.work_dir/'verification/report.csv').is_file())
             self.assertTrue((settings.work_dir/'verification/000000.png').is_file())
+            visualization = settings.work_dir/'visualization'
+            summary = json.loads((visualization/'summary.json').read_text())
+            self.assertEqual(summary['coordinate_chart_id'], reference.chart.chart_id)
+            self.assertEqual(len(summary['images']), 3)
+            self.assertEqual(summary['final_LUT']['count'], lut.metadata['total_sample_count'])
+            self.assertEqual(len(list((visualization/'color_difference').glob('*.png'))), 3)
+            self.assertEqual(len(list((visualization/'pq_mapping').glob('*.png'))), 3)
+            self.assertIsNotNone(cv2.imread(str(visualization/'calibration_summary.png')))
+            self.assertIsNotNone(cv2.imread(str(visualization/'lut_slices.png')))
+            self.assertIsNotNone(cv2.imread(str(visualization/'color_pq_mapping.png')))
+            self.assertIsNotNone(cv2.imread(str(visualization/'pq_ambiguities.png')))
+            self.assertFalse((visualization/'pq_ambiguities.svg').exists())
+            with np.load(visualization/'ambiguities.npz', allow_pickle=False) as data:
+                expected = np.zeros(lut.metadata['total_sample_count'], bool)
+                expected[data['pairs'].ravel()] = True
+                np.testing.assert_array_equal(data['ambiguous_mask'], expected)
+                self.assertEqual(summary['ambiguities']['ambiguous_sample_count'], int(expected.sum()))
+            from calibrate.visualize_norm import generate_calibration_visualizations
+            before = (visualization/'summary.json').read_bytes()
+            with np.load(settings.input_file, allow_pickle=False) as data:
+                wrong_samples = {key: data[key] for key in data.files}
+            wrong_samples['coordinate_chart_id'] = np.asarray('old-chart')
+            wrong_path = settings.work_dir/'wrong_samples.npz'
+            np.savez_compressed(wrong_path, **wrong_samples)
+            with self.assertRaisesRegex(ValueError, 'coordinate_chart_id mismatch'):
+                generate_calibration_visualizations(settings.output, wrong_path, settings.work_dir)
+            self.assertEqual((visualization/'summary.json').read_bytes(), before)
 
     def test_validation_isolation_failed_publish_and_external_mode(self):
         with TemporaryDirectory() as directory:
@@ -1140,9 +1538,13 @@ class HeadlessPipelineAndReuse(unittest.TestCase):
             run_samples(settings)
             fit_and_validate_samples(settings.input_file, settings)
             old_output = settings.output.read_bytes()
-            with self.assertRaisesRegex(ValueError, 'LUT'):
-                fit_and_validate_samples(settings.input_file, replace(settings, minimum_samples_per_node=100000))
+            grid_path = settings.work_dir/'lut_material_grid.npz'
+            old_grid = grid_path.read_bytes()
+            with patch('calibrate.norm_pipeline.build_normal_lut', side_effect=ValueError('No valid LUT nodes')):
+                with self.assertRaisesRegex(ValueError, 'LUT'):
+                    fit_and_validate_samples(settings.input_file, settings)
             self.assertEqual(settings.output.read_bytes(), old_output)
+            self.assertEqual(grid_path.read_bytes(), old_grid)
             failed = json.loads((settings.work_dir/'verification/validation.json').read_text())
             self.assertEqual(failed['status'], 'failed')
             with np.load(settings.input_file, allow_pickle=False) as data:
@@ -1157,6 +1559,7 @@ class HeadlessPipelineAndReuse(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'validation failed'):
                 fit_and_validate_samples(settings.input_file, settings)
             self.assertEqual(settings.output.read_bytes(), old_output)
+            self.assertEqual(grid_path.read_bytes(), old_grid)
             train = NormalCalibration.load(settings.output.with_name('normal_lut_train.npz'))
             np.testing.assert_array_equal(train.color_min, train_min)
             np.testing.assert_array_equal(train.color_max, train_max)
@@ -1169,6 +1572,174 @@ class HeadlessPipelineAndReuse(unittest.TestCase):
             report = fit_and_validate_samples(external, settings)
             self.assertEqual(report['status'], 'unvalidated_external_samples')
             self.assertEqual(NormalCalibration.load(settings.output).metadata['validation_status'], 'unvalidated_external_samples')
+            self.assertEqual(grid_path.read_bytes(), old_grid)
+
+    def test_refresh_sampling_grid_uses_this_reference_and_keeps_the_LUT(self):
+        from calibrate.norm_pipeline import update_material_sampling_grid
+        from reconstruction.pipeline import load_sampling_grid
+        with TemporaryDirectory() as directory:
+            settings, reference, _ = synthetic_batch(directory)
+            metadata = dict(coordinate_kind='reference_arclength', coordinate_chart_id=reference.chart.chart_id,
+                frame_convention='st_grid_columns_rows', residual_domain='material_grid', color_space='linear_rgb',
+                reference_image=str(reference.source_image), validation_status='passed')
+            lut = NormalCalibration(np.zeros((3, 3, 3, 2)), np.zeros((3, 3, 3)),
+                                    -np.ones(3), np.ones(3), 1., metadata=metadata)
+            lut.save(settings.output)
+            lut_before = settings.output.read_bytes()
+            chart_before = reference.chart_file.read_bytes()
+            path = settings.work_dir/'lut_material_grid.npz'
+            path.write_bytes(b'old grid')
+            self.assertEqual(update_material_sampling_grid(settings), path)
+            shape = reference.systems.observation.xyz.shape[:2]
+            grid = load_sampling_grid(path, lut, reference.surface, reference.camera, shape)
+            expected = sample_surface_grid(reference.surface, reference.chart, *shape)
+            np.testing.assert_array_equal(grid.parameters, expected.parameters)
+            self.assertEqual(settings.output.read_bytes(), lut_before)
+            self.assertEqual(reference.chart_file.read_bytes(), chart_before)
+            wrong = replace(lut, metadata=dict(metadata, coordinate_chart_id='old-chart'))
+            wrong.save(settings.output)
+            grid_before = path.read_bytes()
+            with self.assertRaisesRegex(ValueError, 'coordinate_chart_id mismatch'):
+                update_material_sampling_grid(settings)
+            self.assertEqual(path.read_bytes(), grid_before)
+
+    def test_staged_LUT_write_failure_preserves_published_grid_and_LUT(self):
+        from calibrate.norm_pipeline import _publish_image_calibration
+        with TemporaryDirectory() as directory:
+            settings, reference, _ = synthetic_batch(directory)
+            metadata = dict(coordinate_kind='reference_arclength', coordinate_chart_id=reference.chart.chart_id,
+                frame_convention='st_grid_columns_rows', residual_domain='material_grid', color_space='linear_rgb',
+                reference_image=str(reference.source_image), validation_status='passed')
+            lut = NormalCalibration(np.zeros((3, 3, 3, 2)), np.zeros((3, 3, 3)),
+                                    -np.ones(3), np.ones(3), 1., metadata=metadata)
+            grid_path = settings.work_dir/'lut_material_grid.npz'
+            grid_path.write_bytes(b'published grid')
+            settings.output.write_bytes(b'published LUT')
+            with patch.object(NormalCalibration, 'save', side_effect=OSError('disk write failed')):
+                with self.assertRaisesRegex(OSError, 'disk write failed'):
+                    _publish_image_calibration(settings, lut, 10)
+            self.assertEqual(grid_path.read_bytes(), b'published grid')
+            self.assertEqual(settings.output.read_bytes(), b'published LUT')
+            self.assertFalse(list(settings.work_dir.glob('.normal-*')))
+
+
+class NormalCalibrationVisualization(unittest.TestCase):
+    def test_failed_diagnostic_lut_updates_plots_without_publishing(self):
+        from calibrate.visualize_norm import generate_calibration_visualizations, _validation_label
+        with TemporaryDirectory() as directory:
+            settings, _, _ = synthetic_batch(directory)
+            run_samples(settings)
+            with patch('calibrate.visualize_norm.generate_calibration_visualizations',
+                       return_value=settings.work_dir/'visualization'):
+                fit_and_validate_samples(settings.input_file, settings)
+            published = settings.output.read_bytes()
+            calibration = NormalCalibration.load(settings.output)
+            validation = dict(calibration.metadata['validation'], status='failed')
+            diagnostic = replace(calibration, metadata=dict(calibration.metadata,
+                                 validation_status='failed', validation=validation))
+            path = settings.work_dir/'diagnostic.npz'
+            diagnostic.save(path)
+            train = NormalCalibration.load(settings.output.with_name(settings.output.stem+'_train.npz'))
+            train.save(path.with_name('diagnostic_train.npz'))
+
+            output = generate_calibration_visualizations(path, settings.input_file, settings.work_dir)
+
+            summary = json.loads((output/'summary.json').read_text())
+            self.assertEqual(summary['validation_status'], 'failed')
+            self.assertEqual(summary['validation']['status'], 'failed')
+            self.assertEqual(summary['calibration_file'], str(path))
+            self.assertEqual(summary['original_valid_node_count'], int(calibration.original_valid.sum()))
+            self.assertEqual(summary['retained_sample_count'], int(calibration.sample_counts.sum()))
+            self.assertIn('FAILED', _validation_label(diagnostic))
+            self.assertIn('not published', _validation_label(diagnostic))
+            self.assertEqual(len(list(output.rglob('*.png'))), 10)
+            self.assertEqual(settings.output.read_bytes(), published)
+
+    def _metadata(self):
+        return dict(coordinate_kind='reference_arclength', coordinate_chart_id='this-chart',
+                    frame_convention='st_grid_columns_rows', residual_domain='material_grid',
+                    color_space='linear_rgb', reference_image='reference.png', validation_status='passed',
+                    total_sample_count=2, validation=dict(training_images=['train.png'],
+                    validation_images=['held.png'], thresholds=dict(rms_degrees=25.)))
+
+    def _lut(self, metadata, p):
+        slopes = np.zeros((3, 3, 3, 2))
+        slopes[..., 0] = p
+        return NormalCalibration(slopes, np.zeros((3, 3, 3)), -np.ones(3), np.ones(3), 1., metadata=metadata)
+
+    def _samples(self):
+        return dict(color_residual_samples=np.zeros((2, 3)), slope_samples=np.zeros((2, 2)),
+                    reference_normal_samples=np.tile([0., 0., 1.], (2, 1)),
+                    tangent_frame_samples=np.tile(np.eye(3)[:, :2], (2, 1, 1)),
+                    image_index=np.array([0, 1]), image_paths=np.array(['train.png', 'held.png']))
+
+    def test_raw_prediction_is_visible_outside_the_truth_comparison_mask(self):
+        from calibrate.visualize_norm import _predict
+        samples = self._samples()
+        truth = np.tile([1., 0.], (2, 1))
+        predicted, angles, valid = _predict(self._lut(self._metadata(), 1.), samples['color_residual_samples'],
+            truth, samples['reference_normal_samples'], samples['tangent_frame_samples'], np.array([True, False]))
+        # A zero color still receives the LUT's raw value; reconstruction protection is absent.
+        np.testing.assert_array_equal(predicted, truth)
+        np.testing.assert_array_equal(valid, [True, False])
+        self.assertAlmostEqual(angles[0], 0., places=5)
+        self.assertTrue(np.isnan(angles[1]))
+
+    def test_held_out_plot_queries_training_LUT_instead_of_the_final_LUT(self):
+        from calibrate.visualize_norm import _validation_predictions
+        metadata = self._metadata()
+        final = self._lut(metadata, 10.)
+        train_metadata = dict(metadata, validation_status='training_only',
+                              training_images=['train.png'], validation_images=['held.png'])
+        with TemporaryDirectory() as directory:
+            path = Path(directory)/'current.npz'
+            final.save(path)
+            self._lut(train_metadata, 0.).save(path.with_name('current_train.npz'))
+            prediction, angles, mask = _validation_predictions(path, final, self._samples())
+            np.testing.assert_array_equal(mask, [False, True])
+            np.testing.assert_array_equal(prediction[mask], 0.)
+            np.testing.assert_array_equal(angles[mask], 0.)
+
+    def test_frame_selection_excludes_stale_batches(self):
+        from calibrate.visualize_norm import DECLARATIONS, _frame_paths
+        metadata = self._metadata()
+        declarations = {key: metadata[key] for key in DECLARATIONS}
+        samples = self._samples()
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/'frames').mkdir()
+            for index, key in enumerate(samples['image_paths']):
+                np.savez(root/'frames'/f'{index:06d}.npz', **declarations, image_key=key, geometry_stage='final')
+            old = dict(declarations, coordinate_chart_id='old-chart')
+            np.savez(root/'frames/000009.npz', **old, image_key='train.png', geometry_stage='final')
+            paths = _frame_paths(root, samples, self._lut(metadata, 0.))
+            self.assertEqual(set(paths), {'train.png', 'held.png'})
+            self.assertEqual(paths['train.png'].name, '000000.npz')
+
+    def test_visualization_directory_rejects_unrelated_files(self):
+        from calibrate.visualize_norm import _check_output_directory
+        with TemporaryDirectory() as directory:
+            output = Path(directory)/'visualization'
+            output.mkdir()
+            summary = dict(report_kind='normal_calibration_visualization', images=[])
+            (output/'summary.json').write_text(json.dumps(summary))
+            note = output/'notes.txt'
+            note.write_text('keep this user file')
+            with self.assertRaisesRegex(ValueError, 'unrelated files'):
+                _check_output_directory(output, ())
+            self.assertEqual(note.read_text(), 'keep this user file')
+
+    def test_plot_failure_does_not_change_a_passed_validation_report(self):
+        with TemporaryDirectory() as directory:
+            work = Path(directory)
+            settings = CalibrationSettings(work, work/'samples.npz', work/'lut.npz', work/'regions.yaml')
+            report_path = work/'verification/validation.json'
+            _save_json(report_path, dict(status='passed'))
+            with patch('calibrate.norm_pipeline._fit_and_validate_samples', return_value={'status': 'passed'}), \
+                 patch('calibrate.visualize_norm.generate_calibration_visualizations', side_effect=ValueError('plot data')):
+                with self.assertRaisesRegex(RuntimeError, '已保存.*可视化生成失败'):
+                    fit_and_validate_samples(settings.input_file, settings)
+            self.assertEqual(json.loads(report_path.read_text()), {'status': 'passed'})
 
 
 class SingleImageReconstruction(unittest.TestCase):
@@ -1201,7 +1772,8 @@ class SingleImageReconstruction(unittest.TestCase):
 
     def test_single_image_pipeline_matches_offline_solver_and_reference_is_zero(self):
         from reconstruction.pipeline import reconstruct_image
-        from reconstruction.local_recon import local_main, reconstruct_from_input
+        from reconstruction.local_recon import (local_main, reconstruct_from_input,
+            load_local_reconstruction_settings, save_reconstruction_result)
         with TemporaryDirectory() as directory:
             root = Path(directory)
             _, reference, _ = synthetic_batch(directory)
@@ -1210,7 +1782,11 @@ class SingleImageReconstruction(unittest.TestCase):
             grid_before = reference.chart_file.read_bytes()
             with patch('reconstruction.pipeline.reconstruct_from_input', wraps=reconstruct_from_input) as solve:
                 result, output = reconstruct_image(root/'folder0/same_name.png', config)
-            self.assertEqual(output, root/'results/same_name_local_result.npz')
+            self.assertEqual(output, root/'results/pc/same_name_local_result.npz')
+            save_reconstruction_result(result, output)
+            self.assertTrue(output.is_file())
+            self.assertIsNotNone(cv2.imread(str(root/'results/same_name_local_result.png')))
+            self.assertFalse(output.with_suffix('.png').exists())
             self.assertEqual(result.xyz_out.shape, (50, 24, 3))
             self.assertTrue(np.max(np.abs(result.displacement)) > .001)
             data = solve.call_args.args[0]
@@ -1219,6 +1795,8 @@ class SingleImageReconstruction(unittest.TestCase):
             np.testing.assert_array_equal(data['material_coordinates'], data['reference_material_coordinates'])
             source, offline = root/'paired_input.npz', root/'offline.npz'
             np.savez_compressed(source, **data)
+            settings = load_local_reconstruction_settings(config, input_override=str(source))
+            self.assertEqual(settings.output_file, root/'results/pc/paired_input_local_reconstruction.npz')
             with patch('sys.argv', ['local-recon', '--config', str(config), '--input', str(source), '--output', str(offline)]):
                 local_main()
             with np.load(offline, allow_pickle=False) as replay:

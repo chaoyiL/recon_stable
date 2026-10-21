@@ -20,7 +20,8 @@ MAX_WIDTH = 30
 MIN_HEIGHT = 2
 MAX_HEIGHT = 30
 # Search limits must include complete cross arms, not only their centers.
-DETECT_X_MAX = 515
+# Exclude the reflective right frame from the current camera view.
+DETECT_X_MAX = 485
 DETECT_X_MIN = 140
 
 

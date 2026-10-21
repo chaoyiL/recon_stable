@@ -7,6 +7,7 @@ import numpy as np
 from scipy.integrate import cumulative_trapezoid
 from scipy.spatial import cKDTree
 from utils.surface_geometry import ParametricSurface
+from utils.surface_projection import CameraModel
 from utils.surface_sampling import bilinear_sample
 
 COORDINATE_KIND = 'reference_arclength'
@@ -204,6 +205,33 @@ def sample_surface_grid(surface: ParametricSurface, chart: ArcLengthChart, rows:
     parameters, st, valid = chart._cache[key]
     xyz = np.asarray(surface.evaluate(parameters.reshape(-1, 2)), np.float64).reshape(rows, columns, 3)
     return SurfaceGrid(parameters, st, xyz, valid & np.isfinite(xyz).all(axis=-1))
+
+
+def build_material_sampling_grid(
+    surface: ParametricSurface,
+    chart: ArcLengthChart,
+    shape: tuple[int, int],
+    template_xy_mm: np.ndarray,
+    camera: CameraModel,
+) -> dict[str, np.ndarray]:
+    """Build frozen-grid NPZ arrays from this reference chart, never an older grid.
+
+    shape is (rows, columns). material_coordinates are native (a, b) in mm;
+    st is the regular dimensionless reference arc-length grid. Both are float64.
+    Camera/template arrays bind the grid to the reconstruction geometry.
+    """
+    grid = sample_surface_grid(surface, chart, *shape)
+    if not grid.coordinate_valid.all():
+        raise ValueError('Reference material sampling grid must have finite geometry everywhere')
+    return dict(
+        format_version=np.asarray(1, np.int32), grid_kind=np.asarray('frozen_material_grid'),
+        material_coordinates=grid.parameters, st=grid.st,
+        coordinate_kind=np.asarray(chart.coordinate_kind), coordinate_chart_id=np.asarray(chart.chart_id),
+        frame_convention=np.asarray(FRAME_CONVENTION), residual_domain=np.asarray('material_grid'),
+        color_space=np.asarray('linear_rgb'), template_xy_mm=np.asarray(template_xy_mm, np.float64),
+        camera_matrix=camera.matrix, dist_coeffs=camera.distortion,
+        image_shape=np.asarray(camera.image_shape, np.int32),
+    )
 
 
 def save_arclength_chart(path: str | Path, chart: ArcLengthChart) -> Path:

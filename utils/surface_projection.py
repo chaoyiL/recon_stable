@@ -49,6 +49,36 @@ def unproject_rays(pixels: np.ndarray, camera: CameraModel) -> tuple[np.ndarray,
     return np.where(valid[..., None], rays, 0), valid
 
 
+def projected_circle_radius_px(
+    center_px: tuple[float, float],
+    radius_mm: float,
+    depth_mm: float,
+    camera: CameraModel,
+) -> float:
+    """Fit an image-space circle inside a projected camera-parallel physical disk.
+
+    center_px uses original, distorted image pixels; depth_mm is camera Z.
+    The physical disk has radius_mm and its center projects to center_px.
+    Return the smallest projected radius over 128 boundary directions, including
+    lens distortion. Without distortion this is min(fx, fy) * radius_mm / depth_mm.
+    The disk may extend beyond the image; image clipping does not change its size.
+    """
+    if not np.isfinite([radius_mm, depth_mm]).all() or min(radius_mm, depth_mm) <= 0:
+        raise ValueError('Physical radius and camera depth must be positive and finite')
+    rays, valid = unproject_rays(np.asarray(center_px)[None], camera)
+    if not valid[0] or rays[0, 2] <= 0:
+        raise ValueError('Circle center must have a finite forward camera ray')
+    center = rays[0] * (depth_mm / rays[0, 2])
+    angles = np.arange(128) * (2 * np.pi / 128)
+    boundary = center + radius_mm * np.column_stack(
+        (np.cos(angles), np.sin(angles), np.zeros_like(angles)))
+    pixels, _ = project_points(boundary, camera)
+    radii = np.linalg.norm(pixels - center_px, axis=-1)
+    if not np.isfinite(radii).all() or radii.min() <= 0:
+        raise ValueError('Physical disk must have a finite positive projected radius')
+    return float(radii.min())
+
+
 @dataclass(frozen=True)
 class ProjectionInverse:
     parameters: np.ndarray

@@ -19,10 +19,16 @@ uv run recon --config config.yaml \
   --image assets/cali_norm_pics/capture_20261016_184356_361449.png
 ```
 
-默认输出到 `reconstruction.output_dir`，文件名为 `<图片名>_local_result.npz` 和同名 PNG。
+默认输出根目录为 `reconstruction.output_dir`（当前是 `assets/reconstruction`）：
+
+- NPZ：`assets/reconstruction/pc/<图片名>_local_result.npz`。
+- 预览图：`assets/reconstruction/<图片名>_local_result.png`。
+
+程序自动创建所需目录。独立 `local-recon` 同样使用这组目录，默认文件名为 `<输入包名>_local_reconstruction`。
 NPZ 字段及预览格式与独立局部重建一致；预览显示三维曲面和法向位移，不显示置信度。
 二维位移图按三维曲面行、列曲线的代表性实际长度保持宽高比例，坐标标签仍为材料网格索引。
-可用 `--output result.npz` 指定输出，`--show` 在保存后打开预览。
+可用 `--output result.npz` 指定 NPZ 的准确位置；位于 `pc/` 时，同名预览图默认放在上一级目录，其余情况放在 NPZ 旁。
+`--preview-output` 可单独指定图片路径，`--show` 在保存后打开预览。
 也可使用 `uv run python -m reconstruction.recon`，参数相同。
 
 ## 固定输入与处理流程
@@ -70,19 +76,24 @@ local_reconstruction:
 设置 `match_surface_aspect: false` 可严格使用 observation 配置的行列数。
 
 材料文件可为与 LUT 编号匹配的完整弧长图，也可为已保存的冻结逆采样网格。
-当前 `lut_material_grid.npz` 保留旧 LUT 的 400×202 原生参数、st、相机和模板。
-它提供原坐标图的逆映射；改变求解分辨率时，在规则 st 上双线性插值原生参数，然后重新计算
+图片法向标定的 `fit` 验证通过后，自动从同批 reference 坐标图重新生成
+`work_dir/lut_material_grid.npz`，同时发布最终 LUT。网格尺寸取 reference 的 observation 行列数，
+保留本批坐标编号、float64 原生参数、st、相机和模板，不沿用旧文件的坐标或尺寸。
+单独重跑 `fit` 同样更新网格；reference 不配套或验证失败时保留此前发布的 LUT 和网格。
+重建配置的 `material_grid_file` 应指向本批 work_dir 下的该文件。
+
+它提供参考坐标图的逆映射；改变求解分辨率时，在规则 st 上双线性插值原生参数，然后重新计算
 两张图各自的 XYZ、UV 和颜色。完整弧长图则直接反解目标 st。两条路径均保留坐标身份，不修改 LUT，
 也不缩放已有位移结果；冻结逆网格插值的精度受原网格分辨率限制。
-新批次 prepare 的坐标图与当前旧 LUT 编号不同，二者应分开使用。
-成像条件变化会影响旧 LUT 的精度，复用网格只保证坐标与颜色配对一致。
+新批次 prepare 后，完成相应 samples 和 fit，再使用同批 LUT 与采样网格。
+标定后成像条件变化会影响 LUT 的精度，配套网格只保证坐标与颜色配对一致。
 
 ## 独立模块
 
 ```bash
 uv run get-surface --config config.yaml --image input.png --output overall.npz
 uv run local-recon --config config.yaml --input paired_input.npz --output local.npz
-uv run local-recon --view local.npz
+uv run local-recon --view assets/reconstruction/pc/local.npz
 ```
 
 `recon-local` 作为 `local-recon` 的兼容别名保留。
@@ -95,6 +106,6 @@ uv run local-recon --view local.npz
 ## 保留的数据
 
 `assets/normal_calibration/` 保留当前 LUT、训练样本、标注、相关几何缓存、验证结果和冻结材料网格。
-`lut_source_images/` 从旧标定缓存无损恢复当前 LUT 的 17 张原始标定图和底色图，来源见 `lut_sources.json`。
+`lut_source_images/` 保留从旧标定缓存恢复的 17 张历史标定图和底色图，来源见 `lut_sources.json`；当前 LUT 的配套关系以自身 metadata 为准。
 新批次照片保留在 `assets/cali_norm_pics/`，运行时参考图为 `assets/reference.png`。
 相机标定结果也保留。

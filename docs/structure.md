@@ -85,7 +85,7 @@ uv run calibrate-norm --config config.yaml --stage fit
 | `prepare` | 检测参考/当前黑框、参考完整 ID 初始化、独立跟踪、保存可回放缓存；不要求球半径 |
 | `annotate` | 对缺标注图片打开三面板编辑器；accepted/skip 默认复用，`--edit` 重新编辑 |
 | `samples` | 无界面读取缓存与 accepted 标注，重新拟合最终曲面，生成颜色/球面标签和逐图报告 |
-| `fit` | 只读取聚合样本，不读取原图、不创建 GUI；训练、整图留出验证和最终发布 |
+| `fit` | 读取聚合样本及同批 reference 几何缓存；训练、整图留出验证，发布最终 LUT 和重新生成的采样网格；不读取原图、不创建 GUI |
 
 CLI 还可使用 `--images`、`--reference-image`、`--sphere-radius-mm`、`--sphere-side`、`--annotations` 和 `--output` 覆盖配置。`--input` 选择外部样本模式，与 `--images` 互斥；默认阶段为 fit。
 
@@ -97,14 +97,20 @@ uv run calibrate-norm --input external_samples.npz --output external_lut.npz
 
 ### 标注操作
 
-三个面板显示原图与 marker 屏蔽、曲面色差与 sample mask、整体曲面深度预览或球面法向/拟合误差。直接在中间色差图上编辑绿色接触轮廓和红色圆心，左侧原图同步显示轮廓供对照；鼠标编辑只作用于中间面板。进入标注即显示基于参考曲面 UV 的近似色差，标记为 `Reference UV colors`；按 `g` 后改用重拟合曲面的 UV，标记为 `Final UV colors`。右侧明确标识参考深度、最终整体深度或球面法向。面板列出有效颜色点和配对样本数。色差图的显示缩放及面板偏移显式转换回原图像素坐标。
+三个面板显示原图与 marker 屏蔽、曲面色差与 sample mask、整体曲面深度预览或球面法向/拟合误差。直接在中间色差图上编辑绿色接触轮廓和红色圆心，左侧原图同步显示轮廓供对照；鼠标编辑只作用于中间面板。进入标注即显示基于参考曲面 UV 的近似色差，标记为 `Reference UV colors`；按 `g` 后改用重拟合曲面的 UV，标记为 `Final UV colors`。面板列出有效颜色点和配对样本数。色差图的显示缩放及面板偏移显式转换回原图像素坐标。
 
-中间面板按当前预览几何的 UV 将曲面色差及 sample mask 映射回原图像素坐标，并与左侧原图使用相同的显示缩放，使 marker 位置与间距对应。投影外、无效颜色和 marker 区域显示为黑色。该反投影仅用于显示，训练仍使用材料网格中的原始色差和有效 mask；编辑轮廓时复用色差预览，重算几何后刷新。
+右侧在球面法向尚未算出时显示整体曲面的相机深度 `Z`（mm）：按当前有效区域的最小、最大 Z 映射为 VIRIDIS 颜色，深紫色较近、黄色较远；每张图单独归一化，不能跨图直接比较颜色。`Reference overall depth` 使用准备阶段的参考曲面，`Final overall depth` 使用按当前标注重拟合的整体曲面。球面拟合成功后切换为 `Sphere normals`：RGB 分别编码相机坐标系的 `nx / ny / nz`，分量从 `[-1,1]` 映射到 `[0,255]`；黑色为未参与配对的样本区域。该图来自球面几何标签，不是 LUT 预测、置信度或局部位移。右图使用材料采样网格行列，不是原图像素坐标。编辑圆后清除旧球面标签，恢复参考深度预览；按 `g` 重新计算。
+
+标注窗口使用 Matplotlib 的 PyQt5 画布，禁用导航工具和画面缩放。三栏显示宽度依次为 640、960、280 像素，图像区高度为 720 像素；左侧原图和中间色差图等比例显示，右侧预览紧凑排列，说明文字在上方换行。说明文字和状态栏采用 22 像素字号、30 像素行距，使用独立字体图层按窗口实际分辨率绘制；不再先把小字画进源图后随图像插值放大。文字按实际字宽换行，底部预留四行状态区。窗口初始大小适配屏幕，可手动调整；鼠标位置仍按固定图像坐标转换，滚轮仅修改中间面板内的标注圆半径。保存的标定预览使用相同布局，文字直接在最终 PNG 分辨率绘制。首次安装新增 GUI 依赖时运行 `uv sync`。
+
+使用 Conda 或其他已激活环境时，依赖必须安装到实际运行程序的 Python 中；`uv sync` 默认管理项目 `.venv`，不会自动同步其他环境。可用 `python -c "import sys; print(sys.executable)"` 确认解释器。在该环境安装 PyQt5 后，可直接运行 `python -m calibrate.calibrate_norm --config config.yaml --stage annotate` 继续标注，无需重新 prepare。
+
+中间面板按当前预览几何的 UV 将曲面色差及 sample mask 映射回原图像素坐标。各面板分别等比例缩放，鼠标位置按中间面板的偏移与缩放换算回原图，保存的轮廓仍使用原图像素坐标。投影外、无效颜色和 marker 区域显示为黑色。该反投影仅用于显示，训练仍使用材料网格中的原始色差和有效 mask；编辑轮廓时复用色差预览，重算几何后刷新。
 
 | 操作 | 行为 |
 |---|---|
-| 在中间色差图拖动圆内部 / 圆周 | 平移圆心 / 调整半径，始终保持圆形 |
-| 鼠标滚轮 | 同比例缩放圆的半径 |
+| 在中间色差图拖动圆内部 / 圆周 | 平移圆心 / 调整半径，始终保持圆形且不超过物理尺寸上限 |
+| 中间色差图内使用鼠标滚轮 | 在物理上限内调整圆半径，不缩放画面；其他面板和空白区域不响应 |
 | `c` 后点击中间色差图 | 设置圆心，同时作为接触区内部代表点 |
 | `z` | 撤回当前图片的上一步编辑，可连续撤回；完整拖动算一步 |
 | `g` | 用当前标注重新计算最终几何、背景检查和球面标签 |
@@ -114,9 +120,13 @@ uv run calibrate-norm --input external_samples.npz --output external_lut.npz
 
 标定默认使用原图像素空间中的圆形接触边界，`shape: circle`，`semi_axes_px` 的两个数值均为半径；拖动和缩放都不能改变为椭圆，`a / d / p` 在圆形模式下不生效。球面标签继续通过相机投影和真实球半径计算。
 
+标注圆直径受真实球尺寸限制。这里“最高深度”指有效整体曲面的最大正相机深度 `Z_max`（mm），不是离相机最近的点。令球半径为配置中的 `R`（mm）、标注圆心为原图像素 `c`，将圆心相机射线与 `Z=Z_max` 平面相交得到 `C`。在该平面投影球的最大截面：对 128 个均匀角度计算 `q(theta) = C + R * (cos(theta), sin(theta), 0)`，上限为 `r_max = min ||project(q(theta)) - c||`（pixel）。`project` 使用相机内参和畸变；无畸变时简化为 `D_max = 2 * min(fx, fy) * R / Z_max`，圆形标注采用较小方向的投影尺度。这个尺寸约束使用平行于成像平面的最大截面，不替代后续球面拟合验收。
+
+初始使用 prepared 曲面，重算后使用最近一次得到的最终曲面；移动圆心时重新计算畸变对尺寸的影响。面板显示当前直径和最大直径。新圆、重新打开的旧圆、拖动、滚轮与撤回均限制在上限内。若重算后上限变小，自动收缩并清除过期预览，再次重算通过才能接受；没有有效正深度时报错，不使用默认上限。未打开的 accepted/skip 标注保持不变。
+
 旧椭圆或多边形标注仍可读取；在 annotate 中重新打开该图片时，保留圆心位置并以等面积圆作为编辑初值（多边形转换的最小半径为 2 px），重新确认后保存。已接受或跳过的图片需用 `--stage annotate --edit` 打开；不会批量改写未打开的旧标注。
 
-撤回支持圆心平移、半径调整、滚轮缩放和中心设置。撤回后按 `g` 重算预览；中心选择尚未点击时，`z` 先取消选择。历史仅保留在当前图片本次编辑过程中。
+撤回支持圆心平移、半径调整、滚轮调整半径和中心设置。撤回后按 `g` 重算预览；中心选择尚未点击时，`z` 先取消选择。历史仅保留在当前图片本次编辑过程中。
 
 标注 YAML v2 使用统一 `image_root` 下的完整相对图片路径，支持不同目录同名图片。标注语义固定为 `contact_boundary`。修改标注后从 samples 重跑；相机、模板或参考坐标图变化后重新 prepare。
 
@@ -132,7 +142,7 @@ uv run calibrate-norm --input external_samples.npz --output external_lut.npz
 
 先转线性 RGB，再分别按各自 UV 做严格四邻域双线性采样，最后计算 `observed-reference`。保留三通道正负号，不给 marker 补色。几何 mask 保留 marker 材料位置，光度 mask 表示两侧颜色都有效。
 
-边界按 128 点采样；内缩 3 px 生成标签区，外扩 20 px 排除整体拟合和背景统计。UV 三角形提供原生参数初值，再在归一化原生参数中优化反投影。边界至少 96 点有效且连续缺失不超过 32 点；多解拒绝。
+边界按 128 点采样；标签直接使用标注圆盘，不缩小半径或内缩边界，外扩 20 px 仅用于排除整体拟合和背景统计。UV 三角形提供原生参数初值，再在归一化原生参数中优化反投影。边界至少 96 点有效且连续缺失不超过 32 点；多解拒绝。
 
 固定真实半径，用带鲁棒损失的优化拟合球心。先在中心射线选择唯一球冠分支，再将 minus/plus 分支锁定整张图片。每个颜色点沿同一个当前 UV 的射线求真实球面交点，法向转换成共用局部基的坡度。
 
@@ -140,7 +150,82 @@ uv run calibrate-norm --input external_samples.npz --output external_lut.npz
 
 整图验证按图片 key 排序后用种子 42 打乱，默认留出 20%，至少一张验证图、一张训练图。颜色范围、节点和缺节点补全仅使用训练组。验证直接调用原始 LUT 插值，不应用推理的零色差保护或无接触覆盖。默认要求每张验证图角度 RMS ≤5°、原始色差超训练范围比例 ≤0.05。
 
-先写训练 LUT 和验证 JSON；全部通过后才用全部 accepted 样本重新拟合并原子替换最终输出。失败保留已有最终 LUT。
+先写训练 LUT 和验证 JSON；全部通过后才用全部 accepted 样本重新拟合最终 LUT。同时加载同批 `reference_surface.npz` 和其 `reference_coordinates.npz`，按 reference 的 observation 行列数在规则 st 上重新反解原生材料坐标，生成 `lut_material_grid.npz`。不读取或沿用已有采样网格，单独运行 `fit` 也会重新生成。
+
+发布前检查 reference 与 LUT 的坐标编号、参考图和坐标约定一致，并先完整写好两个临时文件，再分别替换最终 LUT 和采样网格。验证、reference 检查或临时文件写入失败时保留已发布的两个文件。旧两数组外部样本没有 reference 几何，只生成标记为未验证的 LUT，不更新采样网格。
+
+图片 `fit` 成功后自动在 `work_dir/visualization/` 生成本批结果；已有标定也可独立补生成：
+
+```bash
+uv run python -m calibrate.visualize_norm --config config.yaml
+```
+
+验证失败的诊断 LUT 也可通过 `--calibration PATH` 生成全部图表，但须附带失败验证报告及同名 `_train.npz`。图表统一标记 `FAILED | diagnostic LUT; not published`，`summary.json` 记录验证状态、报告、有效节点数和保留样本数；该操作不发布 LUT，也不更新重建使用的采样网格。
+
+程序读取全样本 LUT、同名 `_train.npz`、聚合样本及配套 `frames/overall` 缓存，不重新训练或打开 GUI。可用 `--calibration`、`--samples`、`--work-dir`、`--output-dir` 覆盖路径。输入须为通过验证的图片 LUT，或附带失败报告的诊断 LUT；旧两数组外部样本没有空间图和独立验证信息。
+
+不良映射图使用拟合及剔除前的球面标签 p/q：对所有无序样本对（包含同图与跨图），若有符号线性 RGB 欧氏距离 ≤色差阈值，且公共局部坐标约定下 `normalize([-p,-q,1])` 的法向夹角 >角度阈值，将两端样本都标红。默认阈值分别为 0.01 和 20°；通过 `--color-distance-threshold` 和 `--normal-angle-threshold-degrees` 调整。一个点只要参与任意冲突对即计为不良点；点数与配对数分别记录，不只查询最近邻。图中 q 轴向下增大，与参考图一致，p/q 数值符号不变。
+
+使用原始标注圆盘重新标定的 deep 结果位于 `assets/normal_calibration_comparison/deep_full_disk/`，原 deep 结果保留作对照。重新绘图示例：
+
+```bash
+uv run python -m calibrate.visualize_norm \
+  --calibration assets/normal_calibration_comparison/deep_full_disk/normal_lut.npz \
+  --samples assets/normal_calibration_comparison/deep_full_disk/normal_samples.npz \
+  --work-dir assets/normal_calibration_comparison/deep_full_disk \
+  --color-distance-threshold 0.01 --normal-angle-threshold-degrees 20
+```
+
+| 输出 | 内容 |
+|---|---|
+| `color_difference/000000.png` | 原图像素位置的有符号色差预览及线性 RGB 三通道色差；预览为 `0.5 + 2 * delta`，黑色表示无效 |
+| `pq_mapping/000000.png` | 最终 LUT 查询得到的 p、q、坡度模长；球面真值 p、q 和仅在配对样本区计算的法向角误差 |
+| `color_pq_mapping.png` | 以三个 RGB 色差通道为坐标、分别以预测 p/q 着色的三维映射示意；最多均匀显示 6000 个样本 |
+| `lut_slices.png` | 分别固定 ΔR、ΔG、ΔB 为 0 的完整 LUT p/q 切片，包含补全节点 |
+| `calibration_summary.png` | 最终 LUT 的拟合散点和角误差分布，以及训练组 LUT 在留出图片上的 p/q 散点和逐图 RMS |
+| `pq_ambiguities.png` | 球面标签的 p/q 分布，不良映射点标红；大坡度数据另附中央区域放大图，仅输出 PNG |
+| `ambiguities.npz` | 完整样本色差与坡度、图片索引、不良点 mask、冲突对索引、逐对色差距离和法向夹角、两个阈值 |
+| `summary.json` | 本批图片索引、完整图片 key、图像路径及拟合/独立验证统计 |
+
+p/q 是局部正交切向基下的无量纲坡度，所有预测都调用原始 LUT，不应用重建阶段的零色差保护或无接触覆盖。逐图 p/q 图展示最终全样本 LUT；独立留出验证使用 `_train.npz`，与 `validation.json` 的分组保持一致。编号按聚合样本中的 `image_paths` 顺序，完整对应关系见 `summary.json`。
+
+空间图通过现有 UV 映射回原图，并裁剪到可见曲面附近。色差及 p/q 色标在本批图片间一致；角误差图以本批 RMS 阈值作为显示上限，超出值使用顶端颜色并由色条箭头标明，不参与重新判定有效性。图像回投只用于显示，统计直接在原始材料网格样本上计算。旧批次缓存按编号排除；输入不配套或生成失败时保留原报告。报告目录内出现无关文件时拒绝覆盖。可视化失败会明确报错，已发布 LUT 的验证状态保持不变。
+
+`calibrate.analyze_ambiguities` 进一步分析不良点的色差符号、强度、倾角、图片及接触圆内位置，比较图像域的局部法向平滑性，并检查每个不良点颜色邻域内的坡度分支：
+
+```bash
+uv run python -m calibrate.analyze_ambiguities \
+  --work-dir assets/normal_calibration_comparison/deep_full_disk \
+  --color-distance-threshold 0.01 --normal-angle-threshold-degrees 20
+```
+
+默认输出到本批目录的 `ambiguity_analysis/`：PNG 展示统计规律、原图中的不良点、局部 p/q 分支、外围分支支撑及改进实验；`analysis.json` 记录定义、源文件哈希和完整统计，`samples.csv` 保存逐点诊断。颜色图统计不良点比例，不使用红点数量代替风险；另记录每个近色邻居的冲突比例，避免混淆样本密度与歧义。
+
+局部颜色球以不良点为中心、RGB 距离为半径，因此不同球可以重叠，分类数不代表独立板块数。原颜色球的连通分量描述保留在 `neighbourhood_classification`：法向图用 ≤10° 的边连接样本，并记录 7.5°、10°、15° 连边阈值的敏感性；其中少于 6 点只描述原颜色球内的数量。正式的“主支撑簇／多分支重叠”分类使用下面的外围扩展证据，不以原颜色球点数停止分析。
+
+少于 6 点只描述原颜色球内的数量，不停止分析或删除样本。对全部冲突对，继续以两端色差中点查询 2、3、4 倍色差阈值的外围邻域，并排除两端各自的原颜色球，防止冲突点和原邻域给自身提供支撑。分别记录外围法向与两端法向相差 ≤原法向阈值一半的点数、图片数、其他图片数、最近色差距离和外围最小法向差。`branch_continuation.csv` 保存全部逐对、多尺度证据，`branch_continuation.png` 展示两支都有外围支撑和仅一支有支撑的实例。此处用已知端点法向追踪候选分支，不是无偏预测验证；外围没有支撑也不自动等于错点，可能是覆盖不足或分支变化快。
+
+扩展分类默认使用 3 倍色差阈值的外围半径。设两支的外围支撑点数为 A、B：总支撑大于零且 `max(A,B)/(A+B) ≥ 0.8` 时记为 `main_support`（主支撑簇），否则两支都有支撑时记为 `multiple_branches`（多分支重叠）；均无支撑才记为 `no_outer_support`。没有最少 6 点或最少 3 点的门槛。`--dominance-fraction` 可调整主支撑比例；报告同时比较 0.7、0.8、0.9，以及三个扩展半径。支撑锥的半角为原法向阈值的一半，而冲突对法向差严格大于原阈值，因此两锥不会重复计数。
+
+一个不良点可能与多个点冲突：只要与任一冲突点形成多分支重叠，逐点分类就记为多分支重叠；其余存在主支撑关系的点记为主支撑簇。每个点只计数一次，同时保留混合关系及强支／弱支角色。`branch_classification.png` 展示色差与 p/q 分布和扩展半径敏感性；`branch_classification_pairs.csv`、`branch_classification_points.csv` 分别保存逐对与逐点结果，完整统计位于 `analysis.json` 的 `branch_continuation.expanded_classification`。原球面标签、LUT 和样本均不修改。支撑比例反映采样密度，不代表标签正确概率；报告另记图片数判据是否一致、是否有多图支撑及跨尺度稳定性，不能仅据主支撑分类删除弱支。
+
+改进实验比较现有 LUT、仅颜色的单位法向插值、加入材料位置的插值，以及删除全部不良训练点后重建 LUT。插值在 `[ΔR,ΔG,ΔB,weight*s,weight*t]` 中查近邻，按距离平方倒数加权单位局部法向后归一化；st 是无量纲材料位置，不作为物理距离。权重与邻居数仅由原训练组内部逐图留出选择，再评估原来的独立留出图片；删点也只使用训练组配对。`remedy_predictions.npz` 保存留出预测，`experimental_position_model.npz` 保存训练组的位置条件原型。原型尚未接入重建，分析不修改已发布的 LUT、配置或已有重建结果。验证仍基于球面标签，无法单独判定真实光学多值和标签偏差。
+
+`calibrate.compare_norm` 分别标定 `assets/cali_norm_pics(deep)` 和 `assets/cali_norm_pics(shallow)`，沿用当前底色和各图已有标注。两组使用同样的 LUT 参数，结果隔离保存在 `assets/normal_calibration_comparison/{deep,shallow}/`，不覆盖重建所用模型。
+
+```bash
+uv run python -u -m calibrate.compare_norm --config config.yaml
+```
+
+比较包括逐图留出、各取 8 张训练图的 10 轮共同测试、按球面标签倾角分段的误差、样本支撑、异图近色标签一致性及颜色扰动敏感度。颜色距离统一使用绝对线性 RGB 欧氏距离；近色标签比较在公共局部坡度基下进行，不直接比较不同曲面点的相机法向。`comparison.json` 包含指标定义和全部统计，两个 CSV 保存逐图及逐轮结果，三个汇总 PNG 展示对照。`--reuse-samples` 只在输入文件和配置哈希一致时复用已生成样本。
+
+在上述比较完成后，可运行混合标定实验：
+
+```bash
+uv run python -u -m calibrate.compare_mixed_norm --config config.yaml
+```
+
+全部图片在同一参考坐标图下重新生成样本，逐图确认数值与单组标定一致，混合 LUT、配套网格和可视化保存在比较目录的 `mixed/`。实验沿用原比较的 10 轮留出图：`mixed8` 使用 4 张 deep 和 4 张 shallow，与两种单组 8 张模型比较；`mixed16` 使用留出图之外的两组各 8 张训练图，单独评估额外数据的收益。测试图始终排除在所有模型的训练集之外。`mixed_comparison.json`、`mixed_common_test_rounds.csv` 和 `mixed_common_tests.png` 保存完整指标、逐轮结果和对照图；其中混合逐图留出使用 20 张训练图，不能当作控制训练数量的实验。原标定及单组比较产物保持不变。`--reuse-samples` 依据源文件哈希复用混合样本。
 
 ## 5. 输出与缓存契约
 
@@ -162,6 +247,14 @@ assets/normal_calibration/
   verification/000000.png
   verification/report.csv
   verification/validation.json
+  visualization/color_difference/000000.png
+  visualization/pq_mapping/000000.png
+  visualization/color_pq_mapping.png
+  visualization/lut_slices.png
+  visualization/calibration_summary.png
+  visualization/pq_ambiguities.png
+  visualization/ambiguities.npz
+  visualization/summary.json
 ```
 
 每图对应一个六位索引缓存名、一张合并预览和一行报告；manifest 固定记录索引、完整相对 key、源路径和参考路径。失败使用稳定 reason code，并排除出训练。预览在阶段重跑时覆盖同一文件。
@@ -175,12 +268,13 @@ assets/normal_calibration/
 | frames | 最终 XYZ/UV/st/原生参数、参考/当前颜色和有符号差、几何/光度/sample mask、球面坡度/法向/球心/根分支与诊断 |
 | 样本 v1 | 逐点颜色、坡度、图片分组、st/原生参数、局部法向与切向基，参考背景和几何模型 |
 | LUT v5 signed | 坡度、方差、原始节点计数/有效性、颜色范围及 Unicode JSON metadata |
+| 冻结采样网格 v1 | 每次图片 fit 通过后从同批 reference 重建；规则 st、float64 原生材料坐标、坐标编号、相机、模板和参考来源 |
 
 `xyz / uv / coordinates / st / valid_mask / geometry_valid_mask` 是 observation 网格别名。
 较低分辨率 geometry 网格使用 `geometry_grid_valid_mask`，避免覆盖 observation 的 mask；缓存加载兼容旧字段。
 `*_coordinates` 始终为原生 a,b，不保存归一化 st 到该字段。
 
-全部 NPZ 使用 `allow_pickle=False`，不保存 object 数组。系数、相机、坐标图用 float64；普通采样网格、颜色和坡度用 float32；mask 用 bool；字典用 Unicode JSON。缓存通过模板和系数恢复曲面，不重新拟合缓存 XYZ。
+全部 NPZ 使用 `allow_pickle=False`，不保存 object 数组。系数、相机、坐标图和冻结逆采样网格用 float64；普通几何采样网格、颜色和坡度用 float32；mask 用 bool；字典用 Unicode JSON。缓存通过模板和系数恢复曲面，不重新拟合缓存 XYZ。
 
 所有新几何文件声明 `coordinate_kind=reference_arclength`、`coordinate_chart_id`、相对当前 NPZ 的 `coordinate_chart_file`、`frame_convention=st_grid_columns_rows`。颜色/样本还声明 `residual_domain=material_grid` 和 `color_space=linear_rgb`。
 
@@ -225,7 +319,7 @@ LUT 构建时的零色差锚点，以及显式 `trusted_no_contact_mask` 对坡�
 已有重建结果可直接显示，不需要重新加载输入包、配置或 LUT：
 
 ```bash
-uv run local-recon --view assets/000000_local_result_debug.npz
+uv run local-recon --view assets/reconstruction/pc/000000_local_result.npz
 ```
 
 窗口仅显示两张图：相机坐标系中的三维曲面、局部法向位移图，不绘制置信度图。三维曲面按局部位移着色，XYZ 与位移单位均为 mm；正位移沿整体基准法向。三维坐标轴保持相同物理尺度，可用鼠标拖动旋转。二维图的行列是材料采样网格索引，灰色表示无效几何，marker 处仍显示求解出的位移。预览只读取 `xyz_out / displacement / valid_mask`，不要求 NPZ 含置信度字段。
@@ -234,11 +328,11 @@ uv run local-recon --view assets/000000_local_result_debug.npz
 分别累加行、列相邻有效 XYZ 的三维距离，并取各条曲线长度的中位数作为代表宽度与高度；
 缺失段按同条曲线的可见平均步长估算。该比例用于整个显示框，不表示弯曲曲面能严格无失真地展开到平面。
 
-正常重建默认同时保存 NPZ 和同目录、同名的 PNG 预览图，例如 `000001_local_result.npz` 和 `000001_local_result.png`。无需额外参数；加 `--show` 可在保存后显示窗口。`--preview-output` 可自定义预览路径或改存 JPG/SVG/PDF；与 `--view` 配合且不加 `--show` 时只保存图片，适用于无图形界面的环境：
+完整重建和独立局部重建默认将 NPZ 保存到 `reconstruction.output_dir/pc/`，同名 PNG 直接保存到 `reconstruction.output_dir/`；当前分别为 `assets/reconstruction/pc/` 和 `assets/reconstruction/`，目录自动创建。显式 `--output` 按给定位置保存 NPZ，默认预览图放在 `pc/` 上一级目录，其他位置则与 NPZ 相邻。加 `--show` 可在保存后显示窗口。`--preview-output` 可自定义预览路径或改存 JPG/SVG/PDF；与 `--view` 配合且不加 `--show` 时只保存图片，适用于无图形界面的环境：
 
 ```bash
-uv run local-recon --view assets/000000_local_result_debug.npz \
-  --preview-output assets/000000_local_result_debug.png
+uv run local-recon --view assets/reconstruction/pc/000000_local_result.npz \
+  --preview-output assets/reconstruction/000000_local_result.png
 ```
 
 旧 v1 几何和 v4/v5 LUT 可按旧模板参数路径读取；不会自动转换成新的参考弧长语义。本次修改 CPU 路径，JAX 独立数值接口保留。
@@ -252,22 +346,22 @@ uv run local-recon --view assets/000000_local_result_debug.npz \
 uv run recon --config config.yaml \
   --image assets/cali_norm_pics/capture_20261016_184356_361449.png
 # 可指定结果路径并显示预览：
-uv run recon --image input.png --output assets/reconstruction/result.npz --show
+uv run recon --image input.png --output assets/reconstruction/pc/result.npz --show
 ```
 
 配置段 `reconstruction` 指定 `reference_image`、`material_grid_file`、`output_dir` 和 `match_surface_aspect`。
 程序用参考图固定 marker ID，独立拟合当前曲面，按与 LUT 配套的材料网格分别采样两张图，
-然后调用相同的局部求解和保存函数。默认保存 `<图片名>_local_result.npz` 与同名 PNG，不生成中间输入包。
+然后调用相同的局部求解和保存函数。默认在 `output_dir/pc/` 保存 `<图片名>_local_result.npz`，同名 PNG 保存在 `output_dir/`，不生成中间输入包。
 相机、模板、材料身份及颜色约定不一致时拒绝使用；不自动训练或替换 LUT。
 
-当前旧 LUT 的完整弧长图曾被新批次 prepare 覆盖，运行时保留原网格的
-`assets/normal_calibration/lut_material_grid.npz`，原逆采样网格为 400×202。
+`assets/normal_calibration/lut_material_grid.npz` 随图片法向标定的最终 LUT 更新，
+每次从同批 reference 坐标图生成，基准尺寸取本批 reference 的 observation 网格。
 默认 `match_surface_aspect: true`：按当前整体曲面三维曲线的代表宽高确定求解网格，
 长边点数取 observation 配置的较大维度，短边间隔数取长边间隔数乘物理短长比后四舍五入。
-旧逆网格在共同规则 st 上插值原生参数，参考与当前 XYZ、UV、颜色均重新计算；LUT 与原网格文件不变。
+冻结逆网格在共同规则 st 上插值原生参数，参考与当前 XYZ、UV、颜色均重新计算；重建期间 LUT 与网格文件不变。
 也支持匹配 LUT 的完整参考弧长图，直接反解新网格。
 设为 `false` 时严格使用 observation 行列数。独立 `local-recon --input` 仍使用输入包自带网格。
-当前 LUT 的原始 17 张标定照片及参考图已从标定缓存无损恢复至 `lut_source_images/`。
+旧批次的原始 17 张标定照片及参考图保留在 `lut_source_images/`，来源记录不作为当前 LUT 的配套声明。
 过期光场素材、模型、实验、测试重建结果和未使用的训练检查点已清理；
 当前法向标定资料、新批次标定照片与相机标定保留。
 完整配置和命令见 [重建模块说明](../reconstruction/README.md)。
@@ -280,6 +374,7 @@ uv run recon --image input.png --output assets/reconstruction/result.npz --show
 | `calibrate/calibrate_camera.py` | 相机标定，保留原入口 |
 | `calibrate/calibrate_norm.py` | 参数解析和阶段选择，重导出 build_normal_lut |
 | `calibrate/norm_pipeline.py` | 图片准备、缓存、重拟合、颜色/标签组合、样本和整图验证 |
+| `calibrate/visualize_norm.py` | 标定后的色差、p/q 映射、LUT 切片及拟合/独立验证可视化；支持独立补生成 |
 | `calibrate/manual_norm_regions.py` | 接触语义和三面板回调适配 |
 | `reconstruction/surface_reconstruction/markers.py` | 黑框区域、marker 检测与光度屏蔽 |
 | `reconstruction/surface_reconstruction/tracking.py` | 完整网格初始化与固定 ID 跟踪 |
@@ -292,6 +387,7 @@ uv run recon --image input.png --output assets/reconstruction/result.npz --show
 | `utils/sphere_geometry.py` | 固定半径球拟合、双根求交和球冠选择 |
 | `utils/region_annotations.py` | 通用区域数据、YAML、边界和 mask |
 | `utils/annotation_editor.py` | 仅依赖回调的通用编辑器 |
+| `utils/annotation_window.py` | 固定图像范围的标注窗口，屏蔽导航缩放并转换鼠标与键盘事件 |
 | `utils/color_difference.py` | 线性 RGB、有符号差和显示转换 |
 | `utils/normal_mapping.py` | LUT 数据、构建、原始查询 |
 | `utils/reconstruction_interface.py` | 三套网格和坐标类型 |

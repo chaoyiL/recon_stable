@@ -10,6 +10,8 @@ import numpy as np
 from reconstruction.get_surface import build_reconstruction_provider
 from reconstruction.local_recon import (
     LocalReconstructionResult,
+    default_reconstruction_output,
+    default_reconstruction_preview,
     load_local_reconstruction_settings,
     reconstruct_from_input,
 )
@@ -191,8 +193,8 @@ def reconstruct_image(
     grid_path = (Path(material_grid_file).expanduser().resolve() if material_grid_file is not None
                  else _configured_path(raw.get('material_grid_file'), config_path.parent, 'material_grid_file'))
     output_path = (Path(output).expanduser() if output is not None else
-                   _configured_path(raw.get('output_dir'), config_path.parent, 'output_dir')
-                   / (image_path.stem + '_local_result.npz'))
+                   default_reconstruction_output(
+                       config_path, raw.get('output_dir'), image_path.stem + '_local_result.npz'))
     if output_path.suffix.lower() != '.npz':
         raise ValueError('重建输出必须使用 .npz 扩展名')
     if output_path.resolve() in {image_path, reference_path.resolve(), grid_path.resolve()}:
@@ -203,7 +205,9 @@ def reconstruct_image(
         lsmr_btol_override=lsmr_btol, lsmr_max_iterations_override=lsmr_max_iterations)
     if output_path.resolve() == settings.calibration_file.resolve():
         raise ValueError('重建输出不能覆盖 LUT')
-    if preview_output is not None and Path(preview_output).expanduser().resolve() in {
+    preview_path = (Path(preview_output).expanduser() if preview_output is not None
+                    else default_reconstruction_preview(output_path))
+    if preview_path.resolve() in {
             image_path, reference_path.resolve(), grid_path.resolve(), settings.calibration_file.resolve()}:
         raise ValueError('预览图不能覆盖输入图片或标定文件')
     calibration = NormalCalibration.load(settings.calibration_file)

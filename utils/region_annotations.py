@@ -105,7 +105,7 @@ def region_boundary_points(region: RegionAnnotation, count=BOUNDARY_SAMPLE_COUNT
     return polygon[ids]+edges[ids]*((samples-cumulative[ids])/lengths[ids])[:, None]
 
 
-def region_masks(region, image_shape, *, inner_margin_px, outer_margin_px):
+def region_masks(region, image_shape, *, outer_margin_px):
     if tuple(region.image_size) != tuple(image_shape[:2][::-1]):
         raise ValueError('Annotation image_size differs from source image')
     contour = region_boundary_points(region, 512)
@@ -115,6 +115,5 @@ def region_masks(region, image_shape, *, inner_margin_px, outer_margin_px):
         raise ValueError('Representative contact center must be inside boundary')
     def kernel(radius):
         return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*radius+1, 2*radius+1))
-    interior = cv2.erode(mask, kernel(inner_margin_px), borderType=cv2.BORDER_CONSTANT, borderValue=0)
     excluded = cv2.dilate(mask, kernel(outer_margin_px))
-    return dict(contact=mask.astype(bool), interior=interior.astype(bool), exclusion=excluded.astype(bool))
+    return dict(contact=mask.astype(bool), exclusion=excluded.astype(bool))

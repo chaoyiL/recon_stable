@@ -7,6 +7,7 @@ dependencies = [
     "jax[cuda12]>=0.4.30",
     "matplotlib>=3.8",
     "opencv-python>=4.8.0",
+    "PyQt5>=5.15",
     "pyyaml>=6.0.3",
     "scipy>=1.15.0",
 ]
