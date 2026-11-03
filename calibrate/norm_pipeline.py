@@ -20,7 +20,8 @@ from utils.surface_sampling import (bilinear_sample, sample_mask_to_surface,
                                     sample_linear_rgb_to_surface)
 from utils.sphere_geometry import (fit_sphere_center, intersect_sphere_rays, select_sphere_cap,
                                    sphere_normals)
-from utils.color_difference import bgr8_to_linear_rgb, signed_color_difference
+from utils.color_difference import (CAMERA_RGB_TRANSFER_FUNCTION, bgr8_to_linear_rgb,
+                                    require_camera_rgb_transfer, signed_color_difference)
 from utils.region_annotations import BOUNDARY_SAMPLE_COUNT, load_regions, region_boundary_points, region_masks
 from utils.reconstruction_interface import (load_material_coordinate_specs, MaterialCoordinateMap,
                                             MaterialCoordinateSystems)
@@ -331,7 +332,8 @@ def prepare_image(config_path, settings: CalibrationSettings, reference: FrameCa
 def _coordinate_metadata(frame, output_path):
     return dict(coordinate_kind=COORDINATE_KIND, coordinate_chart_id=frame.chart.chart_id,
                 coordinate_chart_file=os.path.relpath(frame.chart_file, Path(output_path).resolve().parent),
-                frame_convention=FRAME_CONVENTION, residual_domain='material_grid', color_space='linear_rgb')
+                frame_convention=FRAME_CONVENTION, residual_domain='material_grid', color_space='linear_rgb',
+                rgb_transfer_function=CAMERA_RGB_TRANSFER_FUNCTION)
 
 
 def compute_frame_colors(final_frame, reference, settings):
@@ -607,10 +609,15 @@ def _fit_and_validate_samples(sample_path, settings):
             return report
         if int(data['format_version']) != 1:
             raise ValueError('Grouped image samples require format_version=1')
+        require_camera_rgb_transfer(
+            {'rgb_transfer_function': str(data['rgb_transfer_function']) if 'rgb_transfer_function' in data else None},
+            '图像标定样本',
+        )
         
         # 超参数检查
         required = ('coordinate_kind', 'coordinate_chart_id', 'coordinate_chart_file', 'frame_convention',
-                    'residual_domain', 'color_space', 'reference_image', 'sphere_radius_mm', 'sphere_side', 'boundary_model')
+                    'residual_domain', 'color_space', 'rgb_transfer_function', 'reference_image',
+                    'sphere_radius_mm', 'sphere_side', 'boundary_model')
         metadata = {key: data[key].item() for key in required}
         for key, expected in dict(coordinate_kind=COORDINATE_KIND, frame_convention=FRAME_CONVENTION,
                                   residual_domain='material_grid', color_space='linear_rgb',

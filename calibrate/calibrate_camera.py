@@ -625,6 +625,8 @@ def main() -> None:
             camera.white_balance_temperature,
             camera.width,
             camera.height,
+            fourcc=camera.fourcc,
+            backlight_compensation=camera.backlight_compensation,
         )
     except RuntimeError as error:
         print(error, file=sys.stderr)

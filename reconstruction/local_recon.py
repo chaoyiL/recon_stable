@@ -14,7 +14,8 @@ import cv2
 import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import lsmr
-from utils.color_difference import bgr8_to_linear_rgb,signed_color_difference
+from utils.color_difference import (CAMERA_RGB_TRANSFER_FUNCTION, bgr8_to_linear_rgb,
+                                    require_camera_rgb_transfer, signed_color_difference)
 from utils.config import load_config
 from utils.color_protection import resolve_zero_color_radii, signed_color_protection_factors
 
@@ -671,6 +672,7 @@ def load_reconstruction_arrays(data, expected_metadata=None):
     from utils.surface_sampling import sample_linear_rgb_to_surface
     from utils.surface_coordinates import COORDINATE_KIND, FRAME_CONVENTION
     metadata=json.loads(str(data['metadata'])) if 'metadata' in data else {}
+    transfer = str(data['rgb_transfer_function']) if 'rgb_transfer_function' in data else metadata.get('rgb_transfer_function')
     declarations=('coordinate_kind','coordinate_chart_id','frame_convention','residual_domain','color_space')
     actual={key: str(data[key]) if key in data else metadata.get(key) for key in declarations}
     new_path=actual['coordinate_kind']==COORDINATE_KIND
@@ -755,6 +757,11 @@ def load_reconstruction_arrays(data, expected_metadata=None):
             current_valid=source_valid('observed_',observed)
             ref_valid=source_valid('reference_',reference)
         elif 'observed_bgr' in data and 'reference_bgr' in data:
+            if transfer is not None:
+                require_camera_rgb_transfer({'rgb_transfer_function': transfer}, '输入图像')
+            if expected_metadata is not None:
+                require_camera_rgb_transfer(expected_metadata, 'LUT')
+            transfer = CAMERA_RGB_TRANSFER_FUNCTION
             observed=bgr8_to_linear_rgb(data['observed_bgr'])
             reference=bgr8_to_linear_rgb(data['reference_bgr'])
             current_valid=source_valid('observed_',observed,data['observed_bgr'])
@@ -764,6 +771,8 @@ def load_reconstruction_arrays(data, expected_metadata=None):
         current=sample_linear_rgb_to_surface(observed,data['uv'],current_valid)
         background=sample_linear_rgb_to_surface(reference,ref_uv,ref_valid)
         colors,photo=signed_color_difference(current.values,background.values,current.valid & background.valid)
+    if expected_metadata is not None and transfer != expected_metadata.get('rgb_transfer_function'):
+        raise ValueError('LUT/input declaration mismatch: rgb_transfer_function')
     if colors.shape!=xyz.shape or photo.shape!=shape:
         raise ValueError('Material-grid colors and geometry shapes differ')
     if 'photometric_valid_mask' in data:

@@ -1,10 +1,24 @@
+# 灯带顺序：空出 → 上（左到右）→ 右（上到下）→ 下（右到左）→ 左（下到上）。
+# 五项总数不超过 128；空出部分始终熄灭，四边可分别设为 0。
+led_controller:
+  top: 9
+  right: 4
+  bottom: 9
+  left: 4
+  skip: 3
+  # 2026-11-02 实拍校正；保留四边配色，在输出 PWM 时衰减蓝通道。
+  brightness: 30
+  rgb_scale: [1.0, 1.0, 0.35]
+
 # 相机与采集
 camera:
   device: 2
-  exposure: 130
-  white_balance_temperature: 4600
-  width: null
-  height: null
+  exposure: 20
+  white_balance_temperature: 6500
+  width: 640
+  height: 480
+  fourcc: YUYV
+  backlight_compensation: 0
 
 capture:
   save: ~/recon_stable/assets/cali_norm_pics

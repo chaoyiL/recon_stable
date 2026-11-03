@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -21,6 +22,8 @@ class CameraConfig:
     white_balance_temperature: float
     width: int | None
     height: int | None
+    fourcc: str | None = None
+    backlight_compensation: float | None = None
 
 
 def _merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
@@ -90,7 +93,9 @@ def parse_camera_config(section: Mapping[str, Any] | None) -> CameraConfig:
         section, "camera", "device", "exposure",
         "white_balance_temperature", "width", "height")
     unknown = set(section) - {
-        "device", "exposure", "white_balance_temperature", "width", "height"}
+        "device", "exposure", "white_balance_temperature", "width", "height",
+        "fourcc", "backlight_compensation",
+    }
     if unknown:
         raise ConfigError(f"camera 包含未知字段: {sorted(unknown)}")
     device = section["device"]
@@ -111,10 +116,30 @@ def parse_camera_config(section: Mapping[str, Any] | None) -> CameraConfig:
                 not isinstance(value, int) or isinstance(value, bool) or value <= 0):
             raise ConfigError(f"camera.{name} 必须是正整数或 null")
         dimensions.append(value)
+    fourcc = section.get("fourcc")
+    if fourcc is not None and (
+            not isinstance(fourcc, str) or len(fourcc) != 4 or not fourcc.isascii()):
+        raise ConfigError("camera.fourcc 必须是 4 个 ASCII 字符或 null")
+    backlight_compensation = section.get("backlight_compensation")
+    if backlight_compensation is not None:
+        if not isinstance(backlight_compensation, (int, float)) \
+                or isinstance(backlight_compensation, bool):
+            raise ConfigError(
+                "camera.backlight_compensation 必须是有限非负数或 null")
+        try:
+            backlight_compensation = float(backlight_compensation)
+        except OverflowError as error:
+            raise ConfigError(
+                "camera.backlight_compensation 必须是有限非负数或 null") from error
+        if not math.isfinite(backlight_compensation) or backlight_compensation < 0:
+            raise ConfigError(
+                "camera.backlight_compensation 必须是有限非负数或 null")
     return CameraConfig(
         device=device,
         exposure=float(exposure),
         white_balance_temperature=float(temperature),
         width=dimensions[0],
         height=dimensions[1],
+        fourcc=fourcc,
+        backlight_compensation=backlight_compensation,
     )

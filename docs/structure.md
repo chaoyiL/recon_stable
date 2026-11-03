@@ -136,6 +136,69 @@ uv run calibrate-norm --input external_samples.npz --output external_lut.npz
 
 ## 4. 颜色、球面标签与 LUT 验证
 
+### 相机颜色契约（2026-11-02 核对）
+
+本机 LRCP V1080P（USB `05a3:9230`，`/dev/video2`）通过 V4L2 查询得到当前
+`YUYV 640×480 @ 30 FPS`，`colorspace=8`、`xfer_func=1`、`ycbcr_enc=1`、
+`quantization=0`。传递曲线的显式声明是 **BT.709**；YUV 编码矩阵是 **BT.601**，
+默认量程按 limited range 解释。sRGB 与 BT.709 的原色色度相同，但逆传递曲线不同，
+不能只根据 `colorspace` 名称选择 sRGB 解码。公式与字段语义见
+[Linux V4L2 色彩空间文档](https://docs.kernel.org/userspace-api/media/v4l/colorspaces-details.html)。
+
+当前链路为：相机 ISP → YUYV → OpenCV 展开 YUV 量程并转 BGR8 →
+PNG/缓存原图 → BT.709 逆曲线转线性 RGB → 各自 UV 采样 → 有符号色差 → LUT。
+当前 OpenCV 5.0.0 的 YUYV 路径使用 BT.601 limited-range 转换，与当前声明一致，
+参见 [V4L2 后端](https://github.com/opencv/opencv/blob/5.0.0/modules/videoio/src/cap_v4l.cpp)
+和 [YUV 转换实现](https://github.com/opencv/opencv/blob/5.0.0/modules/imgproc/src/color_yuv.simd.hpp)。
+进入 Python 逆曲线前的 RGB 已展开到完整编码量程，不能再次扣除 YUV 的黑电平。
+程序没有 Reinhard 色调映射；色差诊断图的 `0.5 + 2 * delta` 仅用于显示。
+
+运行 `uv run capture` 时，`camera preview` 窗口默认将 BT.709 解码的线性 RGB
+按 sRGB 正向曲线编码显示。按 `l` 切换到直接将 `[0,1]` 量化为 `[0,255]` 的
+线性数值预览；后者通常更暗，不用于判断显示器上的颜色。两种模式都不做亮度
+归一化，模式和录像状态文字只画在预览副本上。
+按 `p` 保存图片、按 `v` 开始录像时仍写入相机原始编码帧，后续标定再解码一次，
+避免重复应用逆曲线。
+
+`utils/color_difference.py` 是标定和重建共用的解码入口。对每个归一化编码通道
+`E = uint8 / 255`，输出无量纲的 `L∈[0,1]`：
+
+```text
+L = E / 4.5                            E < 0.081
+L = ((E + 0.099) / 1.099)^(1 / 0.45)  E >= 0.081
+```
+
+例如编码值 128 解码为约 0.261482，旧 sRGB 逆曲线则约为 0.215861。
+当前实现按这台相机核对到的声明固定使用 BT.709，不从 PNG 文件名推测曲线；
+更换设备或采集格式后需要重新核对。驱动声明尚未经曝光扫描实测验证，逆曲线不能
+消除相机内部锐化、降噪、背光补偿、色度抽样和饱和裁剪。
+
+颜色帧、聚合图像样本和 LUT 元数据新增 `rgb_transfer_function=bt709`，表示生成
+线性 RGB 所使用的编码曲线。新旧颜色数据不能混用；没有声明或使用旧曲线的图像
+样本必须从原图重新计算，不能给旧文件补字段后继续使用。原始图片、几何缓存和标注
+可以保留，在当前 `input_mode: images` 配置下依次运行：
+
+```bash
+uv run calibrate-norm --config config.yaml --stage samples
+uv run calibrate-norm --config config.yaml --stage fit
+```
+
+重建会拒绝旧 LUT 与新解码图像配对，也检查预计算颜色与 LUT 的曲线声明。
+比较工具的 `--reuse-samples` 签名包含曲线，防止沿用旧颜色缓存。外部已经线性化的
+通用两数组样本不自动标记为相机 BT.709 数据。原有色差阈值需要在重算后复核，
+两种逆曲线的色差不能用一个固定倍率换算。
+
+采集一致性检查如下；2026-11-02 的照明调整及实拍证据见 [偏蓝诊断与调整记录](color_balance.md)。已有标定资产未改写：
+
+| 检查项 | 当前结果与影响 |
+|---|---|
+| 分辨率 | 当前 YAML 指定 640×480，与内参一致；实拍确认实际分辨率相同 |
+| 采集格式 | 当前 YAML 指定 YUYV，共享初始化设置并回读 FOURCC；相机没有 RAW/线性 RGB，YUYV 仍有色度抽样 |
+| 曝光/白平衡 | 当前手动曝光 20、自动白平衡关闭、色温 6500 K，与 YAML 一致；独立 `surface_reconstruction/run_reconstruction.py` 实时入口仍绕过共享初始化，未锁定这些控制项 |
+| ISP 控制 | 当前背光补偿由 YAML 固定为 0，共享初始化设置并回读。gamma=100、gain=0、contrast=32、saturation=64、sharpness=2 为本次实测值，未由配置固定；gamma=100 不代表输出物理线性 |
+| 几何内参 | `assets/camera_calibration.yaml` 与重建所读 `data/camera_params.npz` 的矩阵和畸变系数一致；重新标定时两个文件仍需同步 |
+| 保存格式 | 原图 PNG 不经过 RGB 逆曲线；默认 AVI/FFV1 已用随机 BGR8 帧验证编解码逐像素一致；显式选择 MP4 使用有损 mp4v，不适合精确色差标定 |
+
 两张原图各自建立 `surface_mask & ~marker_image_mask & unsaturated`。marker mask 复用检测的组件形状；失检或匹配不唯一时使用参考尺寸与跟踪位置保守屏蔽。额外膨胀宽度为 1 px（3×3 核），标定与 `reconstruction/get_surface.py` 共用此默认值。原始 BGR8 任一通道为 255 即排除。
 
 标定加载几何缓存时，从缓存原图、marker 位置及参考尺寸重建光度屏蔽 mask，使调整后的膨胀宽度直接用于 annotate 和 samples；不重新拟合整体曲面或建立坐标图，也不在读取时改写缓存文件。重跑 samples、fit 可更新训练样本和 LUT。已导出的普通整体重建或 recon 输入 NPZ 仍保留其原有 mask，需重新导出才能采用新宽度。
@@ -276,7 +339,7 @@ assets/normal_calibration/
 
 全部 NPZ 使用 `allow_pickle=False`，不保存 object 数组。系数、相机、坐标图和冻结逆采样网格用 float64；普通几何采样网格、颜色和坡度用 float32；mask 用 bool；字典用 Unicode JSON。缓存通过模板和系数恢复曲面，不重新拟合缓存 XYZ。
 
-所有新几何文件声明 `coordinate_kind=reference_arclength`、`coordinate_chart_id`、相对当前 NPZ 的 `coordinate_chart_file`、`frame_convention=st_grid_columns_rows`。颜色/样本还声明 `residual_domain=material_grid` 和 `color_space=linear_rgb`。
+所有新几何文件声明 `coordinate_kind=reference_arclength`、`coordinate_chart_id`、相对当前 NPZ 的 `coordinate_chart_file`、`frame_convention=st_grid_columns_rows`。颜色/图像样本还声明 `residual_domain=material_grid`、`color_space=linear_rgb` 和 `rgb_transfer_function=bt709`；图像 LUT 将曲线声明保存在 metadata 中。
 
 ## 6. 局部推理
 
@@ -403,7 +466,8 @@ uv run recon --image input.png --output assets/reconstruction/pc/result.npz --sh
 ## 9. 开发验收
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -p test_norm_calibration_pipeline.py -v
+uv run python -m unittest discover -s tests -p test_color_difference.py -v
+uv run python -m unittest discover -s tests -p test_norm_calibration_pipeline.py -v
 ```
 
 标准库 unittest 覆盖：弧长/坐标闭环及多解拒绝；独立颜色采样和几何缺失区；两侧球面几何及法向符号；无界面样本/拟合、缓存复用、分组验证隔离和失败不覆盖发布；单图流程与离线求解一致、参考图零位移和材料身份校验。实际数据运行后查看每图合并预览、`report.csv` 与 `validation.json`。

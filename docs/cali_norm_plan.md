@@ -173,6 +173,10 @@ delta(s,t) = C_i(s,t) - C_ref(s,t)
 
 保留有符号的三个通道，不取绝对值、不转灰度、不做显示归一化。固定底色假设由最终曲面上的非接触区色差验证，不因“形变近似为零”省掉曲面坐标转换。
 
+已实现：BGR8 按本机相机声明的 BT.709 逆曲线线性化，标定与重建共用
+`utils/color_difference.py`。曲线、当前设备核对结果及旧样本/LUT 的重算要求见
+[相机颜色契约](structure.md#相机颜色契约2026-11-02-核对)。
+
 参考、当前网格的 chart_id、st、原生 parameters 必须一致；各自使用自己的 XYZ、UV 和有效域。
 
 ### 3.2 黑色 marker 只造成光度缺失
@@ -625,7 +629,7 @@ assets/normal_calibration/
 | normal_samples | v1；color_residual_samples(N×3)、slope_samples(N×2)、image_index(N)、material_coordinates(N×2)、st_samples(N×2)、image_paths(M)、reference_image、sphere_radius_mm、sphere_side、boundary_model |
 | LUT | 沿用 v5 signed 数值格式；metadata 增加参考背景、坐标与基约定、几何模型、validation_status 和验证分组/指标 |
 
-所有几何、颜色和样本产物包含 `coordinate_kind=reference_arclength`、`coordinate_chart_id`、`coordinate_chart_file`、`frame_convention=st_grid_columns_rows`。颜色/样本另含 `residual_domain=material_grid`、`color_space=linear_rgb`。
+所有几何、颜色和样本产物包含 `coordinate_kind=reference_arclength`、`coordinate_chart_id`、`coordinate_chart_file`、`frame_convention=st_grid_columns_rows`。颜色/图像样本另含 `residual_domain=material_grid`、`color_space=linear_rgb`、`rgb_transfer_function=bt709`；图像 LUT metadata 同样记录曲线。
 
 `*_coordinates` 始终保存反解后的原生 a,b；`*_st` 保存规则弧长网格。保留 observation 的 `xyz/uv/valid_mask` 别名，新增 `coordinates/st` 别名；`valid_mask` 与新增 geometry_valid_mask 均表示几何域。fit_info、metadata 等字典在 NPZ 中存为 Unicode JSON，不使用 object 数组。
 

@@ -25,6 +25,10 @@ def _check_declarations(data, calibration, keys=DECLARATIONS):
     for key in keys:
         if str(data[key]) != calibration.metadata.get(key):
             raise ValueError(f'Visualization input/LUT {key} mismatch')
+    if 'color_space' in keys:
+        transfer = str(data['rgb_transfer_function']) if 'rgb_transfer_function' in data else None
+        if transfer != calibration.metadata.get('rgb_transfer_function'):
+            raise ValueError('Visualization input/LUT rgb_transfer_function mismatch')
 
 
 def _load_samples(path, calibration):

@@ -2,21 +2,60 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import cv2
 import jax.numpy as jnp
 import numpy as np
 
 
+CAMERA_RGB_TRANSFER_FUNCTION = "bt709"
+
+
+def require_camera_rgb_transfer(metadata: Mapping[str, object], source: str) -> None:
+    """拒绝把旧曲线生成的相机颜色样本/LUT 与当前解码结果混用。"""
+    actual = metadata.get("rgb_transfer_function")
+    if actual != CAMERA_RGB_TRANSFER_FUNCTION:
+        raise ValueError(
+            f"{source}: rgb_transfer_function={actual!r}，"
+            f"当前相机解码要求 {CAMERA_RGB_TRANSFER_FUNCTION!r}；"
+            "请从原始图像重新生成颜色样本并拟合 LUT，不能仅修改元数据"
+        )
+
+
 def bgr8_to_linear_rgb(image_bgr: np.ndarray) -> np.ndarray:
+    """将相机 BGR8 按其声明的 BT.709 逆传递曲线解码为 [0, 1] RGB。
+
+    输入为 OpenCV 完成 YUV 矩阵转换和量程展开后的编码 RGB，不能再次
+    按 YUV limited range 缩放。相机声明不代表已完成实测辐射定标。
+    """
     values = np.asarray(image_bgr)
     if values.ndim != 3 or values.shape[-1] != 3 or values.dtype != np.uint8:
         raise ValueError("image_bgr 必须是 HxWx3 uint8")
-    srgb = values[..., ::-1].astype(np.float32) / 255.0
+    encoded_rgb = values[..., ::-1].astype(np.float32) / 255.0
     return np.where(
-        srgb <= 0.04045,
-        srgb / 12.92,
-        ((srgb + 0.055) / 1.055) ** 2.4,
+        encoded_rgb < 0.081,
+        encoded_rgb / 4.5,
+        ((encoded_rgb + 0.099) / 1.099) ** (1.0 / 0.45),
     ).astype(np.float32)
+
+
+def linear_rgb_to_display_bgr(image_linear_rgb: np.ndarray) -> np.ndarray:
+    """将线性 RGB 编码为适合常规显示器预览的 sRGB BGR8。"""
+    values = np.asarray(image_linear_rgb)
+    if values.ndim != 3 or values.shape[-1] != 3 \
+            or not np.issubdtype(values.dtype, np.floating):
+        raise ValueError("image_linear_rgb 必须是 HxWx3 浮点数组")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("image_linear_rgb 必须包含有限值")
+
+    linear_rgb = np.clip(values, 0.0, 1.0)
+    encoded_rgb = np.where(
+        linear_rgb <= 0.0031308,
+        12.92 * linear_rgb,
+        1.055 * np.power(linear_rgb, 1.0 / 2.4) - 0.055,
+    )
+    return np.rint(encoded_rgb[..., ::-1] * 255.0).astype(np.uint8)
 
 
 def signed_color_difference(

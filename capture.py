@@ -1,4 +1,4 @@
-"""从相机实时读取图像帧并显示，固定曝光度。"""
+"""固定曝光采集相机原始帧，并提供 sRGB 与线性值两种预览模式。"""
 
 import argparse
 import math
@@ -7,8 +7,13 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from utils.camera import open_camera
+from utils.color_difference import (
+    bgr8_to_linear_rgb,
+    linear_rgb_to_display_bgr,
+)
 from utils.config import (
     ConfigError,
     load_config_sections,
@@ -80,7 +85,9 @@ def open_video_writer(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="从相机实时显示帧（固定曝光）")
+    parser = argparse.ArgumentParser(
+        description="固定曝光采集原始相机帧，预览可切换 sRGB 显示和线性值模式"
+    )
     parser.add_argument(
         "--config",
         default=DEFAULT_CONFIG_PATH,
@@ -119,6 +126,8 @@ def main() -> None:
         camera.white_balance_temperature,
         camera.width,
         camera.height,
+        fourcc=camera.fourcc,
+        backlight_compensation=camera.backlight_compensation,
     )
 
     actual_exposure = cap.get(cv2.CAP_PROP_EXPOSURE)
@@ -130,13 +139,19 @@ def main() -> None:
     print(f"相机已打开: device={camera.device}, 分辨率={w}x{h}")
     print(f"自动曝光={actual_auto}, 曝光值={actual_exposure}")
     print(f"自动白平衡={actual_auto_wb}, 白平衡色温={actual_wb} K")
+    actual_fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+    fourcc_name = actual_fourcc.to_bytes(4, "little").decode("ascii", errors="replace")
+    print(f"采集格式={fourcc_name}, 背光补偿={cap.get(cv2.CAP_PROP_BACKLIGHT)}")
+    print("默认预览使用 sRGB 显示编码；按 l 切换未编码线性值预览")
+    print("预览上的模式和录像文字不会写入图片或录像；保存内容为相机原始编码帧")
     print("按 v 开始录像；按 s 停止录像；按 p 保存当前帧；按 q 或 Esc 退出")
 
-    window = "camera"
+    window = "camera preview"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     video_writer: cv2.VideoWriter | None = None
     active_video_path: Path | None = None
     recorded_frames = 0
+    show_linear_preview = False
 
     try:
         while True:
@@ -149,13 +164,30 @@ def main() -> None:
                 video_writer.write(frame)
                 recorded_frames += 1
 
-            display_frame = frame
+            linear_rgb = bgr8_to_linear_rgb(frame)
+            if show_linear_preview:
+                display_frame = np.rint(
+                    linear_rgb[..., ::-1] * 255.0
+                ).astype(np.uint8)
+                mode_text = "LINEAR VALUES (l)"
+            else:
+                display_frame = linear_rgb_to_display_bgr(linear_rgb)
+                mode_text = "sRGB DISPLAY (l)"
+            cv2.putText(
+                display_frame,
+                mode_text,
+                (16, 36),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
             if video_writer is not None:
-                display_frame = frame.copy()
                 cv2.putText(
                     display_frame,
                     f"REC  {recorded_frames}",
-                    (16, 36),
+                    (16, 68),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.9,
                     (0, 0, 255),
@@ -167,6 +199,11 @@ def main() -> None:
 
             if key == ord("q") or key == 27:  # q 或 Esc
                 break
+            if key == ord("l"):
+                show_linear_preview = not show_linear_preview
+                mode = "线性值" if show_linear_preview else "sRGB 显示编码"
+                print(f"预览模式：{mode}")
+                continue
             if key == ord("v"):
                 if video_writer is not None:
                     print(f"正在录像: {active_video_path}")

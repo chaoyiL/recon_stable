@@ -7,6 +7,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from utils.color_difference import CAMERA_RGB_TRANSFER_FUNCTION
 from reconstruction.get_surface import build_reconstruction_provider
 from reconstruction.local_recon import (
     LocalReconstructionResult,
@@ -132,7 +133,8 @@ def make_reconstruction_input(
         marker_image_mask=marker_mask, reference_marker_image_mask=reference_marker_mask,
         photometric_valid_mask=current_map.valid_mask & reference_map.valid_mask,
         coordinate_kind=COORDINATE_KIND, coordinate_chart_id=current_map.chart_id,
-        frame_convention=FRAME_CONVENTION, residual_domain='material_grid', color_space='linear_rgb')
+        frame_convention=FRAME_CONVENTION, residual_domain='material_grid', color_space='linear_rgb',
+        rgb_transfer_function=CAMERA_RGB_TRANSFER_FUNCTION)
 
 
 def _fit_frame(session, image, label):

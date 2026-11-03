@@ -9,6 +9,9 @@ tests/
 !/tests/
 /tests/*
 !/tests/test_norm_calibration_pipeline.py
+!/tests/test_color_difference.py
+!/tests/test_led_protocol.py
+!/tests/test_camera_controls.py
 .vscode/
 
 # 本地采集/标定数据（体积过大，不纳入版本控制）

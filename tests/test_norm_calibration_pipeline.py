@@ -680,10 +680,10 @@ def synthetic_batch(directory):
     p = -normals[..., 0]/np.maximum(normals[..., 2], .1)
     q = -normals[..., 1]/np.maximum(normals[..., 2], .1)
     delta = np.stack((.25*p, .25*q, .1*(p+q)), axis=-1)
-    base = ((150/255+.055)/1.055)**2.4
+    base = ((150/255+.099)/1.099)**(1/.45)
     linear = np.clip(base+delta, 0, 1)
-    srgb = np.where(linear <= .0031308, 12.92*linear, 1.055*linear**(1/2.4)-.055)
-    observed = np.rint(np.clip(srgb[..., ::-1], 0, 1)*255).astype(np.uint8)
+    encoded = np.where(linear < .018, 4.5*linear, 1.099*linear**.45-.099)
+    observed = np.rint(np.clip(encoded[..., ::-1], 0, 1)*255).astype(np.uint8)
     contact_pixels = (xx-320)**2+(yy-240)**2 < (650*3/100)**2
     image_current = np.where(contact_pixels[..., None] & ~marker_mask[..., None], observed, image)
     entries, annotations = [], {}
@@ -1756,7 +1756,8 @@ class SingleImageReconstruction(unittest.TestCase):
         axis = np.linspace(-1, 1, 3)
         r, g, _ = np.meshgrid(axis, axis, axis, indexing='ij')
         metadata = dict(coordinate_kind='reference_arclength', coordinate_chart_id=reference.chart.chart_id,
-                        frame_convention='st_grid_columns_rows', residual_domain='material_grid', color_space='linear_rgb')
+                        frame_convention='st_grid_columns_rows', residual_domain='material_grid', color_space='linear_rgb',
+                        rgb_transfer_function='bt709')
         calibration = NormalCalibration(np.stack((r, g), axis=-1), np.zeros((3, 3, 3)),
                                         -np.ones(3), np.ones(3), 1., metadata=metadata)
         calibration.save(root/'runtime_lut.npz')

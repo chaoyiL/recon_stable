@@ -135,6 +135,7 @@ def noise_response(colors, calibration, delta=.005):
 
 
 def source_signature(config, datasets, settings):
+    from utils.color_difference import CAMERA_RGB_TRANSFER_FUNCTION
     paths = [config, settings.annotations_file, settings.reference_image]
     # Provider geometry/camera settings are also part of reproducibility.
     from utils.config import load_config
@@ -142,7 +143,9 @@ def source_signature(config, datasets, settings):
     paths.append(provider if provider.is_absolute() else config.parent/provider)
     for directory in datasets.values():
         paths.extend(sorted(directory.glob('*.png')))
-    return {str(path.resolve()): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+    signature = {str(path.resolve()): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+    signature['rgb_transfer_function'] = CAMERA_RGB_TRANSFER_FUNCTION
+    return signature
 
 
 def prepare_dataset(name, directory, output, config, base):

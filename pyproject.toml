@@ -8,6 +8,7 @@ dependencies = [
     "matplotlib>=3.8",
     "opencv-python>=4.8.0",
     "PyQt5>=5.15",
+    "pyserial>=3.5",
     "pyyaml>=6.0.3",
     "scipy>=1.15.0",
 ]
@@ -17,7 +18,13 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["utils", "calibrate", "reconstruction", "reconstruction.surface_reconstruction"]
+packages = [
+    "utils",
+    "calibrate",
+    "reconstruction",
+    "reconstruction.surface_reconstruction",
+    "hardware",
+]
 py-modules = ["capture"]
 
 [tool.setuptools.package-data]
