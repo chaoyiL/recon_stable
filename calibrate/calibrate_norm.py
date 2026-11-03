@@ -3,13 +3,12 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from utils.config import load_config
-from utils.normal_mapping import build_normal_lut  # Compatibility export.
-from calibrate.norm_pipeline import parse_settings, run_prepare, run_samples, fit_and_validate_samples
+from calibrate.utils.norm_pipeline import parse_settings, run_prepare, run_samples, fit_and_validate_samples
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent/'config.yaml'
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description='压球图片色差—法向标定，或外部色差/坡度样本 LUT 拟合')
     parser.add_argument('--config', default=DEFAULT_CONFIG_PATH)
     source = parser.add_mutually_exclusive_group()
@@ -45,7 +44,7 @@ def main():
     if stage in {'prepare', 'all'}:
         run_prepare(config_path, settings)
     if stage in {'annotate', 'all'}:
-        from calibrate.manual_norm_regions import annotate_images
+        from calibrate.utils.manual_norm_regions import annotate_images
         if not annotate_images(settings, edit=args.edit):
             print('标注草稿已保存。重新运行 annotate 可继续。')
             return

@@ -1,5 +1,6 @@
 """Contact-boundary adapter for the generic image-region editor."""
 from dataclasses import replace
+from pathlib import Path
 import cv2
 import numpy as np
 from utils.region_annotations import (BOUNDARY_SAMPLE_COUNT, RegionAnnotation, load_regions, save_regions,
@@ -113,7 +114,7 @@ def calibration_panels(frame, annotation, record=None, *, color_image=None,
 
 def annotate_images(settings, *, edit=False):
     # Import orchestration only in this adapter, never from the generic editor.
-    from calibrate.norm_pipeline import (FrameCalibrationError, compute_frame_colors,
+    from calibrate.utils.norm_pipeline import (FrameCalibrationError, compute_frame_colors,
         load_manifest, load_frame_calibration_data, finalize_image)
     settings.require_sphere()
     manifest = load_manifest(settings)

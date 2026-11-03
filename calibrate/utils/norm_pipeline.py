@@ -1,4 +1,4 @@
-"""Image calibration stages. Geometry and sampling live in reusable utils modules."""
+"""Image calibration stages using the shared geometry and sampling utilities."""
 from __future__ import annotations
 from dataclasses import dataclass, replace
 from pathlib import Path

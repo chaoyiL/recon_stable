@@ -429,14 +429,20 @@ uv run recon --image input.png --output assets/reconstruction/pc/result.npz --sh
 
 ## 8. 模块职责
 
+`calibrate/` 顶层保留标定与质检命令的参数解析和流程选择，实现统一放在 `calibrate/utils/`。后者使用仓库根目录 `utils/` 中的通用几何、数据和数值工具；实现模块不反向依赖命令入口。
+
 | 位置 | 职责 |
 |---|---|
 | `reconstruction/recon.py / reconstruction/pipeline.py` | 单张图片的整体曲面、颜色配对和局部重建编排 |
-| `calibrate/calibrate_camera.py` | 相机标定，保留原入口 |
-| `calibrate/calibrate_norm.py` | 参数解析和阶段选择，重导出 build_normal_lut |
-| `calibrate/norm_pipeline.py` | 图片准备、缓存、重拟合、颜色/标签组合、样本和整图验证 |
-| `calibrate/visualize_norm.py` | 标定后的色差、p/q 映射、LUT 切片及拟合/独立验证可视化；支持独立补生成 |
-| `calibrate/manual_norm_regions.py` | 接触语义和三面板回调适配 |
+| `calibrate/calibrate_camera.py` | 相机标定 CLI，解析参数并启动采集标定 |
+| `calibrate/calibrate_norm.py` | 法向标定 CLI，解析参数并选择阶段 |
+| `calibrate/visualize_norm.py` | 法向标定可视化质检 CLI |
+| `calibrate/analyze_ambiguities.py` | 色差/法向歧义诊断与改进实验 CLI |
+| `calibrate/utils/camera_calibration.py` | 标定板检测、相机拟合、异常帧剔除、采集界面和结果保存 |
+| `calibrate/utils/norm_pipeline.py` | 图片准备、缓存、重拟合、颜色/标签组合、样本和整图验证 |
+| `calibrate/utils/manual_norm_regions.py` | 接触语义和三面板回调适配，由法向标定的 annotate 阶段调用 |
+| `calibrate/utils/visualize_norm.py` | 色差、p/q 映射、LUT 切片及拟合/独立验证报告生成 |
+| `calibrate/utils/analyze_ambiguities.py` | 歧义统计、分支支撑分析和改进实验报告生成 |
 | `reconstruction/surface_reconstruction/markers.py` | 黑框区域、marker 检测与光度屏蔽 |
 | `reconstruction/surface_reconstruction/tracking.py` | 完整网格初始化与固定 ID 跟踪 |
 | `reconstruction/surface_reconstruction/surface.py` | 双三次拟合与 BicubicSurfaceAdapter |

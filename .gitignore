@@ -5,14 +5,9 @@ __pycache__/
 *.pyc
 *.egg-info/
 .pytest_cache/
-tests/
-!/tests/
-/tests/*
-!/tests/test_norm_calibration_pipeline.py
-!/tests/test_color_difference.py
-!/tests/test_led_protocol.py
-!/tests/test_camera_controls.py
 .vscode/
+
+# 所有层级的测试目录仅保留本地
 tests/
 
 # 本地采集/标定数据（体积过大，不纳入版本控制）
@@ -20,3 +15,8 @@ assets/
 
 # 运行时生成的标定输出
 camera_calibration.yaml
+
+# 解析仿真的运行产物（配置与代码单独保留）
+/physical_model/render_results/
+/physical_model/lut/
+/physical_model/compensate_results/

@@ -338,7 +338,7 @@ sample_valid =
 
 已实现配套采样网格更新：图片 `fit` 每次验证通过后，读取同批 `reference_surface.npz` 及其参考弧长图，校验参考图和坐标编号与待发布 LUT 一致。以 reference 的 observation 行列数生成规则 st，调用同一 `sample_surface_grid` 反解原生材料参数，写入 `work_dir/lut_material_grid.npz`；不读取旧网格，不继承旧分辨率。两个临时文件写完后再分别替换最终 LUT 与网格。验证、reference 检查或临时写入失败时保留已发布产物；旧两数组样本不生成网格。
 
-保留显式科学分析工具，正常标定不自动调用：`calibrate/visualize_norm.py` 使用本批 LUT、聚合样本及 `frames/overall` 缓存，在 `work_dir/visualization/` 生成逐图色差与 p/q 对照、RGB 色差到 p/q 的三维映射、三个零通道 LUT 切片和整批汇总。逐图预测调用最终 LUT 的原始插值；独立留出统计调用同批 `_train.npz`，复用已有局部坡度转法向函数计算角误差。显示回投复用 `rasterize_surface_grid`，统计始终使用原材料网格样本。所有输入校验坐标身份；空间样本还检查与训练样本逐点一致，不混入遗留缓存。显式分析失败不改写已发布 LUT 的验证状态；完整报告生成后才替换旧报告。没有图片分组的旧两数组模式不生成该报告。
+保留显式科学分析工具，正常标定不自动调用：`calibrate/visualize_norm.py` 是命令入口，调用 `calibrate/utils/visualize_norm.py`，使用本批 LUT、聚合样本及 `frames/overall` 缓存，在 `work_dir/visualization/` 生成逐图色差与 p/q 对照、RGB 色差到 p/q 的三维映射、三个零通道 LUT 切片和整批汇总。逐图预测调用最终 LUT 的原始插值；独立留出统计调用同批 `_train.npz`，复用已有局部坡度转法向函数计算角误差。显示回投复用 `rasterize_surface_grid`，统计始终使用原材料网格样本。所有输入校验坐标身份；空间样本还检查与训练样本逐点一致，不混入遗留缓存。显式分析失败不改写已发布 LUT 的验证状态；完整报告生成后才替换旧报告。没有图片分组的旧两数组模式不生成该报告。
 
 已实现 p/q 不良映射图：使用拟合及剔除前的全部配对样本，以 KDTree 查询有符号线性 RGB 欧氏距离 ≤0.01 的所有无序样本对，包含同图与跨图。将 p/q 转成公共局部基下的单位法向 `normalize([-p,-q,1])`，夹角 >20° 的样本对为冲突对，两端点均在 p/q 图中标红。一个点可参与多个冲突对，点数与对数分别统计；不只选最近邻。两个阈值可通过可视化 CLI 调整。图片仅输出 PNG，另保存全部冲突索引、逐对距离与角度、不良点 mask 的 NPZ，汇总 JSON 记录阈值和统计。这些诊断不改变 LUT 拟合或筛选规则。
 
@@ -386,13 +386,15 @@ h_i = sqrt(mean_j(||Q_j-Q_i||²))
 | `utils/annotation_window.py` | 固定图像范围的 Matplotlib/PyQt5 窗口，滚轮只转交给形状编辑 |
 | `utils/image_io.py` | 线性 NPZ 读写、旧图入口解码、直接线性显示适配与检测灰度适配 |
 | `utils/color_difference.py` | BT.709 逆传递、曲面数组有符号差及色差示意 |
-| `utils/normal_mapping.py` | 提取 LUT 数据、构建与原始查询；保留兼容导出 |
-| `calibrate/manual_norm_regions.py` | 为通用编辑器配置接触语义、三面板与重算回调 |
-| `calibrate/norm_pipeline.py` | 图片准备、最终重拟合、颜色/标签组合、样本导出、验证 |
+| `utils/normal_mapping.py` | LUT 数据、构建与原始查询 |
+| `calibrate/utils/manual_norm_regions.py` | 为通用编辑器配置接触语义、三面板与重算回调 |
+| `calibrate/utils/norm_pipeline.py` | 图片准备、最终重拟合、颜色/标签组合、样本导出、验证 |
 | `calibrate/calibrate_norm.py` | 保留现有 CLI 入口，解析参数并选择阶段 |
+| `calibrate/visualize_norm.py / calibrate/analyze_ambiguities.py` | 质检命令入口，解析参数并调用实现 |
+| `calibrate/utils/visualize_norm.py / calibrate/utils/analyze_ambiguities.py` | 标定可视化、歧义分析与改进实验的实现 |
 | `reconstruction/get_surface.py / reconstruction/local_recon.py` | 薄编排、文件适配和已有推理策略，不复制底层算法 |
 
-依赖单向：底层数组与几何模块 → provider/标定适配 → CLI。禁止 `utils` 反向导入 `calibrate`，也不让数学函数读取配置、GUI 或 `provider.last_frame_result`。
+依赖单向：底层数组与几何模块 → provider/标定适配 → CLI。仓库根目录的 `utils/` 不得反向导入 `calibrate`；`calibrate/utils/` 承载标定专用实现，不反向导入命令入口。数学函数不读取配置、GUI 或 `provider.last_frame_result`。
 
 下列接口中的普通数组默认支持批量输入；参数曲面输入 Nx2 原生参数、输出 Nx3。无效值通过 mask 返回，不以零值代表成功。
 

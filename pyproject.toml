@@ -6,12 +6,17 @@ requires-python = ">=3.10"
 dependencies = [
     "jax[cuda12]>=0.4.30",
     "matplotlib>=3.8",
+    "numpy>=1.24",
     "opencv-python>=4.8.0",
+    "Pillow>=10",
     "PyQt5>=5.15",
     "pyserial>=3.5",
     "pyyaml>=6.0.3",
     "scipy>=1.15.0",
 ]
+
+[project.optional-dependencies]
+physical-gpu = ["torch>=2.7"]
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -21,14 +26,20 @@ build-backend = "setuptools.build_meta"
 packages = [
     "utils",
     "calibrate",
+    "calibrate.utils",
     "reconstruction",
     "reconstruction.surface_reconstruction",
     "hardware",
+    "physical_model",
+    "physical_model.model_utils",
+    "physical_model.cali_utils",
+    "physical_model.compensation_utils",
 ]
 py-modules = ["capture"]
 
 [tool.setuptools.package-data]
 "reconstruction.surface_reconstruction" = ["config.json", "data/*.npz", "data/*.csv"]
+"physical_model" = ["configs/*.json", "README.md", "SOURCE.json"]
 
 [project.scripts]
 capture = "capture:main"
@@ -38,3 +49,7 @@ calibrate-norm = "calibrate.calibrate_norm:main"
 recon = "reconstruction.recon:main"
 local-recon = "reconstruction.local_recon:local_main"
 recon-local = "reconstruction.local_recon:local_main"
+physical-simulate = "physical_model.simulate:main"
+physical-simulate-curve = "physical_model.simulate_curve:main"
+physical-calibrate-lut = "physical_model.calibrate_lut:main"
+physical-compensate = "physical_model.compensate:main"
