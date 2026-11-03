@@ -21,7 +21,6 @@ import yaml
 from calibrate.norm_pipeline import (
     _LUTValidationFailure, fit_and_validate_samples, parse_settings, run_prepare, run_samples,
 )
-from calibrate.visualize_norm import generate_calibration_visualizations
 from utils.normal_mapping import NormalCalibration, build_normal_lut, lookup_slopes_raw
 from utils.region_annotations import load_regions, region_masks
 from utils.surface_geometry import local_slopes_to_normals
@@ -31,6 +30,50 @@ from utils.surface_sampling import sample_mask_to_surface
 SAMPLE_FIELDS = ('color_residual_samples', 'slope_samples', 'reference_normal_samples',
                  'tangent_frame_samples', 'image_index', 'image_paths')
 TILT_BINS = ((0, 15), (15, 30), (30, 45), (45, 60), (60, 90))
+IMAGE_SUFFIXES = {'.npz', '.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp'}
+
+
+def source_images(directory):
+    """Select one source per image stem, preferring linear NPZ over image previews."""
+    directory = Path(directory)
+    candidates = [path for path in directory.iterdir()
+                  if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES]
+    by_stem = {}
+    for path in candidates:
+        by_stem.setdefault(path.stem.casefold(), []).append(path)
+    selected = []
+    for paths in by_stem.values():
+        linear = [path for path in paths if path.suffix.lower() == '.npz']
+        if linear:
+            if len(linear) != 1:
+                raise ValueError(f'Multiple linear NPZ sources share a stem: {sorted(linear)}')
+            selected.append(linear[0])
+        elif len(paths) == 1:
+            selected.append(paths[0])
+        else:
+            raise ValueError(f'Multiple source images share a stem: {sorted(paths)}')
+    return sorted(selected)
+
+
+def matching_annotation(annotations, image, image_root):
+    """Match annotations by relative image identity while allowing an extension change."""
+    image = Path(image)
+    image_root = Path(image_root)
+    image_key = Path(image.relative_to(image_root)).with_suffix('').as_posix()
+    matches = []
+    for row in annotations['regions']:
+        annotation_key = Path(row['image']).with_suffix('').as_posix()
+        if (annotation_key == image_key or annotation_key.endswith('/'+image_key)
+                or image_key.endswith('/'+annotation_key)):
+            matches.append(row)
+    if len(matches) > 1:
+        domain = image.parent.name
+        domain_matches = [row for row in matches if domain in Path(row['image']).parts]
+        if domain_matches:
+            matches = domain_matches
+    if len(matches) != 1:
+        raise ValueError(f'Expected one annotation for {image}; found {len(matches)}')
+    return matches[0]
 
 
 def distribution(values):
@@ -142,28 +185,31 @@ def source_signature(config, datasets, settings):
     provider = Path(load_config(config)['get_surface']['overall_reconstruction']['config_file'])
     paths.append(provider if provider.is_absolute() else config.parent/provider)
     for directory in datasets.values():
-        paths.extend(sorted(directory.glob('*.png')))
+        paths.extend(source_images(directory))
     signature = {str(path.resolve()): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
     signature['rgb_transfer_function'] = CAMERA_RGB_TRANSFER_FUNCTION
+    signature['source_color_storage'] = 'linear_rgb_npz_or_legacy_camera_image'
     return signature
 
 
 def prepare_dataset(name, directory, output, config, base):
     work = output/name
     work.mkdir(parents=True, exist_ok=True)
-    images = sorted(directory.glob('*.png'))
+    images = source_images(directory)
+    if not images:
+        raise ValueError(f'{name}: no supported source images in {directory}')
     annotations = yaml.safe_load(base.annotations_file.read_text())
     rows = []
     for image in images:
-        matches = [row for row in annotations['regions'] if Path(row['image']).name == image.name]
-        if len(matches) != 1 or matches[0]['status'] != 'accepted':
-            raise ValueError(f'{name}: expected one accepted annotation for {image.name}')
-        rows.append(dict(matches[0], image=image.name))
+        match = matching_annotation(annotations, image, directory)
+        if match['status'] != 'accepted':
+            raise ValueError(f'{name}: expected an accepted annotation for {image.name}')
+        rows.append(dict(match, image=image.relative_to(directory).as_posix()))
     import os
     annotation_file = work/'manual_regions.yaml'
     annotation_file.write_text(yaml.safe_dump(dict(version=2, image_root=os.path.relpath(directory, work),
                                regions=rows), sort_keys=False, allow_unicode=True))
-    settings = replace(base, images=(str(directory/'*.png'),), image_root=directory,
+    settings = replace(base, images=tuple(str(image) for image in images), image_root=directory,
                        annotations_file=annotation_file, work_dir=work,
                        input_file=work/'normal_samples.npz', output=work/'normal_lut.npz')
     print(f'[{name}] prepare {len(images)} images', flush=True)
@@ -189,7 +235,6 @@ def fit_dataset(settings):
                     if key not in {'training_images', 'validation_images', 'total_sample_count'}}
         metadata.update(validation_status='failed', validation=exc.report)
         replace(model, metadata=metadata).save(settings.output, total_sample_count=count)
-        generate_calibration_visualizations(settings.output, settings.input_file, settings.work_dir)
     with np.load(settings.input_file, allow_pickle=False) as data:
         samples = {key: data[key] for key in SAMPLE_FIELDS}
     return NormalCalibration.load(settings.output), samples

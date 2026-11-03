@@ -1,18 +1,19 @@
-"""固定曝光采集相机原始帧，并提供 sRGB 与线性值两种预览模式。"""
+"""固定曝光采集相机帧，并保存为线性 RGB NPZ。"""
 
 import argparse
+import json
 import math
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
 import cv2
-import numpy as np
 
 from utils.camera import open_camera
 from utils.color_difference import (
+    CAMERA_RGB_TRANSFER_FUNCTION,
     bgr8_to_linear_rgb,
-    linear_rgb_to_display_bgr,
 )
 from utils.config import (
     ConfigError,
@@ -20,6 +21,7 @@ from utils.config import (
     parse_camera_config,
     require_keys,
 )
+from utils.image_io import linear_rgb_to_bgr8, save_linear_image
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.yaml")
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
@@ -27,30 +29,42 @@ VIDEO_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv"}
 
 
 def capture_output_path(configured_path: Path) -> Path:
-    """文件配置直接使用；目录配置生成带微秒时间戳且不覆盖的 PNG。"""
-    if configured_path.suffix.lower() in IMAGE_SUFFIXES:
-        return configured_path
+    """Use an explicit NPZ path or create a timestamped NPZ in a directory."""
+    suffix = configured_path.suffix.lower()
+    if not configured_path.is_dir():
+        if suffix == ".npz":
+            return configured_path
+        if suffix in IMAGE_SUFFIXES:
+            raise ValueError(
+                f"静态图片必须保存为线性 RGB NPZ，请将 capture.save 改为 .npz: "
+                f"{configured_path}"
+            )
     configured_path.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    candidate = configured_path / f"capture_{timestamp}.png"
+    candidate = configured_path / f"capture_{timestamp}.npz"
     counter = 1
     while candidate.exists():
-        candidate = configured_path / f"capture_{timestamp}_{counter:02d}.png"
+        candidate = configured_path / f"capture_{timestamp}_{counter:02d}.npz"
         counter += 1
     return candidate
 
 
 def video_output_path(configured_path: Path) -> Path:
-    """文件配置直接使用；目录配置生成带微秒时间戳且不覆盖的无损 AVI。"""
-    if configured_path.suffix.lower() in VIDEO_SUFFIXES:
-        return configured_path
+    """Create a timestamped frame directory under the configured directory."""
+    if not configured_path.is_dir() \
+            and configured_path.suffix.lower() in VIDEO_SUFFIXES:
+        raise ValueError(
+            f"录像现保存为逐帧 NPZ 目录，请将 capture.video_save 配置为目录: "
+            f"{configured_path}"
+        )
     configured_path.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    candidate = configured_path / f"capture_{timestamp}.avi"
+    candidate = configured_path / f"capture_{timestamp}"
     counter = 1
     while candidate.exists():
-        candidate = configured_path / f"capture_{timestamp}_{counter:02d}.avi"
+        candidate = configured_path / f"capture_{timestamp}_{counter:02d}"
         counter += 1
+    candidate.mkdir()
     return candidate
 
 
@@ -61,32 +75,32 @@ def recording_fps(camera_fps: float, fallback: float = 30.0) -> float:
     return float(fallback)
 
 
-def open_video_writer(
-    output_path: Path,
-    frame_size: tuple[int, int],
+def save_video_manifest(
+    output_dir: Path,
     fps: float,
-) -> cv2.VideoWriter:
-    """按文件扩展名选择编码器并创建录像写入器。"""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    # FFV1 保留精确像素颜色，适合后续光场标定；显式选择 MP4 时使用 mp4v。
-    codec = "FFV1" if output_path.suffix.lower() == ".avi" else "mp4v"
-    writer = cv2.VideoWriter(
-        str(output_path),
-        cv2.VideoWriter_fourcc(*codec),
-        fps,
-        frame_size,
-    )
-    if not writer.isOpened():
-        writer.release()
-        raise RuntimeError(
-            f"无法创建录像文件 {output_path}（编码器 {codec}，{fps:.2f} FPS）"
-        )
-    return writer
+    frames: list[dict[str, int | float | str]],
+) -> bool:
+    """Write the frame index and nominal time for a completed recording."""
+    manifest = {
+        "format_version": 1,
+        "color_space": "linear_rgb",
+        "rgb_transfer_function": CAMERA_RGB_TRANSFER_FUNCTION,
+        "fps": fps,
+        "frames": frames,
+    }
+    try:
+        with (output_dir / "manifest.json").open("w", encoding="utf-8") as stream:
+            json.dump(manifest, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+    except OSError as error:
+        print(f"录像清单保存失败: {error}", file=sys.stderr)
+        return False
+    return True
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="固定曝光采集原始相机帧，预览可切换 sRGB 显示和线性值模式"
+        description="固定曝光采集相机帧并保存线性 RGB NPZ"
     )
     parser.add_argument(
         "--config",
@@ -142,16 +156,17 @@ def main() -> None:
     actual_fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
     fourcc_name = actual_fourcc.to_bytes(4, "little").decode("ascii", errors="replace")
     print(f"采集格式={fourcc_name}, 背光补偿={cap.get(cv2.CAP_PROP_BACKLIGHT)}")
-    print("默认预览使用 sRGB 显示编码；按 l 切换未编码线性值预览")
-    print("预览上的模式和录像文字不会写入图片或录像；保存内容为相机原始编码帧")
+    print("预览直接显示线性 RGB 值")
+    print("静态图片和录像均保存为线性 RGB float32 NPZ")
     print("按 v 开始录像；按 s 停止录像；按 p 保存当前帧；按 q 或 Esc 退出")
 
     window = "camera preview"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-    video_writer: cv2.VideoWriter | None = None
-    active_video_path: Path | None = None
+    active_video_dir: Path | None = None
+    video_fps = 0.0
+    video_start_time: float | None = None
+    frame_records: list[dict[str, int | float | str]] = []
     recorded_frames = 0
-    show_linear_preview = False
 
     try:
         while True:
@@ -160,22 +175,35 @@ def main() -> None:
                 print("读取帧失败", file=sys.stderr)
                 break
 
-            if video_writer is not None:
-                video_writer.write(frame)
-                recorded_frames += 1
-
             linear_rgb = bgr8_to_linear_rgb(frame)
-            if show_linear_preview:
-                display_frame = np.rint(
-                    linear_rgb[..., ::-1] * 255.0
-                ).astype(np.uint8)
-                mode_text = "LINEAR VALUES (l)"
-            else:
-                display_frame = linear_rgb_to_display_bgr(linear_rgb)
-                mode_text = "sRGB DISPLAY (l)"
+            if active_video_dir is not None:
+                frame_time = time.monotonic()
+                if video_start_time is None:
+                    video_start_time = frame_time
+                timestamp_s = frame_time - video_start_time
+                frame_name = f"frame_{recorded_frames:06d}.npz"
+                frame_path = active_video_dir / frame_name
+                try:
+                    save_linear_image(frame_path, linear_rgb)
+                except OSError as error:
+                    print(f"录像帧保存失败: {error}", file=sys.stderr)
+                    save_video_manifest(active_video_dir, video_fps, frame_records)
+                    active_video_dir = None
+                    video_start_time = None
+                    frame_records = []
+                    recorded_frames = 0
+                else:
+                    frame_records.append({
+                        "index": recorded_frames,
+                        "timestamp_s": timestamp_s,
+                        "file": frame_name,
+                    })
+                    recorded_frames += 1
+
+            display_frame = linear_rgb_to_bgr8(linear_rgb)
             cv2.putText(
                 display_frame,
-                mode_text,
+                "LINEAR RGB",
                 (16, 36),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -183,7 +211,7 @@ def main() -> None:
                 2,
                 cv2.LINE_AA,
             )
-            if video_writer is not None:
+            if active_video_dir is not None:
                 cv2.putText(
                     display_frame,
                     f"REC  {recorded_frames}",
@@ -199,53 +227,50 @@ def main() -> None:
 
             if key == ord("q") or key == 27:  # q 或 Esc
                 break
-            if key == ord("l"):
-                show_linear_preview = not show_linear_preview
-                mode = "线性值" if show_linear_preview else "sRGB 显示编码"
-                print(f"预览模式：{mode}")
-                continue
             if key == ord("v"):
-                if video_writer is not None:
-                    print(f"正在录像: {active_video_path}")
+                if active_video_dir is not None:
+                    print(f"正在录像: {active_video_dir}")
                     continue
-                height, width = frame.shape[:2]
-                active_video_path = video_output_path(video_save_path)
-                fps = recording_fps(float(cap.get(cv2.CAP_PROP_FPS)))
                 try:
-                    video_writer = open_video_writer(
-                        active_video_path,
-                        (width, height),
-                        fps,
-                    )
-                except RuntimeError as error:
+                    active_video_dir = video_output_path(video_save_path)
+                except (OSError, ValueError) as error:
                     print(f"开始录像失败: {error}", file=sys.stderr)
-                    active_video_path = None
                     continue
+                video_fps = recording_fps(float(cap.get(cv2.CAP_PROP_FPS)))
+                video_start_time = None
+                frame_records = []
                 recorded_frames = 0
                 print(
-                    f"开始录像: {active_video_path} "
-                    f"({width}x{height}, {fps:.2f} FPS)"
+                    f"开始录像: {active_video_dir} "
+                    f"({frame.shape[1]}x{frame.shape[0]}, {video_fps:.2f} FPS)"
                 )
             elif key == ord("s"):
-                if video_writer is None:
+                if active_video_dir is None:
                     print("当前没有正在进行的录像。按 v 开始录像。")
                     continue
-                video_writer.release()
-                video_writer = None
-                print(f"录像已保存: {active_video_path}（{recorded_frames} 帧）")
-                active_video_path = None
+                manifest_saved = save_video_manifest(
+                    active_video_dir, video_fps, frame_records
+                )
+                result = "录像已保存" if manifest_saved else "录像帧已写入，清单保存失败"
+                print(f"{result}: {active_video_dir}（{recorded_frames} 帧）")
+                active_video_dir = None
+                video_start_time = None
+                frame_records = []
                 recorded_frames = 0
             elif key == ord("p") and save_path:
-                output_path = capture_output_path(save_path)
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                if cv2.imwrite(str(output_path), frame):
+                try:
+                    output_path = capture_output_path(save_path)
+                    save_linear_image(output_path, linear_rgb)
                     print(f"已保存到 {output_path}")
-                else:
-                    print(f"保存失败: {output_path}", file=sys.stderr)
+                except (OSError, ValueError) as error:
+                    print(f"保存失败: {error}", file=sys.stderr)
     finally:
-        if video_writer is not None:
-            video_writer.release()
-            print(f"录像已保存: {active_video_path}（{recorded_frames} 帧）")
+        if active_video_dir is not None:
+            manifest_saved = save_video_manifest(
+                active_video_dir, video_fps, frame_records
+            )
+            result = "录像已保存" if manifest_saved else "录像帧已写入，清单保存失败"
+            print(f"{result}: {active_video_dir}（{recorded_frames} 帧）")
         cap.release()
         cv2.destroyAllWindows()
 

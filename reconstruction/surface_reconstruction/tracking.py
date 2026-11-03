@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from itertools import combinations
 import cv2
 import numpy as np
+
+from utils.image_io import linear_rgb_to_tracking_bgr8, validate_linear_rgb
 from scipy.optimize import linear_sum_assignment
 try:
     from . import markers as detector
@@ -90,8 +92,12 @@ class TrackingSeed:
     gray: np.ndarray
 
     @classmethod
-    def build(cls, frame, ids, xy, direction="auto", region=None):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame.copy()
+    def build(cls, frame_linear_rgb, ids, xy, direction="auto", region=None,
+              *, tracking_bgr=None):
+        frame_linear_rgb = validate_linear_rgb(frame_linear_rgb)
+        if tracking_bgr is None:
+            tracking_bgr = linear_rgb_to_tracking_bgr8(frame_linear_rgb)
+        gray = cv2.cvtColor(tracking_bgr, cv2.COLOR_BGR2GRAY)
         rows, cols = require_regular_template(ids, xy)
         roi = detector.find_inner_roi(gray) if region is None else region.roi
         centers, _, _ = detector.detect_cross_centers(gray, roi)
@@ -115,8 +121,12 @@ class MarkerTracker:
         self.gate_fraction = gate_fraction
         self.failure_count = 0
 
-    def update(self, image):
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    def update(self, image_linear_rgb, *, tracking_bgr=None):
+        """Track IDs from one linear-RGB frame using BT.709 detector values."""
+        image_linear_rgb = validate_linear_rgb(image_linear_rgb)
+        if tracking_bgr is None:
+            tracking_bgr = linear_rgb_to_tracking_bgr8(image_linear_rgb)
+        gray = cv2.cvtColor(tracking_bgr, cv2.COLOR_BGR2GRAY)
         if gray.shape != self.seed.gray.shape:
             raise ValueError("Frame resolution changed; reinitialize with matching calibration")
         n = len(self.positions)

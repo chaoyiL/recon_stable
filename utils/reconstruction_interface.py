@@ -100,15 +100,15 @@ class MaterialCoordinateSystems:
 
 @runtime_checkable
 class OverallReconstructionProvider(Protocol):
-    """整体重建实现需要满足的唯一协议。"""
+    """整体重建实现；frame 参数为 HxWx3 float32 [0, 1] 线性 RGB。"""
 
     def reconstruct(
         self,
-        frame_bgr: np.ndarray,
+        frame_linear_rgb: np.ndarray,
         specs: MaterialCoordinateSpecs,
         surface_mask: np.ndarray | None = None,
     ) -> MaterialCoordinateSystems:
-        """从当前图像返回三套坐标；mask 只作为可选有效域约束。"""
+        """从 HxWx3 float32 [0, 1] 线性 RGB 图像返回坐标；mask 限定可选有效域。"""
 
 
 def _grid_spec(raw: Any, name: str) -> CoordinateGridSpec:

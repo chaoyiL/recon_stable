@@ -1,6 +1,6 @@
 # 当前仓库结构与主链路
 
-核对日期：2026-10-16。压球图片标定的算法和文件契约见 [cali_norm_plan.md](cali_norm_plan.md)。
+核对日期：2026-11-03。压球图片标定的算法和文件契约见 [cali_norm_plan.md](cali_norm_plan.md)。
 
 ## 1. 主链路与坐标约定
 
@@ -11,7 +11,7 @@
                                                ↓
 规则 st → 同一个参考弧长图反解 → 原生 a,b → 当前/参考 XYZ 和各自 UV
                                                ↓
-两张原图分别转线性 RGB、分别采样 → 有符号曲面域色差
+入口读取线性 RGB → 两张图分别采样 → 有符号曲面域色差
 接触边界 + 最终整体曲面 + 真实球半径/侧 → 球心 → 同 UV 射线的固定球冠 → 法向/坡度
                                                ↓
 统一有效索引配对 → 整张图片留出验证 → 通过后发布最终 LUT
@@ -54,13 +54,13 @@ uv run get-surface --image input.png --output overall_surface.npz \
 
 ## 3. 图片标定命令
 
-保留 `calibrate-norm` 命令。默认 `input_mode: samples`，外部两数组输入继续可用；图片工作流需要在 `config.yaml` 填写本次数据：
+保留 `calibrate-norm` 命令。当前配置为 `input_mode: images`，外部两数组输入继续可用；图片工作流需要在 `config.yaml` 填写本次数据：
 
 ```yaml
 normal_calibration:
   input_mode: images
-  images: ["assets/cali_norm_pics/*.png"]
-  reference_image: assets/reference.png
+  images: ["assets/cali_norm_pics/*.npz"]
+  reference_image: assets/reference.npz
   sphere_radius_mm: 10.0          # 示例；必须换成本次真实半径
   sphere_side: positive_normal    # 或 negative_normal，须明确球心相对局部基准法向的侧
   boundary_model: zero_boundary_displacement
@@ -101,7 +101,7 @@ uv run calibrate-norm --input external_samples.npz --output external_lut.npz
 
 右侧在球面法向尚未算出时显示整体曲面的相机深度 `Z`（mm）：按当前有效区域的最小、最大 Z 映射为 VIRIDIS 颜色，深紫色较近、黄色较远；每张图单独归一化，不能跨图直接比较颜色。`Reference overall depth` 使用准备阶段的参考曲面，`Final overall depth` 使用按当前标注重拟合的整体曲面。球面拟合成功后切换为 `Sphere normals`：RGB 分别编码相机坐标系的 `nx / ny / nz`，分量从 `[-1,1]` 映射到 `[0,255]`；黑色为未参与配对的样本区域。该图来自球面几何标签，不是 LUT 预测、置信度或局部位移。右图使用材料采样网格行列，不是原图像素坐标。编辑圆后清除旧球面标签，恢复参考深度预览；按 `g` 重新计算。
 
-标注窗口使用 Matplotlib 的 PyQt5 画布，禁用导航工具和画面缩放。三栏显示宽度依次为 640、960、280 像素，图像区高度为 720 像素；左侧原图和中间色差图等比例显示，右侧预览紧凑排列，说明文字在上方换行。说明文字和状态栏采用 22 像素字号、30 像素行距，使用独立字体图层按窗口实际分辨率绘制；不再先把小字画进源图后随图像插值放大。文字按实际字宽换行，底部预留四行状态区。窗口初始大小适配屏幕，可手动调整；鼠标位置仍按固定图像坐标转换，滚轮仅修改中间面板内的标注圆半径。保存的标定预览使用相同布局，文字直接在最终 PNG 分辨率绘制。首次安装新增 GUI 依赖时运行 `uv sync`。
+标注窗口使用 Matplotlib 的 PyQt5 画布，禁用导航工具和画面缩放。三栏显示宽度依次为 640、960、280 像素，图像区高度为 720 像素；左侧原图和中间色差图等比例显示，右侧预览紧凑排列，说明文字在上方换行。说明文字和状态栏采用 22 像素字号、30 像素行距，使用独立字体图层按窗口实际分辨率绘制；不再先把小字画进源图后随图像插值放大。文字按实际字宽换行，底部预留四行状态区。窗口初始大小适配屏幕，可手动调整；鼠标位置仍按固定图像坐标转换，滚轮仅修改中间面板内的标注圆半径。标注只在窗口预览，保存动作仅写入标注 YAML。首次安装新增 GUI 依赖时运行 `uv sync`。
 
 使用 Conda 或其他已激活环境时，依赖必须安装到实际运行程序的 Python 中；`uv sync` 默认管理项目 `.venv`，不会自动同步其他环境。可用 `python -c "import sys; print(sys.executable)"` 确认解释器。在该环境安装 PyQt5 后，可直接运行 `python -m calibrate.calibrate_norm --config config.yaml --stage annotate` 继续标注，无需重新 prepare。
 
@@ -146,19 +146,26 @@ uv run calibrate-norm --input external_samples.npz --output external_lut.npz
 [Linux V4L2 色彩空间文档](https://docs.kernel.org/userspace-api/media/v4l/colorspaces-details.html)。
 
 当前链路为：相机 ISP → YUYV → OpenCV 展开 YUV 量程并转 BGR8 →
-PNG/缓存原图 → BT.709 逆曲线转线性 RGB → 各自 UV 采样 → 有符号色差 → LUT。
+入口按 BT.709 逆曲线转线性 RGB → 线性 NPZ/内存缓存 → 各自 UV 采样 → 有符号色差 → LUT。
 当前 OpenCV 5.0.0 的 YUYV 路径使用 BT.601 limited-range 转换，与当前声明一致，
 参见 [V4L2 后端](https://github.com/opencv/opencv/blob/5.0.0/modules/videoio/src/cap_v4l.cpp)
 和 [YUV 转换实现](https://github.com/opencv/opencv/blob/5.0.0/modules/imgproc/src/color_yuv.simd.hpp)。
 进入 Python 逆曲线前的 RGB 已展开到完整编码量程，不能再次扣除 YUV 的黑电平。
 程序没有 Reinhard 色调映射；色差诊断图的 `0.5 + 2 * delta` 仅用于显示。
 
-运行 `uv run capture` 时，`camera preview` 窗口默认将 BT.709 解码的线性 RGB
-按 sRGB 正向曲线编码显示。按 `l` 切换到直接将 `[0,1]` 量化为 `[0,255]` 的
-线性数值预览；后者通常更暗，不用于判断显示器上的颜色。两种模式都不做亮度
-归一化，模式和录像状态文字只画在预览副本上。
-按 `p` 保存图片、按 `v` 开始录像时仍写入相机原始编码帧，后续标定再解码一次，
-避免重复应用逆曲线。
+`utils/image_io.py` 统一图像读写：`load_linear_image` 返回 `H×W×3 float32 RGB [0,1]`，
+旧相机 PNG/JPG 在这里解码一次，新线性 NPZ 直接加载。`save_linear_image` 保存
+`linear_rgb`、`color_space=linear_rgb`、来源曲线 `rgb_transfer_function=bt709` 和格式版本 1。
+它不量化为 8 位，也不产生预览图片。旧 `assets/reference.png` 也可配置为输入，在读取时解码；
+当前配置使用新格式的 `assets/reference.npz`，需采集本批底色图。
+
+采集、标注及原图预览均直接显示线性值，不做 sRGB 正向编码、色调映射或亮度归一化。
+OpenCV/Qt 的 8 位画布仅做 `round(linear_rgb * 255)` 和 RGB/BGR 换序，叠加文字不写入主数据。
+`capture` 按 `p` 保存线性 NPZ，按 `v/s` 开始/停止逐帧 NPZ 录像，帧顺序和时间保存在
+录像目录的 `manifest.json`。不再使用 `l` 切换显示曲线，也不生成检查 PNG。
+
+marker 检测和光流保留原来的 8 位灰度强度：仅在检测边界从线性图恢复 BT.709 编码值。
+这条适配不参与显示和色差计算，避免为了改变存储格式重新调整检测阈值。
 
 `utils/color_difference.py` 是标定和重建共用的解码入口。对每个归一化编码通道
 `E = uint8 / 255`，输出无量纲的 `L∈[0,1]`：
@@ -197,13 +204,13 @@ uv run calibrate-norm --config config.yaml --stage fit
 | 曝光/白平衡 | 当前手动曝光 20、自动白平衡关闭、色温 6500 K，与 YAML 一致；独立 `surface_reconstruction/run_reconstruction.py` 实时入口仍绕过共享初始化，未锁定这些控制项 |
 | ISP 控制 | 当前背光补偿由 YAML 固定为 0，共享初始化设置并回读。gamma=100、gain=0、contrast=32、saturation=64、sharpness=2 为本次实测值，未由配置固定；gamma=100 不代表输出物理线性 |
 | 几何内参 | `assets/camera_calibration.yaml` 与重建所读 `data/camera_params.npz` 的矩阵和畸变系数一致；重新标定时两个文件仍需同步 |
-| 保存格式 | 原图 PNG 不经过 RGB 逆曲线；默认 AVI/FFV1 已用随机 BGR8 帧验证编解码逐像素一致；显式选择 MP4 使用有损 mp4v，不适合精确色差标定 |
+| 保存格式 | 新采集图片和录像帧均保存 float32 线性 RGB NPZ；旧编码图片仅在加载入口解码 |
 
-两张原图各自建立 `surface_mask & ~marker_image_mask & unsaturated`。marker mask 复用检测的组件形状；失检或匹配不唯一时使用参考尺寸与跟踪位置保守屏蔽。额外膨胀宽度为 1 px（3×3 核），标定与 `reconstruction/get_surface.py` 共用此默认值。原始 BGR8 任一通道为 255 即排除。
+两张原图各自建立 `surface_mask & ~marker_image_mask & unsaturated`。marker mask 复用检测的组件形状；失检或匹配不唯一时使用参考尺寸与跟踪位置保守屏蔽。额外膨胀宽度为 1 px（3×3 核），标定与 `reconstruction/get_surface.py` 共用此默认值。线性 RGB 任一通道达到 1 即排除，对应原始 BGR8 的 255。
 
 标定加载几何缓存时，从缓存原图、marker 位置及参考尺寸重建光度屏蔽 mask，使调整后的膨胀宽度直接用于 annotate 和 samples；不重新拟合整体曲面或建立坐标图，也不在读取时改写缓存文件。重跑 samples、fit 可更新训练样本和 LUT。已导出的普通整体重建或 recon 输入 NPZ 仍保留其原有 mask，需重新导出才能采用新宽度。
 
-先转线性 RGB，再分别按各自 UV 做严格四邻域双线性采样，最后计算 `observed-reference`。保留三通道正负号，不给 marker 补色。几何 mask 保留 marker 材料位置，光度 mask 表示两侧颜色都有效。
+直接对入口提供的线性 RGB 分别按各自 UV 做严格四邻域双线性采样，最后计算 `observed-reference`。标注重算和样本生成不重复解码整图。保留三通道正负号，不给 marker 补色。几何 mask 保留 marker 材料位置，光度 mask 表示两侧颜色都有效。
 
 边界按 128 点采样；标签直接使用标注圆盘，不缩小半径或内缩边界，外扩 20 px 仅用于排除整体拟合和背景统计。UV 三角形提供原生参数初值，再在归一化原生参数中优化反投影。边界至少 96 点有效且连续缺失不超过 32 点；多解拒绝。
 
@@ -217,7 +224,7 @@ uv run calibrate-norm --config config.yaml --stage fit
 
 发布前检查 reference 与 LUT 的坐标编号、参考图和坐标约定一致，并先完整写好两个临时文件，再分别替换最终 LUT 和采样网格。验证、reference 检查或临时文件写入失败时保留已发布的两个文件。旧两数组外部样本没有 reference 几何，只生成标记为未验证的 LUT，不更新采样网格。
 
-图片 `fit` 成功后自动在 `work_dir/visualization/` 生成本批结果；已有标定也可独立补生成：
+图片 `fit` 只发布模型、材料网格和验证 JSON，不自动导出检查 PNG。需要独立科学分析时可显式运行以下工具：
 
 ```bash
 uv run python -m calibrate.visualize_norm --config config.yaml
@@ -307,25 +314,16 @@ assets/normal_calibration/
   lut_material_grid.npz
   lut_sources.json
   lut_source_images/
-  verification/000000.png
   verification/report.csv
   verification/validation.json
-  visualization/color_difference/000000.png
-  visualization/pq_mapping/000000.png
-  visualization/color_pq_mapping.png
-  visualization/lut_slices.png
-  visualization/calibration_summary.png
-  visualization/pq_ambiguities.png
-  visualization/ambiguities.npz
-  visualization/summary.json
 ```
 
-每图对应一个六位索引缓存名、一张合并预览和一行报告；manifest 固定记录索引、完整相对 key、源路径和参考路径。失败使用稳定 reason code，并排除出训练。预览在阶段重跑时覆盖同一文件。
+每图对应一个六位索引缓存名和一行报告；manifest 固定记录索引、完整相对 key、源路径和参考路径。失败使用稳定 reason code，并排除出训练。历史检查图片可保留，新流程不自动生成或清理它们。
 
 | 文件 | 关键内容 |
 |---|---|
 | 坐标图 v1 | UUID、原生轴/范围、累计弧长、行列总长和 st 表，float64，只保存数组 |
-| 几何 v2 | 三套 XYZ/UV/coordinates/st/mask、16×3 系数、相机、模板、原图/区域、marker 观测与尺寸、拟合信息和 geometry_stage |
+| 几何 v3 | 三套 XYZ/UV/coordinates/st/mask、16×3 系数、相机、模板、`observed_linear_rgb` 浮点整图/区域、marker 观测与尺寸、颜色声明、拟合信息和 geometry_stage；旧 v2 的 BGR 仅在加载时解码 |
 | prepared | `geometry_stage=preview_reference`，可从观测重算；不允许直接训练 |
 | overall | `geometry_stage=final`，含 `marker_fit_valid` 和最终系数 |
 | frames | 最终 XYZ/UV/st/原生参数、参考/当前颜色和有符号差、几何/光度/sample mask、球面坡度/法向/球心/根分支与诊断 |
@@ -391,11 +389,11 @@ uv run local-recon --view assets/reconstruction/pc/000000_local_result.npz
 分别累加行、列相邻有效 XYZ 的三维距离，并取各条曲线长度的中位数作为代表宽度与高度；
 缺失段按同条曲线的可见平均步长估算。该比例用于整个显示框，不表示弯曲曲面能严格无失真地展开到平面。
 
-完整重建和独立局部重建默认将 NPZ 保存到 `reconstruction.output_dir/pc/`，同名 PNG 直接保存到 `reconstruction.output_dir/`；当前分别为 `assets/reconstruction/pc/` 和 `assets/reconstruction/`，目录自动创建。显式 `--output` 按给定位置保存 NPZ，默认预览图放在 `pc/` 上一级目录，其他位置则与 NPZ 相邻。加 `--show` 可在保存后显示窗口。`--preview-output` 可自定义预览路径或改存 JPG/SVG/PDF；与 `--view` 配合且不加 `--show` 时只保存图片，适用于无图形界面的环境：
+完整重建和独立局部重建默认只将结果 NPZ 保存到 `reconstruction.output_dir/pc/`，目录自动创建。
+显式 `--output` 指定结果路径；加 `--show` 打开窗口，不自动保存预览 PNG。已有结果可直接查看：
 
 ```bash
-uv run local-recon --view assets/reconstruction/pc/000000_local_result.npz \
-  --preview-output assets/reconstruction/000000_local_result.png
+uv run local-recon --view assets/reconstruction/pc/000000_local_result.npz
 ```
 
 旧 v1 几何和 v4/v5 LUT 可按旧模板参数路径读取；不会自动转换成新的参考弧长语义。本次修改 CPU 路径，JAX 独立数值接口保留。
@@ -407,14 +405,14 @@ uv run local-recon --view assets/reconstruction/pc/000000_local_result.npz \
 
 ```bash
 uv run recon --config config.yaml \
-  --image assets/cali_norm_pics/capture_20261016_184356_361449.png
+  --image assets/cali_norm_pics/capture_20261016_184356_361449.npz
 # 可指定结果路径并显示预览：
 uv run recon --image input.png --output assets/reconstruction/pc/result.npz --show
 ```
 
 配置段 `reconstruction` 指定 `reference_image`、`material_grid_file`、`output_dir` 和 `match_surface_aspect`。
 程序用参考图固定 marker ID，独立拟合当前曲面，按与 LUT 配套的材料网格分别采样两张图，
-然后调用相同的局部求解和保存函数。默认在 `output_dir/pc/` 保存 `<图片名>_local_result.npz`，同名 PNG 保存在 `output_dir/`，不生成中间输入包。
+然后调用相同的局部求解和保存函数。默认只在 `output_dir/pc/` 保存 `<图片名>_local_result.npz`，不生成检查 PNG 或中间输入包。
 相机、模板、材料身份及颜色约定不一致时拒绝使用；不自动训练或替换 LUT。
 
 `assets/normal_calibration/lut_material_grid.npz` 随图片法向标定的最终 LUT 更新，
@@ -451,7 +449,8 @@ uv run recon --image input.png --output assets/reconstruction/pc/result.npz --sh
 | `utils/region_annotations.py` | 通用区域数据、YAML、边界和 mask |
 | `utils/annotation_editor.py` | 仅依赖回调的通用编辑器 |
 | `utils/annotation_window.py` | 固定图像范围的标注窗口，屏蔽导航缩放并转换鼠标与键盘事件 |
-| `utils/color_difference.py` | 线性 RGB、有符号差和显示转换 |
+| `utils/image_io.py` | 线性 NPZ 图像读写、旧图入口解码、直接线性显示与检测适配 |
+| `utils/color_difference.py` | BT.709 逆传递、有符号色差与色差示意 |
 | `utils/normal_mapping.py` | LUT 数据、构建、原始查询 |
 | `utils/reconstruction_interface.py` | 三套网格和坐标类型 |
 | `reconstruction/get_surface.py / reconstruction/local_recon.py` | 文件适配、CLI 与推理策略；兼容导出旧接口 |
@@ -461,7 +460,7 @@ uv run recon --image input.png --output assets/reconstruction/pc/result.npz --sh
 底层 utils 不反向导入 calibrate，不读配置、不创建 GUI、不读取 provider 的隐式状态。采集工具保留，曲面有效域由黑框内部轮廓提供。仓库不包含背景光场生成算法。
 
 `slope_color_audit.py` 要求旧式成套输入：原图、整体几何 NPZ、`*_recon_input.npz` 和 `*_local_result.npz`，并使用能复现结果的 LUT 与保护参数。
-当前单图入口只保存最终结果及预览，不能仅凭它们执行完整审计；此工具保留用于已有输入包的分析。
+当前单图入口只保存最终结果，不能仅凭它执行完整审计；此工具保留用于已有输入包的分析。
 
 ## 9. 开发验收
 
@@ -470,6 +469,6 @@ uv run python -m unittest discover -s tests -p test_color_difference.py -v
 uv run python -m unittest discover -s tests -p test_norm_calibration_pipeline.py -v
 ```
 
-标准库 unittest 覆盖：弧长/坐标闭环及多解拒绝；独立颜色采样和几何缺失区；两侧球面几何及法向符号；无界面样本/拟合、缓存复用、分组验证隔离和失败不覆盖发布；单图流程与离线求解一致、参考图零位移和材料身份校验。实际数据运行后查看每图合并预览、`report.csv` 与 `validation.json`。
+算法和行为变化应检查弧长/坐标闭环、独立颜色采样、球面几何、缓存复用与分组验证隔离。实际数据运行后查看交互标注、`report.csv` 与 `validation.json`；不依赖自动导出的检查 PNG。测试运行结果以本次交付说明为准。
 
 `assets/`、模型、训练数据、缓存和输出为本地资产，不纳入 Git。验收模块 `tests/test_norm_calibration_pipeline.py` 单独解除测试目录忽略，便于版本管理。

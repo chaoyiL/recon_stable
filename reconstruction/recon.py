@@ -15,8 +15,7 @@ def main() -> None:
     parser.add_argument('--material-grid', help='覆盖与 LUT 配套的材料网格或完整参考弧长图')
     parser.add_argument('--calibration', help='覆盖 local_reconstruction.calibration_file')
     parser.add_argument('--output', help='结果 NPZ；默认保存到 reconstruction.output_dir/pc')
-    parser.add_argument('--preview-output', help='预览图；默认保存到 reconstruction.output_dir，与 NPZ 同名')
-    parser.add_argument('--show', action='store_true', help='保存后显示预览窗口')
+    parser.add_argument('--show', action='store_true', help='显示结果窗口')
     parser.add_argument('--lsmr-atol', type=float)
     parser.add_argument('--lsmr-btol', type=float)
     parser.add_argument('--lsmr-max-iterations', type=int)
@@ -24,10 +23,10 @@ def main() -> None:
     result, output = reconstruct_image(
         args.image, args.config, reference_image=args.reference_image,
         material_grid_file=args.material_grid, calibration_file=args.calibration,
-        output=args.output, preview_output=args.preview_output,
+        output=args.output,
         lsmr_atol=args.lsmr_atol, lsmr_btol=args.lsmr_btol,
         lsmr_max_iterations=args.lsmr_max_iterations)
-    save_reconstruction_result(result, output, preview_output=args.preview_output, show=args.show)
+    save_reconstruction_result(result, output, show=args.show)
 
 
 if __name__ == '__main__':

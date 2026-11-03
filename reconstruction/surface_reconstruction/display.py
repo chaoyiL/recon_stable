@@ -2,14 +2,17 @@
 
 import cv2
 import numpy as np
+
+from utils.image_io import linear_rgb_to_bgr8, validate_linear_rgb
 try:
     from .surface import local_coordinates
 except ImportError:  # Direct execution from this directory.
     from surface import local_coordinates
 
 
-def marker_overlay(frame, pixels, valid, status, segment=0):
-    canvas = frame.copy()
+def marker_overlay(frame_linear_rgb, pixels, valid, status, segment=0):
+    frame_linear_rgb = validate_linear_rgb(frame_linear_rgb)
+    canvas = linear_rgb_to_bgr8(frame_linear_rgb)
     for idx in np.flatnonzero(valid):
         u, v = np.rint(pixels[idx]).astype(int)
         cv2.circle(canvas, (u, v), 3, (0, 210, 0), 1, cv2.LINE_AA)

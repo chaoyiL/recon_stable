@@ -15,9 +15,11 @@ def edit_regions(regions, *, panel_callback, recompute_callback, save_callback,
                  maximum_circle_radius: Callable[[RegionAnnotation], float] | None = None):
     """Edit original-pixel geometry. Return False after saving an Escape draft.
 
-    Callbacks receive the annotation. panel_callback returns three AnnotationPanel objects;
-    editable_panel selects the image receiving mouse edits (0, 1 or 2). It must
-    use the original image dimensions and pixel coordinates, before display scaling.
+    Callbacks receive the annotation. panel_callback returns three AnnotationPanel objects
+    containing display-only BGR8 canvases. Linear RGB source images must be directly
+    quantized before display; this editor does not apply a transfer curve. editable_panel
+    selects the image receiving mouse edits (0, 1 or 2). It must use the original image
+    dimensions and pixel coordinates, before display scaling.
     panel_widths and panel_height control the display space, preserving image aspect ratios.
     recompute_callback raises ValueError/RuntimeError on invalid geometry; errors
     may carry a display-only preview and a multiline display_message.

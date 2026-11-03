@@ -17,7 +17,7 @@ STATUS_HEIGHT_PX = 4*LINE_HEIGHT_PX+2*TEXT_PADDING_PX
 
 @dataclass(frozen=True)
 class AnnotationPanel:
-    """Source BGR pixels and separate captions; header reserves space above the image."""
+    """Direct-quantized linear RGB as display-only BGR8, plus separate captions."""
 
     image: np.ndarray
     captions: tuple[str, ...] = ()
@@ -75,6 +75,8 @@ def compose_annotation_panels(
     left, scales, origins, labels = 0, [], [], []
     for panel, width in zip(panels, widths, strict=True):
         image = panel.image
+        if image.dtype != np.uint8 or image.ndim != 3 or image.shape[-1] != 3:
+            raise ValueError('Annotation panels must contain display-only BGR8 images')
         h, w = image.shape[:2]
         lines = [(line, 'orangered' if caption.startswith('REJECTED') else 'white')
                  for caption in panel.captions
@@ -110,22 +112,6 @@ def _draw_labels(axes, labels):
             for label in labels]
 
 
-def render_annotation_preview(display: AnnotationDisplay) -> np.ndarray:
-    """Render captions once at the final PNG resolution, without a GUI backend."""
-    from matplotlib.backends.backend_agg import FigureCanvasAgg
-    from matplotlib.figure import Figure
-
-    h, w = display.image.shape[:2]
-    figure = Figure(figsize=(w/100, h/100), dpi=100)
-    canvas = FigureCanvasAgg(figure)
-    axes = figure.add_axes((0, 0, 1, 1))
-    axes.set_axis_off()
-    axes.imshow(display.image[..., ::-1], origin='upper', interpolation='nearest')
-    _draw_labels(axes, display.labels)
-    canvas.draw()
-    return np.asarray(canvas.buffer_rgba())[..., 2::-1].copy()
-
-
 def _create_figure_manager():
     from PyQt5.QtCore import QLibraryInfo
     from matplotlib import rc_context
@@ -144,7 +130,7 @@ def _create_figure_manager():
 
 
 class AnnotationWindow:
-    """Display BGR canvases and return mouse coordinates in canvas pixels.
+    """Display BGR8 canvases and return mouse coordinates in canvas pixels.
 
     The axes retain fixed image limits during scrolling and window resizing.
     Mouse events use OpenCV event codes so the geometry editor stays independent
@@ -213,6 +199,8 @@ class AnnotationWindow:
             text.set_fontsize(FONT_SIZE_PX*scale*72/self._canvas.figure.dpi)
 
     def show_image(self, image: np.ndarray, labels: tuple[AnnotationLabel, ...] = ()) -> None:
+        if image.dtype != np.uint8 or image.ndim != 3 or image.shape[-1] != 3:
+            raise ValueError('Annotation window expects a display-only BGR8 canvas')
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         if self._image is None:
             self._image = self._axes.imshow(rgb, origin='upper', interpolation='nearest')

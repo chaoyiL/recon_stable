@@ -2,7 +2,7 @@
 
 `surface_reconstruction/` 提供 marker 检测、跟踪与整体曲面拟合，`get_surface.py` 负责整体重建的文件接口。
 `local_recon.py` 提供独立局部重建，`pipeline.py` 串联完整流程，`recon.py` 提供统一命令 `recon`。
-`viewer.py` 绘制结果预览，由结果保存函数和 `local-recon --view` 调用。
+`viewer.py` 绘制结果预览，由 `--show` 或 `local-recon --view` 显式打开。
 
 ```text
 reconstruction/
@@ -16,26 +16,24 @@ reconstruction/
 
 ```bash
 uv run recon --config config.yaml \
-  --image assets/cali_norm_pics/capture_20261016_184356_361449.png
+  --image assets/cali_norm_pics/capture_20261016_184356_361449.npz
 ```
 
 默认输出根目录为 `reconstruction.output_dir`（当前是 `assets/reconstruction`）：
 
 - NPZ：`assets/reconstruction/pc/<图片名>_local_result.npz`。
-- 预览图：`assets/reconstruction/<图片名>_local_result.png`。
 
-程序自动创建所需目录。独立 `local-recon` 同样使用这组目录，默认文件名为 `<输入包名>_local_reconstruction`。
-NPZ 字段及预览格式与独立局部重建一致；预览显示三维曲面和法向位移，不显示置信度。
+程序自动创建所需目录，不自动保存检查 PNG。独立 `local-recon` 同样使用这组目录，默认文件名为 `<输入包名>_local_reconstruction`。
+NPZ 字段及窗口预览与独立局部重建一致；预览显示三维曲面和法向位移，不显示置信度。
 二维位移图按三维曲面行、列曲线的代表性实际长度保持宽高比例，坐标标签仍为材料网格索引。
-可用 `--output result.npz` 指定 NPZ 的准确位置；位于 `pc/` 时，同名预览图默认放在上一级目录，其余情况放在 NPZ 旁。
-`--preview-output` 可单独指定图片路径，`--show` 在保存后打开预览。
+可用 `--output result.npz` 指定 NPZ 的准确位置，`--show` 在保存后打开预览。
 也可使用 `uv run python -m reconstruction.recon`，参数相同。
 
 ## 固定输入与处理流程
 
 ```yaml
 reconstruction:
-  reference_image: assets/reference.png
+  reference_image: assets/reference.npz
   material_grid_file: assets/normal_calibration/lut_material_grid.npz
   output_dir: assets/reconstruction
   match_surface_aspect: true
@@ -47,9 +45,13 @@ local_reconstruction:
 参考图、材料网格和 LUT 可分别用 `--reference-image`、`--material-grid`、`--calibration` 覆盖。
 
 程序先在无接触参考图初始化 marker ID，再跟踪当前图并独立拟合当前整体曲面。
-参考与当前曲面按同一材料网格评估 XYZ，分别投影到各自图像的 UV；两张图先转线性 RGB、
+参考与当前曲面按同一材料网格评估 XYZ，分别投影到各自图像的 UV；两张图在读取入口统一为线性 RGB、
 屏蔽 marker 和饱和像素，再独立采样、相减。色差交给原有 LUT 与局部求解器，直接输出结果。
 无需人工合成中间 NPZ，不执行标注或 LUT 训练。当前整体拟合使用有效 marker，不自动排除接触区。
+
+新采集图片使用 `linear_rgb: float32 RGB [0,1]` 的 NPZ，旧相机 PNG/JPG 只在统一读取入口解码一次。
+几何缓存 v3 保存 `observed_linear_rgb`，不再把线性图转成 BGR8 落盘。
+原图预览直接显示线性值；marker 检测单独适配为原来的 8 位灰度强度，不改变光度计算。
 
 位移沿当前整体曲面的局部法向，单位 mm，输出 `xyz_out = xyz + displacement * normal`。
 置信度仍只作诊断，不参与局部方程加权。色差零坡度保护、求解精度沿用 `local_reconstruction` 配置。
@@ -107,5 +109,5 @@ uv run local-recon --view assets/reconstruction/pc/local.npz
 
 `assets/normal_calibration/` 保留当前 LUT、训练样本、标注、相关几何缓存、验证结果和冻结材料网格。
 `lut_source_images/` 保留从旧标定缓存恢复的 17 张历史标定图和底色图，来源见 `lut_sources.json`；当前 LUT 的配套关系以自身 metadata 为准。
-新批次照片保留在 `assets/cali_norm_pics/`，运行时参考图为 `assets/reference.png`。
+新批次照片保留在 `assets/cali_norm_pics/`，运行时参考图为 `assets/reference.npz`；旧 PNG 仍可显式配置。
 相机标定结果也保留。

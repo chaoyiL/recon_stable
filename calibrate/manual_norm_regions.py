@@ -1,13 +1,13 @@
 """Contact-boundary adapter for the generic image-region editor."""
 from dataclasses import replace
-from pathlib import Path
 import cv2
 import numpy as np
 from utils.region_annotations import (BOUNDARY_SAMPLE_COUNT, RegionAnnotation, load_regions, save_regions,
                                       region_boundary_points)
 from utils.color_difference import signed_difference_preview
+from utils.image_io import linear_rgb_to_bgr8
 from utils.annotation_editor import edit_regions
-from utils.annotation_window import AnnotationPanel, compose_annotation_panels, render_annotation_preview
+from utils.annotation_window import AnnotationPanel
 from utils.surface_sampling import rasterize_surface_grid
 from utils.surface_projection import projected_circle_radius_px
 
@@ -27,12 +27,12 @@ def _maximum_circle_radius_px(frame, sphere_radius_mm, center_px):
 
 def _color_image_preview(frame, record):
     if 'color_residual_grid' not in record:
-        return np.zeros_like(frame.original_bgr)
+        return np.zeros(frame.linear_rgb.shape, np.uint8)
     fields = record['color_residual_grid']
     if 'sample_valid_mask' in record:
         fields = np.dstack((fields, record['sample_valid_mask']))
     projected = rasterize_surface_grid(fields, frame.systems.observation.uv,
-                                      record['photometric_valid_mask'], frame.original_bgr.shape[:2])
+                                      record['photometric_valid_mask'], frame.linear_rgb.shape[:2])
     valid = projected.valid & frame.surface_mask & ~frame.marker_image_mask
     color = signed_difference_preview(projected.values[..., :3], valid)
     if 'sample_valid_mask' in record:
@@ -42,11 +42,11 @@ def _color_image_preview(frame, record):
     return color
 
 
-def calibration_panels(frame, annotation, record=None, message='', *, color_image=None,
+def calibration_panels(frame, annotation, record=None, *, color_image=None,
                        maximum_circle_radius_px=None):
     record = {} if record is None else record
     display_frame = record.get('frame', frame)
-    original = frame.original_bgr.copy()
+    original = linear_rgb_to_bgr8(frame.linear_rgb)
     contours, _ = cv2.findContours(frame.surface_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(original, contours, -1, (255, 200, 0), 1)
     original[frame.marker_image_mask] = original[frame.marker_image_mask]//2+np.array([0, 0, 100], np.uint8)
@@ -111,31 +111,6 @@ def calibration_panels(frame, annotation, record=None, message='', *, color_imag
             AnnotationPanel(normal, tuple(normal_lines), header=True))
 
 
-def _save_panels(panels, path, message=''):
-    display = compose_annotation_panels(
-        panels, ANNOTATION_PANEL_WIDTHS, ANNOTATION_PANEL_HEIGHT, message)
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not cv2.imwrite(str(path), render_annotation_preview(display)):
-        raise RuntimeError(f'Cannot save preview: {path}')
-
-
-
-def save_verification_preview(record, annotation, path):
-    _save_panels(calibration_panels(record['frame'], annotation, record), path)
-
-
-def save_status_preview(frame, source_path, annotation, path, message):
-    if frame is not None:
-        panels = calibration_panels(frame, annotation)
-    else:
-        image = cv2.imread(str(source_path), cv2.IMREAD_COLOR)
-        if image is None:
-            image = np.zeros((480, 640, 3), np.uint8)
-        panels = tuple(AnnotationPanel(panel) for panel in (image, np.zeros_like(image), np.zeros_like(image)))
-    _save_panels(panels, path, message)
-
-
 def annotate_images(settings, *, edit=False):
     # Import orchestration only in this adapter, never from the generic editor.
     from calibrate.norm_pipeline import (FrameCalibrationError, compute_frame_colors,
@@ -156,7 +131,7 @@ def annotate_images(settings, *, edit=False):
         if annotation is None:
             yy, xx = np.nonzero(frame.surface_mask)
             center = (float(np.median(xx)), float(np.median(yy)))
-            annotation = RegionAnnotation(key, frame.original_bgr.shape[1::-1], center_px=center,
+            annotation = RegionAnnotation(key, frame.linear_rgb.shape[1::-1], center_px=center,
                                           shape='circle', semi_axes_px=(40., 40.),
                                           semantics='contact_boundary')
         elif annotation.shape != 'circle':
@@ -192,14 +167,14 @@ def annotate_images(settings, *, edit=False):
             limit_frame = record['frame']
             return record
 
-        def panels(region, record, message):
+        def panels(region, record, _status):
             nonlocal preview_record, color_image
             record = initial_preview if record is None else record
             if record is not preview_record:
                 # Geometry and colors change on recompute, not while dragging the annotation.
                 color_image = _color_image_preview(record.get('frame', frame), record)
                 preview_record = record
-            return calibration_panels(frame, region, record, message, color_image=color_image,
+            return calibration_panels(frame, region, record, color_image=color_image,
                                       maximum_circle_radius_px=maximum_radius(region))
 
         completed = edit_regions([annotation],

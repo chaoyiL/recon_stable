@@ -8,10 +8,11 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 
-import cv2
 import numpy as np
 
+from utils.color_difference import CAMERA_RGB_TRANSFER_FUNCTION
 from utils.config import ConfigError, load_config
+from utils.image_io import load_linear_image, linear_rgb_to_tracking_bgr8, validate_linear_rgb
 from utils.reconstruction_interface import (
     MaterialCoordinateSystems,
     OverallReconstructionProvider,
@@ -24,15 +25,16 @@ DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.yaml"
 
 
 def reconstruct_material_coordinates(
-    frame_bgr: np.ndarray,
+    frame_linear_rgb: np.ndarray,
     provider: OverallReconstructionProvider,
     config_path: str | Path = DEFAULT_CONFIG_PATH,
     surface_mask: np.ndarray | None = None,
 ) -> MaterialCoordinateSystems:
-    """用十字标记整体重建生成三套材料坐标。"""
+    """从 HxWx3 float32 [0, 1] 线性 RGB 图像重建三套材料坐标。"""
     specs = load_material_coordinate_specs(config_path)
     mask = None if surface_mask is None else np.asarray(surface_mask, np.bool_)
-    result = provider.reconstruct(np.asarray(frame_bgr), specs, mask)
+    frame_linear_rgb = validate_linear_rgb(frame_linear_rgb)
+    result = provider.reconstruct(frame_linear_rgb, specs, mask)
     result.validate_against(specs)
     return result
 
@@ -79,14 +81,16 @@ def save_material_coordinates(
     output_path: str | Path,
     systems: MaterialCoordinateSystems,
     surface_mask: np.ndarray,
-    frame_bgr: np.ndarray,
+    frame_linear_rgb: np.ndarray,
     provider: SurfaceReconstructionProvider,
     *,
     surface_coefficients=None,
     geometry_stage="final",
     metadata=None,
 ) -> Path:
+    """保存几何网格及其 float32 线性 RGB 观测帧。"""
     output = Path(output_path).expanduser()
+    frame_linear_rgb = validate_linear_rgb(frame_linear_rgb)
     output.parent.mkdir(parents=True, exist_ok=True)
     if geometry_stage not in {"final", "preview_reference"}:
         raise ValueError("geometry_stage must be final or preview_reference")
@@ -97,10 +101,12 @@ def save_material_coordinates(
                                 for name in ("geometry", "lightfield", "observation")):
             raise ValueError("All output grids must share the provider coordinate chart")
     values: dict[str, np.ndarray] = {
-        "format_version": np.asarray(2, np.int32),
+        "format_version": np.asarray(3, np.int32),
         "overall_reconstruction": np.asarray("marker_bicubic"),
+        "color_space": np.asarray("linear_rgb"),
+        "rgb_transfer_function": np.asarray(CAMERA_RGB_TRANSFER_FUNCTION),
         "surface_mask": np.asarray(surface_mask, np.bool_),
-        "observed_bgr": np.asarray(frame_bgr, np.uint8),
+        "observed_linear_rgb": np.asarray(frame_linear_rgb, np.float32),
         # recon-local reads the observation grid through these aliases.
         "xyz": observation.xyz,
         "uv": observation.uv,
@@ -109,7 +115,7 @@ def save_material_coordinates(
         "coordinates": observation.coordinates,
         "material_coordinates": observation.coordinates,
         "geometry_stage": np.asarray(geometry_stage),
-        "image_shape": np.asarray(frame_bgr.shape[:2], np.int32),
+        "image_shape": np.asarray(frame_linear_rgb.shape[:2], np.int32),
         "camera_matrix": np.asarray(provider.session.camera, np.float64),
         "dist_coeffs": np.asarray(provider.session.distortion, np.float64),
         "template_xy_mm": np.asarray(provider.session.xy, np.float64),
@@ -143,9 +149,13 @@ def save_material_coordinates(
     if frame_result is not None:
         tracking = frame_result["tracking"]
         from reconstruction.surface_reconstruction.markers import marker_reference_sizes, build_marker_image_mask
-        sizes = marker_reference_sizes(frame_bgr, tracking["pixels"])
+        tracking_bgr = linear_rgb_to_tracking_bgr8(frame_linear_rgb)
+        sizes = marker_reference_sizes(
+            frame_linear_rgb, tracking["pixels"], tracking_bgr=tracking_bgr)
         values["reference_marker_sizes"] = sizes
-        values["marker_image_mask"] = build_marker_image_mask(frame_bgr, tracking["pixels"], tracking["valid"], sizes)
+        values["marker_image_mask"] = build_marker_image_mask(
+            frame_linear_rgb, tracking["pixels"], tracking["valid"], sizes,
+            tracking_bgr=tracking_bgr)
         info = frame_result["info"]
         values.update(
             marker_pixels=np.asarray(tracking["pixels"], np.float32),
@@ -191,12 +201,9 @@ def main() -> None:
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--image", required=True)
     parser.add_argument("--output", required=True, help="输出三套材料坐标 NPZ")
-    parser.add_argument("--mask-output", help="可选：另存黑框内部二值 mask PNG")
     parser.add_argument("--coordinate-reference", help="复用已有参考弧长坐标图 NPZ")
     args = parser.parse_args()
-    image = cv2.imread(str(Path(args.image).expanduser()), cv2.IMREAD_COLOR)
-    if image is None:
-        raise SystemExit(f"无法读取图片: {args.image}")
+    image = load_linear_image(Path(args.image).expanduser())
     provider = build_reconstruction_provider(args.config)
     if args.coordinate_reference:
         from utils.surface_coordinates import load_arclength_chart
@@ -206,12 +213,6 @@ def main() -> None:
     mask = provider.last_frame_result["inner_region"].mask
     output = save_material_coordinates(args.output, systems, mask, image, provider,
                                        metadata={"source_image": str(Path(args.image).expanduser().resolve())})
-    if args.mask_output:
-        mask_output = Path(args.mask_output).expanduser()
-        mask_output.parent.mkdir(parents=True, exist_ok=True)
-        if not cv2.imwrite(str(mask_output), mask.astype(np.uint8) * 255):
-            raise RuntimeError(f"无法保存 mask: {mask_output}")
-        print(f"黑框区域 mask 已保存: {mask_output}")
     print(f"三套材料坐标已保存: {output}")
 
 

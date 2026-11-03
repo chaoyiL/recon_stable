@@ -4,15 +4,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-import cv2
 import numpy as np
 
 from utils.color_difference import CAMERA_RGB_TRANSFER_FUNCTION
+from utils.image_io import (
+    load_linear_image, linear_rgb_to_tracking_bgr8, validate_linear_rgb,
+)
 from reconstruction.get_surface import build_reconstruction_provider
 from reconstruction.local_recon import (
     LocalReconstructionResult,
     default_reconstruction_output,
-    default_reconstruction_preview,
     load_local_reconstruction_settings,
     reconstruct_from_input,
 )
@@ -122,11 +123,14 @@ def make_reconstruction_input(
     if (current_map.chart_id != reference_map.chart_id
             or current_map.coordinate_kind != reference_map.coordinate_kind):
         raise ValueError('Reference/current material-grid identities differ')
+    image = validate_linear_rgb(image)
+    reference_image = validate_linear_rgb(reference_image)
     return dict(
         xyz=current_map.xyz, uv=current_map.uv,
         material_coordinates=current_map.coordinates, st=current_map.st,
         valid_mask=current_map.valid_mask, geometry_valid_mask=current_map.valid_mask,
-        geometry_stage='final', observed_bgr=image, reference_bgr=reference_image,
+        geometry_stage='final', observed_linear_rgb=image,
+        reference_linear_rgb=reference_image,
         reference_uv=reference_map.uv, reference_material_coordinates=reference_map.coordinates,
         reference_st=reference_map.st,
         surface_mask=surface_mask, reference_surface_mask=reference_mask,
@@ -145,13 +149,6 @@ def _fit_frame(session, image, label):
     return fitted
 
 
-def _image(path):
-    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if image is None:
-        raise ValueError(f'无法读取图片: {path}')
-    return image
-
-
 def _configured_path(value, base, name):
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f'reconstruction.{name} 必须是非空路径')
@@ -167,7 +164,6 @@ def reconstruct_image(
     material_grid_file: str | None = None,
     calibration_file: str | None = None,
     output: str | None = None,
-    preview_output: str | None = None,
     lsmr_atol: float | None = None,
     lsmr_btol: float | None = None,
     lsmr_max_iterations: int | None = None,
@@ -207,13 +203,8 @@ def reconstruct_image(
         lsmr_btol_override=lsmr_btol, lsmr_max_iterations_override=lsmr_max_iterations)
     if output_path.resolve() == settings.calibration_file.resolve():
         raise ValueError('重建输出不能覆盖 LUT')
-    preview_path = (Path(preview_output).expanduser() if preview_output is not None
-                    else default_reconstruction_preview(output_path))
-    if preview_path.resolve() in {
-            image_path, reference_path.resolve(), grid_path.resolve(), settings.calibration_file.resolve()}:
-        raise ValueError('预览图不能覆盖输入图片或标定文件')
     calibration = NormalCalibration.load(settings.calibration_file)
-    image, reference = _image(image_path), _image(reference_path)
+    image, reference = load_linear_image(image_path), load_linear_image(reference_path)
     provider = build_reconstruction_provider(config_path)
     session = provider.session
     reference_fit = _fit_frame(session, reference, '参考图')
@@ -222,9 +213,13 @@ def reconstruct_image(
     spec = load_material_coordinate_specs(config_path).observation
     grid = load_sampling_grid(grid_path, calibration, reference_surface, camera, (spec.rows, spec.columns))
     reference_mask = reference_fit['inner_region'].mask
-    sizes = marker_reference_sizes(reference, reference_fit['tracking']['pixels'])
+    reference_tracking_bgr = linear_rgb_to_tracking_bgr8(reference)
+    sizes = marker_reference_sizes(
+        reference, reference_fit['tracking']['pixels'],
+        tracking_bgr=reference_tracking_bgr)
     reference_marker_mask = build_marker_image_mask(reference, reference_fit['tracking']['pixels'],
-                                                   reference_fit['tracking']['valid'], sizes)
+                                                   reference_fit['tracking']['valid'], sizes,
+                                                   tracking_bgr=reference_tracking_bgr)
     # Keep the reference's marker IDs while fitting an independent current shape.
     session.model.reset()
     current_fit = _fit_frame(session, image, '当前图')
@@ -241,8 +236,10 @@ def reconstruct_image(
         grid = load_sampling_grid(grid_path, calibration, current_surface, camera, shape)
     reference_map = sample_material_map(reference_surface, camera, grid, reference_mask)
     current_map = sample_material_map(current_surface, camera, grid, current_mask)
-    marker_mask = build_marker_image_mask(image, current_fit['tracking']['pixels'],
-                                         current_fit['tracking']['valid'], sizes)
+    current_tracking_bgr = linear_rgb_to_tracking_bgr8(image)
+    marker_mask = build_marker_image_mask(
+        image, current_fit['tracking']['pixels'], current_fit['tracking']['valid'],
+        sizes, tracking_bgr=current_tracking_bgr)
     data = make_reconstruction_input(current_map, reference_map, image, reference,
                                      current_mask, reference_mask, marker_mask, reference_marker_mask)
     print(f"整体重建完成: marker={int(current_fit['tracking']['valid'].sum())} "

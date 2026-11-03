@@ -40,24 +40,6 @@ def bgr8_to_linear_rgb(image_bgr: np.ndarray) -> np.ndarray:
     ).astype(np.float32)
 
 
-def linear_rgb_to_display_bgr(image_linear_rgb: np.ndarray) -> np.ndarray:
-    """将线性 RGB 编码为适合常规显示器预览的 sRGB BGR8。"""
-    values = np.asarray(image_linear_rgb)
-    if values.ndim != 3 or values.shape[-1] != 3 \
-            or not np.issubdtype(values.dtype, np.floating):
-        raise ValueError("image_linear_rgb 必须是 HxWx3 浮点数组")
-    if not np.all(np.isfinite(values)):
-        raise ValueError("image_linear_rgb 必须包含有限值")
-
-    linear_rgb = np.clip(values, 0.0, 1.0)
-    encoded_rgb = np.where(
-        linear_rgb <= 0.0031308,
-        12.92 * linear_rgb,
-        1.055 * np.power(linear_rgb, 1.0 / 2.4) - 0.055,
-    )
-    return np.rint(encoded_rgb[..., ::-1] * 255.0).astype(np.uint8)
-
-
 def signed_color_difference(
     observed_linear_rgb: np.ndarray,
     reference_linear_rgb: np.ndarray,

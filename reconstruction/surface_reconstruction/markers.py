@@ -2,13 +2,25 @@
 
 import argparse
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
+import sys
 
 import cv2
 import numpy as np
 
-ROOT = Path(__file__).resolve().parent
+try:
+    from utils.color_difference import bgr8_to_linear_rgb
+    from utils.image_io import (
+        linear_rgb_to_bgr8, linear_rgb_to_tracking_bgr8, load_linear_image,
+        validate_linear_rgb,
+    )
+except ModuleNotFoundError:  # Direct script execution puts this directory first.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from utils.color_difference import bgr8_to_linear_rgb
+    from utils.image_io import (
+        linear_rgb_to_bgr8, linear_rgb_to_tracking_bgr8, load_linear_image,
+        validate_linear_rgb,
+    )
 
 LOCAL_BLOCK_SIZE = 15
 LOCAL_THRESHOLD_C = 15
@@ -156,8 +168,11 @@ def find_inner_roi(gray):
     return find_inner_region(gray).roi
 
 
-def marker_reference_sizes(frame_bgr, marker_pixels):
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+def marker_reference_sizes(frame_linear_rgb, marker_pixels, *, tracking_bgr=None):
+    frame_linear_rgb = validate_linear_rgb(frame_linear_rgb)
+    if tracking_bgr is None:
+        tracking_bgr = linear_rgb_to_tracking_bgr8(frame_linear_rgb)
+    gray = cv2.cvtColor(tracking_bgr, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
     centers, _, diagnostics, _ = _analyze_components(gray, (0, 0, w, h))
     result = np.full((len(marker_pixels), 2), 8., np.float64)
@@ -169,9 +184,13 @@ def marker_reference_sizes(frame_bgr, marker_pixels):
     return result
 
 
-def build_marker_image_mask(frame_bgr, marker_pixels, marker_valid,
-                            reference_marker_sizes, *, dilation_px=1):
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+def build_marker_image_mask(frame_linear_rgb, marker_pixels, marker_valid,
+                            reference_marker_sizes, *, dilation_px=1,
+                            tracking_bgr=None):
+    frame_linear_rgb = validate_linear_rgb(frame_linear_rgb)
+    if tracking_bgr is None:
+        tracking_bgr = linear_rgb_to_tracking_bgr8(frame_linear_rgb)
+    gray = cv2.cvtColor(tracking_bgr, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
     pixels = np.asarray(marker_pixels, np.float64)
     valid = np.asarray(marker_valid, bool)
@@ -276,11 +295,13 @@ def annotate_cross_candidates(frame, roi_rect, diagnostics, message=""):
     return canvas
 
 
-def inspect_cross_candidates(frame, message=""):
-    """Detect and annotate raw candidates without requiring a complete grid."""
-    if frame is None or frame.size == 0:
+def inspect_cross_candidates(frame_linear_rgb, message=""):
+    """Detect from BT.709 tracking values and draw over direct linear display values."""
+    frame_linear_rgb = validate_linear_rgb(frame_linear_rgb)
+    if frame_linear_rgb.size == 0:
         raise ValueError("empty input image")
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame.copy()
+    tracking_bgr = linear_rgb_to_tracking_bgr8(frame_linear_rgb)
+    gray = cv2.cvtColor(tracking_bgr, cv2.COLOR_BGR2GRAY)
     try:
         roi = find_inner_roi(gray)
         centers, binary, diagnostics = detect_cross_centers(gray, roi)
@@ -291,7 +312,8 @@ def inspect_cross_candidates(frame, message=""):
         binary = np.empty((0, 0), dtype=np.uint8)
         diagnostics = []
         error = str(exc)
-    overlay = annotate_cross_candidates(frame, roi, diagnostics, message or error)
+    display_bgr = linear_rgb_to_bgr8(frame_linear_rgb)
+    overlay = annotate_cross_candidates(display_bgr, roi, diagnostics, message or error)
     return overlay, binary, centers, diagnostics, roi, error
 
 
@@ -359,20 +381,6 @@ def sort_grid_points(centers, rows, cols, row_direction="auto"):
     return np.column_stack((np.arange(len(centers)), centers[order]))
 
 
-def _save_debug_images(save_dir, stem, overlay, binary):
-    save_dir = Path(save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    overlay_path = save_dir / f"{stem}_candidates.png"
-    if not cv2.imwrite(str(overlay_path), overlay):
-        raise OSError(f"Cannot save image: {overlay_path}")
-    binary_path = None
-    if binary.size:
-        binary_path = save_dir / f"{stem}_threshold.png"
-        if not cv2.imwrite(str(binary_path), binary):
-            raise OSError(f"Cannot save image: {binary_path}")
-    return overlay_path, binary_path
-
-
 def _print_detection(centers, diagnostics, roi, error):
     summary = f"candidates={len(centers)} roi={roi}"
     if diagnostics:
@@ -389,31 +397,31 @@ def _print_detection(centers, diagnostics, roi, error):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Display every raw cross candidate before the 48-point grid check."
+        description="Display raw cross candidates before the 48-point grid check."
     )
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--image", help="Analyze one image and save annotated PNG files")
-    source.add_argument("--video", help="Video file or camera index; press S to save a frame")
+    source.add_argument("--image", help="Analyze one image")
+    source.add_argument("--video", help="Video file or camera index")
     parser.add_argument("--width", type=int, default=640, help="Camera capture width")
     parser.add_argument("--height", type=int, default=480, help="Camera capture height")
-    parser.add_argument("--save-dir", type=Path, default=ROOT / "marker_debug")
     args = parser.parse_args()
     if args.width < 1 or args.height < 1:
         parser.error("--width and --height must be positive")
 
     if args.image is not None:
-        frame = cv2.imread(args.image)
-        if frame is None:
-            parser.error(f"Cannot read image: {args.image}")
+        try:
+            frame = load_linear_image(args.image)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
         overlay, binary, centers, diagnostics, roi, error = inspect_cross_candidates(frame)
-        stem = Path(args.image).stem
-        overlay_path, binary_path = _save_debug_images(
-            args.save_dir, stem, overlay, binary
-        )
         _print_detection(centers, diagnostics, roi, error)
-        print(f"annotated={overlay_path}")
-        if binary_path is not None:
-            print(f"threshold={binary_path}")
+        cv2.imshow("Raw cross candidates | Esc/Q: exit", overlay)
+        if binary.size:
+            cv2.imshow("Marker threshold inside ROI", binary)
+        try:
+            cv2.waitKey(0)
+        finally:
+            cv2.destroyAllWindows()
         return
 
     source_value = int(args.video) if args.video.isdigit() else args.video
@@ -430,7 +438,7 @@ def main():
     frame_number = 0
     try:
         while True:
-            ok, frame = capture.read()
+            ok, encoded_bgr = capture.read()
             if not ok:
                 print(
                     "No frame received" if frame_number == 0 else "Video input ended",
@@ -438,24 +446,17 @@ def main():
                 )
                 break
             frame_number += 1
-            overlay, binary, centers, diagnostics, roi, error = inspect_cross_candidates(frame)
+            frame_linear_rgb = bgr8_to_linear_rgb(encoded_bgr)
+            overlay, binary, centers, diagnostics, roi, error = inspect_cross_candidates(
+                frame_linear_rgb)
             if frame_number == 1 or frame_number % 30 == 0:
                 _print_detection(centers, diagnostics, roi, error)
-            cv2.imshow("Raw cross candidates | S: save | Esc/Q: exit", overlay)
+            cv2.imshow("Raw cross candidates | Esc/Q: exit", overlay)
             if binary.size:
                 cv2.imshow("Marker threshold inside ROI", binary)
             key = cv2.waitKey(1) & 255
             if key in (27, ord("q"), ord("Q")):
                 break
-            if key in (ord("s"), ord("S")):
-                stem = datetime.now().strftime("frame_%Y%m%d_%H%M%S_%f")
-                overlay_path, binary_path = _save_debug_images(
-                    args.save_dir, stem, overlay, binary
-                )
-                _print_detection(centers, diagnostics, roi, error)
-                print(f"annotated={overlay_path}")
-                if binary_path is not None:
-                    print(f"threshold={binary_path}")
     finally:
         capture.release()
         cv2.destroyAllWindows()

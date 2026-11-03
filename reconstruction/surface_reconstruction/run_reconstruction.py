@@ -20,10 +20,25 @@ try:
     from .display import SurfaceView, marker_overlay
     from .markers import inspect_cross_candidates, find_inner_region
 except ImportError:  # Keep ``python run_reconstruction.py`` working.
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from surface import SurfaceModel, local_coordinates
     from tracking import TrackingSeed, MarkerTracker, require_regular_template
     from display import SurfaceView, marker_overlay
     from markers import inspect_cross_candidates, find_inner_region
+
+try:
+    from utils.color_difference import bgr8_to_linear_rgb
+    from utils.image_io import (
+        load_linear_image, linear_rgb_to_tracking_bgr8, validate_linear_rgb,
+    )
+except ModuleNotFoundError:  # Direct script execution puts this directory first.
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from utils.color_difference import bgr8_to_linear_rgb
+    from utils.image_io import (
+        load_linear_image, linear_rgb_to_tracking_bgr8, validate_linear_rgb,
+    )
 
 ROOT = Path(__file__).resolve().parent
 
@@ -103,19 +118,24 @@ class SurfaceReconstructionSession:
         return dict(tracking=tracking, marker_fit_valid=fit_valid, points=points,
                     coefficients=coefficients, info=info, error=error, segment=self.segment)
 
-    def process(self, frame, *, fit=True):
-        if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
-            raise ValueError('Expected a BGR frame')
-        if (frame.shape[1], frame.shape[0]) != self.expected_size:
-            raise ValueError(f'Calibration is for {self.expected_size}; input is {frame.shape[1::-1]}')
+    def process(self, frame_linear_rgb, *, fit=True):
+        """Process one float32 linear-RGB frame; adapt only the tracking input."""
+        frame_linear_rgb = validate_linear_rgb(frame_linear_rgb)
+        if (frame_linear_rgb.shape[1], frame_linear_rgb.shape[0]) != self.expected_size:
+            raise ValueError(
+                f'Calibration is for {self.expected_size}; '
+                f'input is {frame_linear_rgb.shape[1::-1]}')
+        tracking_bgr = linear_rgb_to_tracking_bgr8(frame_linear_rgb)
         tracking = dict(pixels=np.full((len(self.ids), 2), np.nan),
                         valid=np.zeros(len(self.ids), bool), confidence=np.zeros(len(self.ids)))
         region = None
         try:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.cvtColor(tracking_bgr, cv2.COLOR_BGR2GRAY)
             region = find_inner_region(gray)
             if self.tracker is None:
-                seed, _, _ = TrackingSeed.build(frame, self.ids, self.xy, self.row_direction, region=region)
+                seed, _, _ = TrackingSeed.build(
+                    frame_linear_rgb, self.ids, self.xy, self.row_direction,
+                    region=region, tracking_bgr=tracking_bgr)
                 self.tracker = MarkerTracker(seed)
                 self.model.reset()
                 self.segment += 1
@@ -123,7 +143,8 @@ class SurfaceReconstructionSession:
                 tracking = dict(pixels=seed.pixels.copy(), valid=np.ones(len(self.ids), bool),
                                 confidence=np.ones(len(self.ids)))
             else:
-                tracking = self.tracker.update(frame)
+                tracking = self.tracker.update(
+                    frame_linear_rgb, tracking_bgr=tracking_bgr)
                 # Invalid slots still locate conservative photometric holes.
                 tracking['pixels'] = np.where(np.isfinite(tracking['pixels']),
                                              tracking['pixels'], self.tracker.positions)
@@ -180,8 +201,9 @@ class SurfaceReconstructionProvider:
             self.coordinate_chart = None
             self.coordinate_chart_file = None
 
-    def track_frame(self, frame_bgr):
-        self.last_frame_result = self.session.process(np.asarray(frame_bgr), fit=False)
+    def track_frame(self, frame_linear_rgb):
+        self.last_frame_result = self.session.process(
+            np.asarray(frame_linear_rgb), fit=False)
         return self.last_frame_result
 
     def _surface_mask(self, explicit):
@@ -235,8 +257,8 @@ class SurfaceReconstructionProvider:
             raise RuntimeError(result['error'] or result['info']['status'])
         return self.sample_coefficients(result['coefficients'], specs, surface_mask)
 
-    def reconstruct(self, frame_bgr, specs, surface_mask=None):
-        result = self.session.process(np.asarray(frame_bgr))
+    def reconstruct(self, frame_linear_rgb, specs, surface_mask=None):
+        result = self.session.process(np.asarray(frame_linear_rgb))
         self.last_frame_result = result
         if result['coefficients'] is None or result['info']['status'] == 'ambiguous':
             raise RuntimeError(f"Marker surface reconstruction failed: {result['error'] or result['info']['status']}")
@@ -260,12 +282,13 @@ class LatestCamera:
     def _read(self):
         try:
             while not self.stopped:
-                ok, frame = self.capture.read()
+                ok, encoded_bgr = self.capture.read()
                 if not ok:
                     break
+                frame_linear_rgb = bgr8_to_linear_rgb(encoded_bgr)
                 with self.condition:
                     self.index += 1
-                    self.latest = (self.index, time.perf_counter(), frame)
+                    self.latest = (self.index, time.perf_counter(), frame_linear_rgb)
                     self.condition.notify_all()
         finally:
             with self.condition:
@@ -289,6 +312,47 @@ class LatestCamera:
         self.worker.join(timeout=1.0)
         self.capture.release()
         self.worker.join(timeout=1.0)
+
+
+def load_linear_recording(directory):
+    """Read a capture.py frame manifest and return its nominal FPS and frame list."""
+    directory = Path(directory).expanduser()
+    try:
+        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot read recording manifest in {directory}: {exc}") from exc
+    if (not isinstance(manifest, dict)
+            or manifest.get("format_version") != 1
+            or manifest.get("color_space") != "linear_rgb"
+            or manifest.get("rgb_transfer_function") != "bt709"):
+        raise ValueError(f"Unsupported linear recording manifest: {directory}")
+    try:
+        fps = float(manifest["fps"])
+        records = manifest["frames"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid recording manifest: {directory}") from exc
+    if not np.isfinite(fps) or fps <= 0 or not isinstance(records, list):
+        raise ValueError(f"Invalid recording FPS or frame table: {directory}")
+    frames = []
+    previous_index = -1
+    previous_timestamp = -1.0
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError(f"Invalid frame record in {directory}")
+        try:
+            index = record["index"]
+            timestamp = float(record["timestamp_s"])
+            filename = record["file"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid frame record in {directory}") from exc
+        if (not isinstance(index, int) or isinstance(index, bool) or index <= previous_index
+                or not np.isfinite(timestamp) or timestamp < previous_timestamp
+                or not isinstance(filename, str) or Path(filename).name != filename
+                or Path(filename).suffix.lower() != ".npz"):
+            raise ValueError(f"Invalid frame record in {directory}")
+        frames.append((index, timestamp, directory / filename))
+        previous_index, previous_timestamp = index, timestamp
+    return fps, frames
 
 
 def unique_output(base):
@@ -346,14 +410,18 @@ def run(args):
         else (args.video if args.video is not None else str(config["camera_index"]))
     )
     is_image = args.image is not None
-    is_camera = not is_image and str(source).isdigit()
+    recording_dir = (Path(source).expanduser()
+                     if not is_image and not str(source).isdigit()
+                     and Path(source).expanduser().is_dir() else None)
+    is_camera = not is_image and recording_dir is None and str(source).isdigit()
     expected = session.expected_size
     model = session.model
     viewer = SurfaceView(model, *expected)
     basename = Path(source).stem if not is_camera else "camera_" + str(source)
     output = unique_output(args.out or ROOT / "output" / basename)
     marker_dir = ROOT / "marker_detection" / output.name
-    marker_dir.mkdir(parents=True, exist_ok=False)
+    if not is_image and not args.no_record:
+        marker_dir.mkdir(parents=True, exist_ok=False)
     summary = dict(
         source=str(source),
         frames=0,
@@ -385,10 +453,11 @@ def run(args):
     last_index = 0
     try:
         if is_image:
-            still = cv2.imread(str(source))
-            if still is None:
-                raise ValueError(f"Cannot read image: {source}")
+            still = load_linear_image(source)
             fps = 1.0
+        elif recording_dir is not None:
+            fps, recording_frames = load_linear_recording(recording_dir)
+            summary["input_fps"] = fps
         else:
             capture = cv2.VideoCapture(int(source) if is_camera else str(source))
             if not capture.isOpened():
@@ -448,6 +517,11 @@ def run(args):
                     frame = still
                     timestamp = 0.0
                     frame_index = 0
+                elif recording_dir is not None:
+                    if count >= len(recording_frames):
+                        break
+                    frame_index, timestamp, frame_path = recording_frames[count]
+                    frame = load_linear_image(frame_path)
                 elif latest is not None:
                     packet = latest.read()
                     if packet is None:
@@ -457,9 +531,10 @@ def run(args):
                     summary["camera_frames_dropped"] += max(0, frame_index - last_index - 1)
                     last_index = frame_index
                 else:
-                    ok, frame = capture.read()
+                    ok, encoded_bgr = capture.read()
                     if not ok:
                         break
+                    frame = bgr8_to_linear_rgb(encoded_bgr)
                     frame_index = count
                     timestamp = count / fps
                 frame_result = session.process(frame)
@@ -484,11 +559,7 @@ def run(args):
                 combined = np.hstack((overlay, shape))
                 save_points(pw, frame_index, timestamp, segment, result, points, xy)
                 if is_image:
-                    if not cv2.imwrite(str(marker_dir / "detected_markers.png"), overlay):
-                        raise OSError("Cannot save marker image")
                     if coeff is not None:
-                        if not cv2.imwrite(str(output / "surface.png"), combined):
-                            raise OSError("Cannot save surface image")
                         viewer.save_obj(output / "surface.obj", coeff)
                     summary["image_diagnostics"] = dict(info, error=error)
                 elif not args.no_record:
@@ -597,7 +668,7 @@ def run(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group()
-    source.add_argument("--video", help="Video file or camera index (default from config)")
+    source.add_argument("--video", help="Video file, linear frame directory, or camera index (default from config)")
     source.add_argument("--image", help="Single image; no reference image required")
     parser.add_argument("--config", type=Path, default=ROOT / "config.json")
     parser.add_argument("--out", type=Path)

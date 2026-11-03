@@ -8,9 +8,9 @@ import glob
 import json
 import math
 import os
-import cv2
 import numpy as np
 from utils.config import load_config
+from utils.image_io import cached_linear_rgb, load_linear_image, validate_linear_rgb
 from utils.surface_coordinates import (ArcLengthChart, COORDINATE_KIND, FRAME_CONVENTION, load_arclength_chart,
                                        save_arclength_chart, build_material_sampling_grid)
 from utils.surface_geometry import (ParametricSurface, compute_surface_geometry, normals_to_local_slopes,
@@ -20,7 +20,7 @@ from utils.surface_sampling import (bilinear_sample, sample_mask_to_surface,
                                     sample_linear_rgb_to_surface)
 from utils.sphere_geometry import (fit_sphere_center, intersect_sphere_rays, select_sphere_cap,
                                    sphere_normals)
-from utils.color_difference import (CAMERA_RGB_TRANSFER_FUNCTION, bgr8_to_linear_rgb,
+from utils.color_difference import (CAMERA_RGB_TRANSFER_FUNCTION,
                                     require_camera_rgb_transfer, signed_color_difference)
 from utils.region_annotations import BOUNDARY_SAMPLE_COUNT, load_regions, region_boundary_points, region_masks
 from utils.reconstruction_interface import (load_material_coordinate_specs, MaterialCoordinateMap,
@@ -159,7 +159,7 @@ class FrameCalibrationData:
     image_key: str
     image_index: int
     source_image: Path
-    original_bgr: np.ndarray
+    linear_rgb: np.ndarray
     surface_mask: np.ndarray
     tracking: dict
     template_xy_mm: np.ndarray
@@ -209,7 +209,7 @@ def _save_frame(path, frame):
     provider = _provider_from_frame(frame)
     if frame.marker_fit_valid is not None:
         provider.last_frame_result['marker_fit_valid'] = frame.marker_fit_valid
-    save_material_coordinates(path, frame.systems, frame.surface_mask, frame.original_bgr, provider,
+    save_material_coordinates(path, frame.systems, frame.surface_mask, frame.linear_rgb, provider,
         surface_coefficients=frame.coefficients, geometry_stage=frame.geometry_stage,
         metadata=dict(image_key=frame.image_key, image_index=frame.image_index, source_image=str(frame.source_image)))
     with np.load(path, allow_pickle=False) as data:
@@ -225,8 +225,17 @@ def load_frame_calibration_data(path: str | Path) -> FrameCalibrationData:
     path = Path(path).resolve()
     try:
         with np.load(path, allow_pickle=False) as data:
-            if int(data['format_version']) != 2:
-                raise ValueError('Geometry cache requires version 2; rerun prepare')
+            version = int(data['format_version'])
+            if version == 3:
+                if str(data['color_space']) != 'linear_rgb':
+                    raise ValueError('Geometry cache requires linear RGB')
+                require_camera_rgb_transfer({'rgb_transfer_function': str(data['rgb_transfer_function'])}, '几何缓存')
+                linear_rgb = validate_linear_rgb(data['observed_linear_rgb'])
+            elif version == 2:
+                # Decode historical caches only at the input boundary.
+                linear_rgb = cached_linear_rgb(data)
+            else:
+                raise ValueError('Unsupported geometry cache version; rerun prepare')
             chart_file = (path.parent/str(data['coordinate_chart_file'])).resolve()
             chart = load_arclength_chart(chart_file)
             if (str(data['coordinate_chart_id']) != chart.chart_id
@@ -248,10 +257,10 @@ def load_frame_calibration_data(path: str | Path) -> FrameCalibrationData:
                 expected_st, coordinate_valid = chart.to_st(maps[name].coordinates)
                 if not coordinate_valid.all() or not np.allclose(expected_st, maps[name].st, atol=1e-6, rtol=0):
                     raise ValueError('Cached st/material coordinates differ from reference chart')
-            marker_mask = build_marker_image_mask(data['observed_bgr'], data['marker_pixels'],
+            marker_mask = build_marker_image_mask(linear_rgb, data['marker_pixels'],
                                                  data['marker_valid'], data['reference_marker_sizes'])
             return FrameCalibrationData(str(data['image_key']), int(data['image_index']),
-                Path(str(data['source_image'])), data['observed_bgr'], data['surface_mask'],
+                Path(str(data['source_image'])), linear_rgb, data['surface_mask'],
                 dict(pixels=data['marker_pixels'], valid=data['marker_valid'], confidence=data['marker_confidence']),
                 template, data['reference_marker_sizes'], marker_mask, coefficients, surface,
                 camera, chart, chart_file, MaterialCoordinateSystems(**maps), str(data['geometry_stage']),
@@ -277,9 +286,7 @@ def prepare_reference(config_path: str | Path, settings: CalibrationSettings) ->
     from reconstruction.get_surface import build_reconstruction_provider
     if settings.reference_image is None:
         raise ValueError('reference_image must name the fixed background for this batch')
-    image = cv2.imread(str(settings.reference_image), cv2.IMREAD_COLOR)
-    if image is None:
-        raise ValueError(f'Cannot read reference_image: {settings.reference_image}')
+    image = load_linear_image(settings.reference_image)
     provider = build_reconstruction_provider(config_path)
     try:
         systems = provider.reconstruct(image, load_material_coordinate_specs(config_path))
@@ -301,9 +308,10 @@ def prepare_reference(config_path: str | Path, settings: CalibrationSettings) ->
 def prepare_image(config_path, settings: CalibrationSettings, reference: FrameCalibrationData, image_path) -> FrameCalibrationData:
     from reconstruction.get_surface import build_reconstruction_provider
     source = Path(image_path).resolve()
-    image = cv2.imread(str(source), cv2.IMREAD_COLOR)
-    if image is None:
-        raise FrameCalibrationError('tracking_failed', f'Cannot read {source}')
+    try:
+        image = load_linear_image(source)
+    except (OSError, ValueError) as exc:
+        raise FrameCalibrationError('tracking_failed', f'Cannot read {source}: {exc}') from exc
     provider = build_reconstruction_provider(config_path)
     if (not np.array_equal(provider.session.xy, reference.template_xy_mm)
             or not np.array_equal(provider.session.camera, reference.camera.matrix)
@@ -311,7 +319,7 @@ def prepare_image(config_path, settings: CalibrationSettings, reference: FrameCa
         raise FrameCalibrationError('coordinate_chart_invalid', 'Camera or physical template changed since reference preparation')
     provider.bind_coordinate_chart(reference.chart)
     provider.coordinate_chart_file = reference.chart_file
-    seed = provider.track_frame(reference.original_bgr)
+    seed = provider.track_frame(reference.linear_rgb)
     if seed['error'] or not np.allclose(seed['tracking']['pixels'], reference.tracking['pixels'], atol=1e-5):
         raise FrameCalibrationError('tracking_failed', 'Reference marker identity changed; rerun prepare')
     result = provider.track_frame(image)
@@ -341,10 +349,10 @@ def compute_frame_colors(final_frame, reference, settings):
     if (current.chart_id != ref.chart_id or current.coordinate_kind != COORDINATE_KIND
             or not np.array_equal(current.coordinates, ref.coordinates) or not np.allclose(current.st, ref.st, atol=1e-7, rtol=0)):
         raise FrameCalibrationError('coordinate_chart_invalid', 'Reference/current material identities differ')
-    source_current = final_frame.surface_mask & ~final_frame.marker_image_mask & np.all(final_frame.original_bgr < 255, axis=-1)
-    source_ref = reference.surface_mask & ~reference.marker_image_mask & np.all(reference.original_bgr < 255, axis=-1)
-    observed = sample_linear_rgb_to_surface(bgr8_to_linear_rgb(final_frame.original_bgr), current.uv, source_current)
-    background = sample_linear_rgb_to_surface(bgr8_to_linear_rgb(reference.original_bgr), ref.uv, source_ref)
+    source_current = final_frame.surface_mask & ~final_frame.marker_image_mask & np.all(final_frame.linear_rgb < 1, axis=-1)
+    source_ref = reference.surface_mask & ~reference.marker_image_mask & np.all(reference.linear_rgb < 1, axis=-1)
+    observed = sample_linear_rgb_to_surface(final_frame.linear_rgb, current.uv, source_current)
+    background = sample_linear_rgb_to_surface(reference.linear_rgb, ref.uv, source_ref)
     geometry_valid = current.valid_mask.copy()
     photo = geometry_valid & ref.valid_mask & observed.valid & background.valid
     delta, photo = signed_color_difference(observed.values, background.values, photo)
@@ -418,7 +426,7 @@ def make_sphere_labels(frame, annotation, sphere, settings, *, center_frame=None
     _, points, roots_valid = intersect_sphere_rays(np.zeros(3), rays, sphere)
     normals = -settings.side*sphere_normals(points[..., root_index, :], sphere)
     slopes, finite = normals_to_local_slopes(normals, geometry['normal'], geometry['frame'])
-    masks = region_masks(annotation, frame.original_bgr.shape, outer_margin_px=CONTACT_OUTER_MARGIN_PX)
+    masks = region_masks(annotation, frame.linear_rgb.shape, outer_margin_px=CONTACT_OUTER_MARGIN_PX)
     contact = sample_mask_to_surface(masks['contact'], grid.uv)
     valid = (ray_valid & roots_valid[..., root_index] & finite & geometry['valid']
              & ((normals @ n0) > .1) & contact)
@@ -441,7 +449,7 @@ def finalize_image(prepared: FrameCalibrationData, reference: FrameCalibrationDa
             or not np.array_equal(prepared.camera.distortion, reference.camera.distortion)):
         raise FrameCalibrationError('coordinate_chart_invalid', 'Prepared/reference camera mismatch')
     try:
-        masks = region_masks(annotation, prepared.original_bgr.shape, outer_margin_px=CONTACT_OUTER_MARGIN_PX)
+        masks = region_masks(annotation, prepared.linear_rgb.shape, outer_margin_px=CONTACT_OUTER_MARGIN_PX)
     except ValueError as exc:
         raise FrameCalibrationError('annotation_missing', str(exc)) from exc
     provider = _provider_from_frame(prepared)
@@ -704,14 +712,6 @@ def fit_and_validate_samples(sample_path, settings):
             _save_json(settings.work_dir/'verification'/'validation.json',
                        dict(status='failed', reason='input_or_fit_failed', message=str(exc)))
         raise
-    if report['status'] == 'passed':
-        from calibrate.visualize_norm import generate_calibration_visualizations
-        try:
-            output = generate_calibration_visualizations(settings.output, sample_path, settings.work_dir)
-        except Exception as exc:
-            # Plotting failure must not relabel an already published, validated LUT as failed.
-            raise RuntimeError(f'法向 LUT 和采样网格已保存，但可视化生成失败: {exc}') from exc
-        print(f'法向标定可视化已保存: {output}')
     return report
 
 
@@ -746,7 +746,6 @@ def run_prepare(config_path, settings):
     for index, source in enumerate(paths):
         key = Path(os.path.relpath(source, root)).as_posix()
         row = dict(index=index, key=key, source_image=source, reference_image=str(reference.source_image))
-        frame = None
         try:
             frame = prepare_image(config_path, settings, reference, source)
             frame.image_index = index
@@ -754,9 +753,6 @@ def run_prepare(config_path, settings):
             row.update(status='prepared', reason='')
         except FrameCalibrationError as exc:
             row.update(status='skip', reason=exc.code, message=str(exc))
-        from calibrate.manual_norm_regions import save_status_preview
-        save_status_preview(frame, source, None, settings.work_dir/'verification'/f'{index:06d}.png',
-                            row.get('message', 'preview_reference'))
         manifest['images'].append(row)
         reports.append(dict(image_key=key, stage='prepare', **{k: v for k, v in row.items() if k not in {'index', 'key'}}))
         print(f"prepare {index+1}/{len(paths)} {key}: {row['status']}")
@@ -774,7 +770,6 @@ def run_samples(settings):
     for entry in manifest['images']:
         key = entry['key']
         row = dict(image_key=key, stage='samples', sample_count=0)
-        frame = None
         annotation = regions.get(key)
         if entry['status'] == 'skip':
             row.update(status='skip', reason=entry['reason'])
@@ -787,17 +782,10 @@ def run_samples(settings):
                     raise FrameCalibrationError('annotation_missing', 'No accepted contact_boundary')
                 record = finalize_image(frame, reference, annotation, settings)
                 _write_final_record(record, reference, settings)
-                from calibrate.manual_norm_regions import save_verification_preview
-                save_verification_preview(record, annotation, settings.work_dir/'verification'/f"{entry['index']:06d}.png")
                 records.append(record)
                 row.update(status='accepted', reason='', **record['metrics'])
             except FrameCalibrationError as exc:
                 row.update(status='failed', reason=exc.code, message=str(exc), **exc.metrics)
-        if row['status'] != 'accepted':
-            from calibrate.manual_norm_regions import save_status_preview
-            save_status_preview(frame, entry['source_image'], annotation,
-                                settings.work_dir/'verification'/f"{entry['index']:06d}.png",
-                                row.get('message', row.get('reason', 'skip')))
         reports.append(row)
         print(f"samples {key}: {row['status']} {row.get('reason', '')}")
     _write_report(settings, reports)

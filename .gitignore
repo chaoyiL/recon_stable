@@ -13,6 +13,7 @@ tests/
 !/tests/test_led_protocol.py
 !/tests/test_camera_controls.py
 .vscode/
+tests/
 
 # 本地采集/标定数据（体积过大，不纳入版本控制）
 assets/

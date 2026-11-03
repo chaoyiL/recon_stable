@@ -21,6 +21,7 @@ camera:
   backlight_compensation: 0
 
 capture:
+  # 图片保存 float32 线性 RGB NPZ；录像保存逐帧 NPZ 和 manifest.json。
   save: ~/recon_stable/assets/cali_norm_pics
   video_save: ~/recon_stable/assets/cali_lightfield_videos
 
@@ -56,11 +57,11 @@ material_coordinates:
     rows: 400
     columns: 143
 
-# 默认保留外部样本模式。使用图片时设 input_mode: images，并填写本次底色和几何参数。
+# 图片模式读取线性 NPZ；历史相机 PNG 仅在统一读取入口解码。
 normal_calibration:
   input_mode: images
-  images: ["assets/cali_norm_pics/*.png"]
-  reference_image: assets/reference.png
+  images: ["assets/cali_norm_pics/*.npz"]
+  reference_image: assets/reference.npz
   sphere_radius_mm: 3
   sphere_side: positive_normal
   boundary_model: zero_boundary_displacement
@@ -78,10 +79,10 @@ normal_calibration:
     maximum_out_of_range_fraction: 0.05
 
 reconstruction:
-  reference_image: assets/reference.png
+  reference_image: assets/reference.npz
   # 图片法向标定通过后，根据本批 reference 自动重建此网格。
   material_grid_file: assets/normal_calibration/lut_material_grid.npz
-  # NPZ 保存到 output_dir/pc，预览图片直接保存到 output_dir。
+  # 结果 NPZ 保存到 output_dir/pc，不自动生成预览图片。
   output_dir: assets/reconstruction
   # 求解网格按当前整体曲面的实际长宽配比，长边点数取 observation 的较大维度。
   match_surface_aspect: true

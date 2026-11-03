@@ -14,10 +14,11 @@ import cv2
 import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import lsmr
-from utils.color_difference import (CAMERA_RGB_TRANSFER_FUNCTION, bgr8_to_linear_rgb,
+from utils.color_difference import (CAMERA_RGB_TRANSFER_FUNCTION,
                                     require_camera_rgb_transfer, signed_color_difference)
 from utils.config import load_config
 from utils.color_protection import resolve_zero_color_radii, signed_color_protection_factors
+from utils.image_io import cached_linear_rgb
 
 
 from utils.normal_mapping import NormalCalibration, lookup_slopes_raw
@@ -319,13 +320,6 @@ def default_reconstruction_output(
     if not directory.is_absolute():
         directory = Path(config_path).expanduser().parent / directory
     return directory / 'pc' / filename
-
-
-def default_reconstruction_preview(output: str | Path) -> Path:
-    """Keep previews outside pc/; explicit NPZ paths elsewhere retain adjacent previews."""
-    output = Path(output).expanduser()
-    directory = output.parent.parent if output.parent.name == 'pc' else output.parent
-    return directory / output.with_suffix('.png').name
 
 
 def load_local_reconstruction_settings(
@@ -727,7 +721,7 @@ def load_reconstruction_arrays(data, expected_metadata=None):
                 raise ValueError('Reference/current material identities differ')
         ref_uv=data['reference_uv'] if 'reference_uv' in data else data['uv']
 
-        def source_valid(prefix, image, bgr=None):
+        def source_valid(prefix, image):
             valid=np.isfinite(image).all(axis=-1)
             def mask_field(key):
                 mask=np.asarray(data[key],bool)
@@ -744,28 +738,24 @@ def load_reconstruction_arrays(data, expected_metadata=None):
                 if surface_key not in data or marker_key not in data:
                     raise ValueError(f'Image sampling requires {surface_key} and {marker_key}')
                 valid &= mask_field(surface_key) & ~mask_field(marker_key)
-            if bgr is not None:
-                valid &= np.all(bgr<255,axis=-1)
-            elif new_path:
-                valid &= np.all(image<1,axis=-1)
+            valid &= np.all(image<1,axis=-1)
             if prefix=='observed_' and 'residual_valid' in data:
                 valid &= mask_field('residual_valid')
             return valid
 
-        if 'observed_linear_rgb' in data and 'reference_linear_rgb' in data:
-            observed,reference=data['observed_linear_rgb'],data['reference_linear_rgb']
+        if any(key in data for key in (
+                'observed_linear_rgb', 'reference_linear_rgb',
+                'observed_bgr', 'reference_bgr')):
+            if 'observed_bgr' in data or 'reference_bgr' in data:
+                if transfer is not None:
+                    require_camera_rgb_transfer({'rgb_transfer_function': transfer}, '输入图像')
+                if expected_metadata is not None:
+                    require_camera_rgb_transfer(expected_metadata, 'LUT')
+                transfer = CAMERA_RGB_TRANSFER_FUNCTION
+            observed = cached_linear_rgb(data, 'observed')
+            reference = cached_linear_rgb(data, 'reference')
             current_valid=source_valid('observed_',observed)
             ref_valid=source_valid('reference_',reference)
-        elif 'observed_bgr' in data and 'reference_bgr' in data:
-            if transfer is not None:
-                require_camera_rgb_transfer({'rgb_transfer_function': transfer}, '输入图像')
-            if expected_metadata is not None:
-                require_camera_rgb_transfer(expected_metadata, 'LUT')
-            transfer = CAMERA_RGB_TRANSFER_FUNCTION
-            observed=bgr8_to_linear_rgb(data['observed_bgr'])
-            reference=bgr8_to_linear_rgb(data['reference_bgr'])
-            current_valid=source_valid('observed_',observed,data['observed_bgr'])
-            ref_valid=source_valid('reference_',reference,data['reference_bgr'])
         else:
             raise ValueError('Input needs material-grid colors/residuals or both observed/reference images')
         current=sample_linear_rgb_to_surface(observed,data['uv'],current_valid)
@@ -810,12 +800,13 @@ def save_reconstruction_result(
     result: LocalReconstructionResult, output: str | Path, *,
     preview_output: str | Path | None = None, show: bool = False,
 ) -> Path:
-    """Save the local-result NPZ and preview, keeping PNGs outside the pc/ folder."""
+    """Save a local-result NPZ and optionally export or display its scientific figure."""
     output = result.save(output)
     print(f"局部重建完成: {output}；unknown={int(np.count_nonzero(~result.boundary_mask & result.valid_mask))} "
           f"iterations={result.solver_iterations} residual={result.solver_residual_norm:.6g}")
-    from reconstruction.viewer import view_reconstruction
-    view_reconstruction(output, image_output=preview_output or default_reconstruction_preview(output), show=show)
+    if preview_output is not None or show:
+        from reconstruction.viewer import view_reconstruction
+        view_reconstruction(output, image_output=preview_output, show=show)
     return output
 
 
@@ -840,7 +831,7 @@ def local_main() -> None:
         "--lsmr-max-iterations",type=int,help="覆盖 LSMR 最大迭代次数")
     parser.add_argument("--show",action="store_true",help="重建完成后显示结果窗口")
     parser.add_argument(
-        "--preview-output",help="预览图路径；默认将 pc/ 内 NPZ 的同名 PNG 保存到上一级目录")
+        "--preview-output",help="显式导出三维曲面及位移图；默认只保存结果 NPZ")
     args=parser.parse_args()
     if args.view is not None:
         if args.output is not None:

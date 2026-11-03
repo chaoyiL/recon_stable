@@ -25,6 +25,7 @@ from scipy.spatial.distance import pdist
 
 from calibrate.visualize_norm import _load_samples
 from utils.normal_mapping import NormalCalibration, build_normal_lut, find_ambiguous_color_pairs, lookup_slopes_raw
+from utils.image_io import cached_linear_rgb
 from utils.region_annotations import load_regions
 from utils.surface_geometry import local_slopes_to_normals
 
@@ -593,7 +594,7 @@ def _spatial_figure(work, samples, context, regions, bad, patterns, output):
         name = str(samples['image_paths'][index])
         region = regions[name]
         with np.load(work/'overall'/f'{index:06d}.npz', allow_pickle=False) as frame:
-            axis.imshow(frame['observed_bgr'][..., ::-1])
+            axis.imshow(cached_linear_rgb(frame), origin='upper', interpolation='nearest')
         points = context['uv'][(samples['image_index'] == index) & bad]
         axis.scatter(points[:, 0], points[:, 1], color='red', s=4, edgecolors='white', linewidths=.12)
         cx, cy = region.center_px

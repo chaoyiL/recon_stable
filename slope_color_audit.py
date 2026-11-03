@@ -6,7 +6,6 @@ import csv
 import json
 from pathlib import Path
 
-import cv2
 import numpy as np
 from matplotlib.figure import Figure
 
@@ -14,6 +13,7 @@ from reconstruction.local_recon import _load_reconstruction_input, lookup_slopes
 from utils.color_difference import signed_difference_preview
 from utils.color_protection import signed_color_protection_factors
 from utils.config import load_config
+from utils.image_io import cached_linear_rgb, load_linear_image
 from utils.normal_mapping import NormalCalibration, lookup_slopes_raw
 from utils.surface_geometry import compute_surface_geometry
 from utils.surface_projection import CameraModel, project_points
@@ -66,8 +66,8 @@ def load_case(result_path, calibration, radii, minimum_crossing_amplitude_mm):
         if not np.array_equal(data['xyz'], xyz):
             raise ValueError(f'{index}: baseline and reconstruction input XYZ differ')
     with np.load(input_path, allow_pickle=False) as data:
-        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-        if image is None or not np.array_equal(image, data['observed_bgr']):
+        image = load_linear_image(image_path)
+        if not np.array_equal(image, cached_linear_rgb(data, 'observed')):
             raise ValueError(f'{index}: source photograph and cached colors differ')
         uv = data['uv']
         surface_mask = data['surface_mask']
@@ -187,7 +187,7 @@ def plot_case(case, output_path, slope_limit, depth_limit, minimum_crossing_ampl
     fields = np.dstack((case['colors'], case['magnitude']))
     color = rasterize_surface_grid(fields, case['uv'], case['photo'], shape)
     depth = rasterize_surface_grid(case['saved']['displacement'], case['uv'], case['geometry_valid'], shape)
-    axes[0, 0].imshow(case['image'][..., ::-1])
+    axes[0, 0].imshow(case['image'])
     axes[0, 0].set_title('Photograph + zero-displacement contour')
     artist = axes[0, 1].imshow(np.ma.array(depth.values[..., 0], mask=~depth.valid),
                              cmap='coolwarm', vmin=-depth_limit, vmax=depth_limit)
@@ -229,7 +229,7 @@ def plot_crossing_summary(cases, radii, minimum_crossing_amplitude_mm, output_pa
         crossing = case['analysis_crossing'] & case['photo']
         zero = case['magnitude'] <= ZERO_SLOPE_TOLERANCE
         axis = axes[row, 0]
-        axis.imshow(case['image'][..., ::-1], alpha=.4)
+        axis.imshow(case['image'], alpha=.4)
         for mask, color, label in ((case['analysis_crossing'] & ~case['photo'], 'gray', 'Missing color'),
                                   (crossing & ~zero, '#f06c00', 'Nonzero used slope'),
                                   (crossing & zero, '#0048c9', 'Zero used slope')):

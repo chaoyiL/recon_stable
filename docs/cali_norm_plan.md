@@ -1,6 +1,6 @@
 # 压球图片的色差—法向标定实施计划
 
-本文规定待实施的流程、算法和接口，目标是从一批压球图片、固定底色图、已知球半径和接触边界标注，生成可供局部重建使用的色差→法向映射。文中“新增”“调整”均为待办，不代表代码已经实现。
+本文规定待实施的流程、算法和接口，目标是从一批压球图片、固定底色图、已知球半径和接触边界标注，生成可供局部重建使用的色差→法向映射。文中“新增”“调整”均为待办，不代表代码已经实现。2026-11-03 已将图像入口、采集文件和缓存统一为线性 RGB，移除自动检查 PNG；下文相关接口已同步，其他历史待办的现状以代码及 [structure.md](structure.md) 为准。
 
 ## 核心功能与完整链路
 
@@ -166,15 +166,14 @@ st_table = np.stack(
 本次用固定底色图采样替代背景光场生成。顺序固定如下：
 
 ```text
-底色 BGR8 → 线性 RGB → 按 UV_ref 采样 → C_ref(s,t)
-压球 BGR8 → 线性 RGB → 按 UV_i   采样 → C_i(s,t)
+底色线性 RGB → 按 UV_ref 采样 → C_ref(s,t)
+压球线性 RGB → 按 UV_i   采样 → C_i(s,t)
 delta(s,t) = C_i(s,t) - C_ref(s,t)
 ```
 
 保留有符号的三个通道，不取绝对值、不转灰度、不做显示归一化。固定底色假设由最终曲面上的非接触区色差验证，不因“形变近似为零”省掉曲面坐标转换。
 
-已实现：BGR8 按本机相机声明的 BT.709 逆曲线线性化，标定与重建共用
-`utils/color_difference.py`。曲线、当前设备核对结果及旧样本/LUT 的重算要求见
+已实现：相机帧和旧编码图片只在入口按 BT.709 逆曲线线性化；新图片保存浮点 NPZ，读取后直接使用。标定与重建共用 `utils/image_io.py`，缓存持有线性整图，样本生成和重算不重复解码。所有原图预览直接显示线性值，不做显示曲线转换，也不自动保存检查 PNG。曲线、当前设备核对结果及旧样本/LUT 的重算要求见
 [相机颜色契约](structure.md#相机颜色契约2026-11-02-核对)。
 
 参考、当前网格的 chart_id、st、原生 parameters 必须一致；各自使用自己的 XYZ、UV 和有效域。
@@ -187,7 +186,7 @@ delta(s,t) = C_i(s,t) - C_ref(s,t)
 source_valid = surface_mask & ~marker_image_mask & unsaturated
 ```
 
-`unsaturated` 要求原始 BGR8 三个通道均小于 255。marker mask 由固定 ID 的位置和局部黑色连通域取得，包含组件形状及边缘保护带；参考图和当前图分别建立。
+`unsaturated` 要求线性 RGB 三个通道均小于 1，对应原始 BGR8 的 255 饱和阈值。marker mask 由固定 ID 的位置和局部黑色连通域取得，包含组件形状及边缘保护带；参考图和当前图分别建立。
 
 复用现有组件检测，但保持 `detect_cross_centers` 的三个返回值兼容。提取公共的组件分析辅助函数，避免再写一份阈值和连通域算法。组件对应不唯一、暂时失检时，按参考尺寸和已跟踪位置保守屏蔽。搜索半径与边缘扩张值见第 12 节。
 
@@ -207,7 +206,7 @@ source_valid = surface_mask & ~marker_image_mask & unsaturated
 | 曲面色差 | 映射回原图像素位置的曲面域 RGB 色差、有效域、最终 sample mask；直接编辑接触轮廓和中心 |
 | 几何预览 | 整体曲面、球面法向/坡度、拟合误差或失败原因 |
 
-在中间色差图上按圆形接触边界标注，只编辑圆心和半径；拖动圆周及滚轮调整半径始终保持圆形，滚轮不缩放画面，不提供椭圆半轴调整、旋转或多边形转换。左侧原图同步显示轮廓供对照。三栏宽度为 640、960、280 像素，图像区高 720 像素，各图等比例显示；说明文字采用 22 像素字号和 30 像素行距，独立于源图绘制并按实际字宽换行，底部预留四行状态区。标注窗口与保存预览使用相同布局，避免文字随源图反复缩放而模糊。色差图必须映射回原图像素位置，鼠标坐标需扣除面板偏移并除以显示缩放；保存原图像素坐标。旧椭圆与多边形标注保留读取兼容，重新打开编辑时以相同圆心和等面积圆初始化，重新确认后保存。
+在中间色差图上按圆形接触边界标注，只编辑圆心和半径；拖动圆周及滚轮调整半径始终保持圆形，滚轮不缩放画面，不提供椭圆半轴调整、旋转或多边形转换。左侧原图同步显示轮廓供对照。三栏宽度为 640、960、280 像素，图像区高 720 像素，各图等比例显示；说明文字采用 22 像素字号和 30 像素行距，独立于源图绘制并按实际字宽换行，底部预留四行状态区。标注只在窗口预览，文字独立绘制，不保存检查图片。色差图必须映射回原图像素位置，鼠标坐标需扣除面板偏移并除以显示缩放；保存原图像素坐标。旧椭圆与多边形标注保留读取兼容，重新打开编辑时以相同圆心和等面积圆初始化，重新确认后保存。
 
 标注语义固定为 `contact_boundary`：胶皮与球接触区域的边界。中心是接触区内部的代表点，不是球心投影。普通 ROI、可见球轮廓不能自动充当接触边界。
 
@@ -339,7 +338,7 @@ sample_valid =
 
 已实现配套采样网格更新：图片 `fit` 每次验证通过后，读取同批 `reference_surface.npz` 及其参考弧长图，校验参考图和坐标编号与待发布 LUT 一致。以 reference 的 observation 行列数生成规则 st，调用同一 `sample_surface_grid` 反解原生材料参数，写入 `work_dir/lut_material_grid.npz`；不读取旧网格，不继承旧分辨率。两个临时文件写完后再分别替换最终 LUT 与网格。验证、reference 检查或临时写入失败时保留已发布产物；旧两数组样本不生成网格。
 
-已实现标定后可视化：发布成功后，`calibrate/visualize_norm.py` 使用本批 LUT、聚合样本及 `frames/overall` 缓存，在 `work_dir/visualization/` 生成逐图色差与 p/q 对照、RGB 色差到 p/q 的三维映射、三个零通道 LUT 切片和整批汇总。逐图预测调用最终 LUT 的原始插值；独立留出统计调用同批 `_train.npz`，复用已有局部坡度转法向函数计算角误差。显示回投复用 `rasterize_surface_grid`，统计始终使用原材料网格样本。所有输入校验坐标身份；空间样本还检查与训练样本逐点一致，不混入遗留缓存。可视化失败不改写已发布 LUT 的验证状态；完整报告生成后才替换旧报告。没有图片分组的旧两数组模式不生成该报告。
+保留显式科学分析工具，正常标定不自动调用：`calibrate/visualize_norm.py` 使用本批 LUT、聚合样本及 `frames/overall` 缓存，在 `work_dir/visualization/` 生成逐图色差与 p/q 对照、RGB 色差到 p/q 的三维映射、三个零通道 LUT 切片和整批汇总。逐图预测调用最终 LUT 的原始插值；独立留出统计调用同批 `_train.npz`，复用已有局部坡度转法向函数计算角误差。显示回投复用 `rasterize_surface_grid`，统计始终使用原材料网格样本。所有输入校验坐标身份；空间样本还检查与训练样本逐点一致，不混入遗留缓存。显式分析失败不改写已发布 LUT 的验证状态；完整报告生成后才替换旧报告。没有图片分组的旧两数组模式不生成该报告。
 
 已实现 p/q 不良映射图：使用拟合及剔除前的全部配对样本，以 KDTree 查询有符号线性 RGB 欧氏距离 ≤0.01 的所有无序样本对，包含同图与跨图。将 p/q 转成公共局部基下的单位法向 `normalize([-p,-q,1])`，夹角 >20° 的样本对为冲突对，两端点均在 p/q 图中标红。一个点可参与多个冲突对，点数与对数分别统计；不只选最近邻。两个阈值可通过可视化 CLI 调整。图片仅输出 PNG，另保存全部冲突索引、逐对距离与角度、不良点 mask 的 NPZ，汇总 JSON 记录阈值和统计。这些诊断不改变 LUT 拟合或筛选规则。
 
@@ -385,7 +384,8 @@ h_i = sqrt(mean_j(||Q_j-Q_i||²))
 | `utils/region_annotations.py` | 区域数据、读写、边界采样、mask 与边距 |
 | `utils/annotation_editor.py` | 通用面板和形状编辑；通过回调重算、保存 |
 | `utils/annotation_window.py` | 固定图像范围的 Matplotlib/PyQt5 窗口，滚轮只转交给形状编辑 |
-| `utils/color_difference.py` | BGR8/线性 RGB 转换、曲面数组有符号差、显示转换 |
+| `utils/image_io.py` | 线性 NPZ 读写、旧图入口解码、直接线性显示适配与检测灰度适配 |
+| `utils/color_difference.py` | BT.709 逆传递、曲面数组有符号差及色差示意 |
 | `utils/normal_mapping.py` | 提取 LUT 数据、构建与原始查询；保留兼容导出 |
 | `calibrate/manual_norm_regions.py` | 为通用编辑器配置接触语义、三面板与重算回调 |
 | `calibrate/norm_pipeline.py` | 图片准备、最终重拟合、颜色/标签组合、样本导出、验证 |
@@ -448,7 +448,7 @@ def sample_mask_to_surface(image_mask, uv): ...
 # markers.py
 def find_inner_region(gray) -> InnerRegion: ...
 def find_inner_roi(gray): ...  # 保留矩形返回值
-def build_marker_image_mask(frame_bgr, marker_pixels, marker_valid,
+def build_marker_image_mask(frame_linear_rgb, marker_pixels, marker_valid,
                             reference_marker_sizes, *, dilation_px=1): ...
 
 # Session
@@ -459,7 +459,7 @@ def fit_observations(self, tracking, *, exclusion_mask=None,
 # Provider
 def bind_coordinate_chart(self, chart): ...
 def reset(self, *, clear_coordinate_chart=False): ...
-def track_frame(self, frame_bgr) -> dict: ...
+def track_frame(self, frame_linear_rgb) -> dict: ...
 def sample_coefficients(self, coefficients, specs, surface_mask=None): ...
 def fit_tracked_frame(self, specs, surface_mask, fit_exclusion_mask,
                       prior_coefficients=None): ...
@@ -542,14 +542,14 @@ def find_ambiguous_color_pairs(colors, slopes, *, color_distance_threshold=0.01,
 
 ## 9. 执行阶段与配置
 
-以下是实施后应提供的行为，当前新增阶段尚不能执行。保留已有 `calibrate-norm` 入口。
+以下阶段已由 `calibrate-norm` 提供，具体数值校验以当前实现为准。
 
 | 阶段 | 输入 | 输出 | 界面 |
 |---|---|---|---|
 | prepare | 原图、底色、相机、模板 | reference、坐标图、prepared、manifest | 无 |
 | annotate | prepared、球半径和球心侧 | 标注文件、最终几何预览 | 缺标注或 --edit 时 |
 | samples | prepared、accepted 标注 | 最终整体曲面、颜色/标签、聚合样本、逐图报告 | 无 |
-| fit | 聚合样本、同批 reference 几何/坐标图及 frames/overall 缓存 | 训练 LUT、验证报告、通过后的最终 LUT、新采样网格及可视化 | 无 |
+| fit | 聚合样本、同批 reference 几何/坐标图及 frames/overall 缓存 | 训练 LUT、验证报告、通过后的最终 LUT 和新采样网格 | 无 |
 | all | 上述源输入 | 按顺序执行全部阶段 | 仅标注阶段 |
 
 `prepare` 不要求球半径；`annotate/samples` 要求明确的几何输入。`samples/fit` 不初始化 GUI，fit 不读取原图。
@@ -559,8 +559,8 @@ def find_ambiguous_color_pairs(colors, slopes, *, color_distance_threshold=0.01,
 ```yaml
 normal_calibration:
   input_mode: images
-  images: ["data/cali_norm_pics/*.png"]
-  reference_image: data/reference.png
+  images: ["assets/cali_norm_pics/*.npz"]
+  reference_image: assets/reference.npz
   sphere_radius_mm: null             # 必填：真实半径
   sphere_side: null                  # positive_normal / negative_normal
   boundary_model: zero_boundary_displacement
@@ -608,12 +608,11 @@ assets/normal_calibration/
   normal_lut_train.npz
   normal_lut.npz
   lut_material_grid.npz
-  verification/000000.png
   verification/report.csv
   verification/validation.json
 ```
 
-每图只输出一张合并预览和一行报告。预览包括轮廓/marker 屏蔽、曲面色差/sample mask、球面法向/拟合结果；反投影图仅用于显示。
+每图输出缓存和一行报告，不自动导出检查 PNG。标注窗口直接显示线性原图、轮廓/marker 屏蔽、曲面色差/sample mask、球面法向/拟合结果；反投影图仅用于显示。几何缓存 v3 保存 `observed_linear_rgb` 浮点整图；旧 v2 缓存在读取入口解码。
 
 ### 10.2 NPZ 字段
 
@@ -678,7 +677,7 @@ image_root 相对 YAML 所在目录解析。region 的 image_size 与实际图�
 3. **球面几何与符号**：已知球心、半径和接触圆，恢复两侧球冠及法向；错误边界与分支不定会失败；法向↔坡度往返一致。
 4. **无界面全链路与复用**：至少三张合成分组数据完成 samples/fit；get-surface 与标定共用函数结果一致，非双三次曲面可接入；验证图不影响训练范围；验证失败保留旧 LUT；旧样本模式明确未验证。
 
-采用标准库 unittest。测试覆盖上述行为，不逐行复刻实现。实际数据运行后仅查看每图合并预览与四类报告。
+采用标准库 unittest。测试覆盖上述行为，不逐行复刻实现。实际数据运行后查看交互标注和结构化报告，不依赖检查 PNG。
 
 ## 12. 数值细节与实施顺序
 

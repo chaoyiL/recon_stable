@@ -16,7 +16,9 @@ import numpy as np
 import yaml
 
 from utils.camera import open_camera
+from utils.color_difference import bgr8_to_linear_rgb
 from utils.config import ConfigError, load_config_sections, parse_camera_config
+from utils.image_io import linear_rgb_to_bgr8, linear_rgb_to_tracking_bgr8
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
 BOARD_TYPES = ("chessboard", "circles")
@@ -664,21 +666,23 @@ def main() -> None:
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     try:
         while True:
-            ok, frame = cap.read()
-            if not ok or frame is None:
+            ok, captured_bgr = cap.read()
+            if not ok or captured_bgr is None:
                 print("读取相机帧失败", file=sys.stderr)
                 break
+            linear_rgb = bgr8_to_linear_rgb(captured_bgr)
+            tracking_bgr = linear_rgb_to_tracking_bgr8(linear_rgb)
 
-            current_size = (frame.shape[1], frame.shape[0])
+            current_size = (linear_rgb.shape[1], linear_rgb.shape[0])
             if image_size is None:
                 image_size = current_size
             elif current_size != image_size:
                 print("相机分辨率在采集过程中发生变化，无法继续标定", file=sys.stderr)
                 break
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.cvtColor(tracking_bgr, cv2.COLOR_BGR2GRAY)
             found, corners = find_board_points(gray, calibration_config)
-            display = frame.copy()
+            display = linear_rgb_to_bgr8(linear_rgb)
             if found and corners is not None:
                 cv2.drawChessboardCorners(
                     display,

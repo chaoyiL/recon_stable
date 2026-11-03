@@ -19,8 +19,8 @@ import yaml
 
 from calibrate.compare_norm import (
     SAMPLE_FIELDS, TILT_BINS, background_metrics, color_support, dataset_summary,
-    fit_dataset, leave_one_image_out, near_color_consistency, noise_response,
-    save_csv, save_figure, score_samples, source_signature, summarize_common_tests,
+    fit_dataset, leave_one_image_out, matching_annotation, near_color_consistency, noise_response,
+    save_csv, save_figure, score_samples, source_images, source_signature, summarize_common_tests,
 )
 from calibrate.norm_pipeline import parse_settings, run_prepare, run_samples
 from utils.normal_mapping import NormalCalibration, build_normal_lut, lookup_slopes_raw
@@ -31,17 +31,19 @@ def prepare_mixed(config, base, directories, work):
     work.mkdir(parents=True, exist_ok=True)
     image_root = Path(os.path.commonpath(list(directories.values())))
     annotations = yaml.safe_load(base.annotations_file.read_text())
-    images = sorted(image for directory in directories.values() for image in directory.glob('*.png'))
+    images = sorted(image for directory in directories.values() for image in source_images(directory))
+    if not images:
+        raise ValueError('No supported source images in deep/shallow datasets')
     rows = []
     for image in images:
-        matches = [row for row in annotations['regions'] if Path(row['image']).name == image.name]
-        if len(matches) != 1 or matches[0]['status'] != 'accepted':
-            raise ValueError(f'Expected one accepted annotation for {image}')
-        rows.append(dict(matches[0], image=image.relative_to(image_root).as_posix()))
+        match = matching_annotation(annotations, image, image_root)
+        if match['status'] != 'accepted':
+            raise ValueError(f'Expected an accepted annotation for {image}')
+        rows.append(dict(match, image=image.relative_to(image_root).as_posix()))
     annotation_file = work/'manual_regions.yaml'
     annotation_file.write_text(yaml.safe_dump(dict(version=2,
         image_root=os.path.relpath(image_root, work), regions=rows), sort_keys=False, allow_unicode=True))
-    settings = replace(base, images=tuple(str(directory/'*.png') for directory in directories.values()),
+    settings = replace(base, images=tuple(str(image) for image in images),
         image_root=image_root, annotations_file=annotation_file, work_dir=work,
         input_file=work/'normal_samples.npz', output=work/'normal_lut.npz')
     manifest = run_prepare(config, settings)

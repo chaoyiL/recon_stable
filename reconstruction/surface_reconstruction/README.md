@@ -2,7 +2,7 @@
 
 通过纸片上的十字标记与已标定的单目摄像头，估计纸片的三维曲面。适用于柔性视触觉传感器的曲面重建实验。
 
-程序支持图片、视频文件和摄像头输入。相机与纸片的相对位置可变化，初始纸片可弯曲，不依赖固定平面参考帧。当前版本为研究原型，面向平滑弯曲和有限扭转；三维绝对精度尚需实物真值验证。
+程序支持线性 NPZ 图片、逐帧 NPZ 录像目录、旧图片/视频文件和摄像头输入。相机与纸片的相对位置可变化，初始纸片可弯曲，不依赖固定平面参考帧。当前版本为研究原型，面向平滑弯曲和有限扭转；三维绝对精度尚需实物真值验证。
 
 ## 1. 实验条件
 
@@ -44,10 +44,10 @@ Windows 也可双击 `start.bat`，默认打开配置中的摄像头。启动器
 
 ```bash
 uv run python -m reconstruction.surface_reconstruction.markers --video 2
-uv run python -m reconstruction.surface_reconstruction.markers --image path/to/frame.png
+uv run python -m reconstruction.surface_reconstruction.markers --image path/to/frame.npz
 ```
 
-摄像头调试窗口按 **S** 保存当前候选图和阈值图，按 **Esc** 或 **Q** 退出。单张图片会直接把结果写到 `marker_debug/`；可用 `--save-dir` 改变目录。
+候选图和阈值图只在窗口显示，按 **Esc** 或 **Q** 退出；不保存检查 PNG，也不再提供 `--save-dir`。原图背景直接显示线性 RGB，检测内部使用原来的 8 位灰度强度。
 
 十字搜索的横坐标范围由 `markers.py` 中的 `DETECT_X_MIN` 和 `DETECT_X_MAX` 控制，按原图像素计算并包含上下界。该限制仅裁剪搜索框；胶皮区域 mask 保留完整轮廓，检测出的中心和组件仍使用原图坐标。范围需完整覆盖十字的臂；被搜索边界切断的连通域会被拒绝，不能仅按十字中心设置边界。
 
@@ -71,10 +71,10 @@ reconstruction/surface_reconstruction/
 └── README.md
 ```
 
-运行时自动创建 `output/`、`marker_detection/` 和按需创建的 `marker_debug/`。交付包不包含虚拟环境、本机 `.runtime`、编辑器配置、缓存和完整实验输出。原始照片、标定、模板及视频示例包含在包内，解压后可按上述步骤复现。
+运行时创建 `output/`，仅在需要录像时创建 `marker_detection/`；不创建检查 PNG 目录。交付包不包含虚拟环境、本机 `.runtime`、编辑器配置、缓存和完整实验输出。原始照片、标定、模板及视频示例包含在包内，解压后可按上述步骤复现。
 
 主仓库的 `get-surface` 会导入本模块的
-`SurfaceReconstructionProvider`。provider 对当前帧执行相同的标记检测与曲面拟合，
+`SurfaceReconstructionProvider`。provider 接收 `H×W×3 float32` 线性 RGB，对当前帧执行相同的标记检测与曲面拟合，
 再按 `config.yaml` 中的三套尺寸，用冻结参考弧长图反解原生参数并采样 XYZ、图像 UV、原生材料坐标和 st。
 黑框内部真实轮廓提供完整胶皮 mask，包含 marker 位置。
 `process(frame, fit=False)` 与 `fit_observations` 分离跟踪和拟合，图片标定从同一参考图恢复 ID，
@@ -108,17 +108,17 @@ reconstruction/surface_reconstruction/
 | `max_reprojection_px` | 拒绝三维估计的投影 RMS 阈值 |
 | `max_metric_error` | 局部长度/正交性误差的拒绝阈值 |
 
-主要参数：`--image` 与 `--video` 二选一；`--preview` 显示视频预览；`--no-preview` 关闭摄像头预览；`--max-frames N` 限制处理帧数；`--no-record` 仅保存数据和诊断、不保存视频；`--out` 指定输出目录；`--row-direction` 指定初始行方向（auto/down/up/left/right）。完整说明可运行 `uv run python -m reconstruction.surface_reconstruction.run_reconstruction --help`。
+主要参数：`--image` 与 `--video` 二选一，后者也支持 `capture` 保存的含 `manifest.json` 的线性帧目录；`--preview` 显示视频预览；`--no-preview` 关闭摄像头预览；`--max-frames N` 限制处理帧数；`--no-record` 仅保存数据和诊断、不保存视频；`--out` 指定输出目录；`--row-direction` 指定初始行方向（auto/down/up/left/right）。完整说明可运行 `uv run python -m reconstruction.surface_reconstruction.run_reconstruction --help`。
 
 ## 6. 输出与坐标定义
 
-图片重建结果保存到 `output/<输入名>/`：`surface.png`、`surface.obj`、`reconstructed_points.csv`、`frame_metrics.csv`、`diagnostics.json`。检测图片单独保存到 `marker_detection/<同名目录>/detected_markers.png`。
+图片重建结果保存到 `output/<输入名>/`：`surface.obj`、`reconstructed_points.csv`、`frame_metrics.csv`、`diagnostics.json`。检测叠图和曲面只在请求预览时显示，不自动保存 PNG。
 
 视频结果包括 `reconstruction.avi`、`frame_points.csv`、`frame_metrics.csv` 和 `diagnostics.json`；单独的识别录像位于 `marker_detection/<同名目录>/detected_markers.avi`。默认不会覆盖已有输出，而是新建带时间后缀的目录。
 
 | 数据字段 | 含义 |
 |---|---|
-| `frame`, `time_s` | 帧编号与时间；文件视频按帧率计算，相机使用采集计时 |
+| `frame`, `time_s` | 帧编号与时间；线性录像读取 manifest 中的实际时间戳，旧文件视频按帧率计算，相机使用采集计时 |
 | `segment`, `id` | 连续跟踪片段与片段内编号；跨片段物理身份不保证一致 |
 | `observed` | 当前是否有通过检查的实际标记观测 |
 | `point_source` | `observed_fit`：观测拟合；`model_inferred`：缺点处模型推断；`unavailable`：无三维估计 |
