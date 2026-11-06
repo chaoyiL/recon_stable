@@ -12,6 +12,167 @@ class ParametricSurface(Protocol):
     def first_derivatives(self, parameters: np.ndarray) -> tuple[np.ndarray, np.ndarray]: ...
 
 
+class OffsetSurface:
+    """A normal offset of a parametric surface, with distance in millimeters.
+
+    Positive distances follow ``dX/da × dX/db``. Surfaces may optionally
+    provide ``second_derivatives(parameters)`` returning ``(X_aa, X_ab,
+    X_bb)``; otherwise normal derivatives are estimated inside the parameter
+    bounds with finite differences.
+    """
+
+    def __init__(self, surface: ParametricSurface, distance_mm: float):
+        distance = np.asarray(distance_mm, np.float64)
+        if distance.shape != () or not np.isfinite(distance):
+            raise ValueError('distance_mm must be a finite scalar')
+        bounds = np.asarray(surface.parameter_bounds, np.float64)
+        if (bounds.shape != (4,) or not np.isfinite(bounds).all()
+                or bounds[1] <= bounds[0] or bounds[3] <= bounds[2]):
+            raise ValueError('Surface parameter_bounds must contain two finite intervals')
+        spans = bounds[[1, 3]] - bounds[[0, 2]]
+        if not np.isfinite(spans).all():
+            raise ValueError('Surface parameter spans must be finite')
+        self.surface = surface
+        self.distance_mm = float(distance)
+        self._parameter_bounds = tuple(float(value) for value in bounds)
+
+    @property
+    def parameter_bounds(self) -> tuple[float, float, float, float]:
+        return self._parameter_bounds
+
+    def evaluate(self, parameters: np.ndarray) -> np.ndarray:
+        if self.distance_mm == 0:
+            return self.surface.evaluate(parameters)
+        shape, flat = self._prepare_parameters(parameters)
+        points = self._surface_values(self.surface.evaluate(flat), len(flat), 'evaluate')
+        _, _, normals, _ = self._normal_state(flat)
+        return (points + self.distance_mm * normals).reshape(*shape, 3)
+
+    def first_derivatives(self, parameters: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if self.distance_mm == 0:
+            return self.surface.first_derivatives(parameters)
+        shape, flat = self._prepare_parameters(parameters)
+        da, db, normals, cross_norm = self._normal_state(flat)
+        second_method = getattr(self.surface, 'second_derivatives', None)
+        if callable(second_method):
+            try:
+                second = second_method(flat)
+            except NotImplementedError:
+                second = None
+            if second is not None:
+                normal_da, normal_db = self._analytic_normal_derivatives(
+                    second, da, db, normals, cross_norm, len(flat))
+            else:
+                normal_da, normal_db = self._finite_difference_normal_derivatives(
+                    flat, normals)
+        else:
+            normal_da, normal_db = self._finite_difference_normal_derivatives(flat, normals)
+        offset_da = da + self.distance_mm * normal_da
+        offset_db = db + self.distance_mm * normal_db
+        return offset_da.reshape(*shape, 3), offset_db.reshape(*shape, 3)
+
+    def _prepare_parameters(self, parameters: np.ndarray) -> tuple[tuple[int, ...], np.ndarray]:
+        values = np.asarray(parameters, np.float64)
+        if values.shape[-1:] != (2,) or not np.isfinite(values).all():
+            raise ValueError('parameters must be finite and end in two coordinates')
+        shape = values.shape[:-1]
+        flat = values.reshape(-1, 2)
+        amin, amax, bmin, bmax = self.parameter_bounds
+        if (np.any(flat[:, 0] < amin) or np.any(flat[:, 0] > amax)
+                or np.any(flat[:, 1] < bmin) or np.any(flat[:, 1] > bmax)):
+            raise ValueError('parameters lie outside surface parameter_bounds')
+        return shape, flat
+
+    @staticmethod
+    def _surface_values(values: np.ndarray, count: int, name: str) -> np.ndarray:
+        values = np.asarray(values, np.float64)
+        if values.shape != (count, 3) or not np.isfinite(values).all():
+            raise ValueError(f'Surface {name} must return finite Nx3 coordinates')
+        return values
+
+    def _normal_state(self, parameters: np.ndarray):
+        try:
+            derivatives = self.surface.first_derivatives(parameters)
+        except (TypeError, ValueError) as exc:
+            raise ValueError('Surface first_derivatives failed') from exc
+        if not isinstance(derivatives, (tuple, list)) or len(derivatives) != 2:
+            raise ValueError('Surface first_derivatives must return (X_a, X_b)')
+        da = self._surface_values(derivatives[0], len(parameters), 'first_derivatives')
+        db = self._surface_values(derivatives[1], len(parameters), 'first_derivatives')
+        cross = np.cross(da, db)
+        cross_norm = np.linalg.norm(cross, axis=-1)
+        tangent_scale = np.linalg.norm(da, axis=-1) * np.linalg.norm(db, axis=-1)
+        regular = (np.isfinite(cross_norm) & np.isfinite(tangent_scale)
+                   & (tangent_scale > 0)
+                   & (cross_norm > 1e-12 * tangent_scale))
+        if not regular.all():
+            raise ValueError('Surface normal is undefined at degenerate parameters')
+        normals = cross / cross_norm[:, None]
+        return da, db, normals, cross_norm
+
+    @staticmethod
+    def _analytic_normal_derivatives(second, da, db, normals, cross_norm, count):
+        if not isinstance(second, (tuple, list)) or len(second) != 3:
+            raise ValueError('Surface second_derivatives must return (X_aa, X_ab, X_bb)')
+        xaa, xab, xbb = (
+            OffsetSurface._surface_values(value, count, 'second_derivatives')
+            for value in second
+        )
+        cross_a = np.cross(xaa, db) + np.cross(da, xab)
+        cross_b = np.cross(xab, db) + np.cross(da, xbb)
+        normal_a = (cross_a - normals * np.sum(normals * cross_a, axis=-1, keepdims=True))
+        normal_b = (cross_b - normals * np.sum(normals * cross_b, axis=-1, keepdims=True))
+        return normal_a / cross_norm[:, None], normal_b / cross_norm[:, None]
+
+    def _finite_difference_normal_derivatives(self, parameters, normals):
+        lower = np.array([self.parameter_bounds[0], self.parameter_bounds[2]])
+        upper = np.array([self.parameter_bounds[1], self.parameter_bounds[3]])
+        spans = upper - lower
+        # The cube-root step balances cancellation and truncation for a
+        # centered first derivative in float64.
+        for axis in (0, 1):
+            step = np.cbrt(np.finfo(np.float64).eps) * spans[axis]
+            left = parameters[:, axis] - lower[axis]
+            right = upper[axis] - parameters[:, axis]
+            central = (left >= 2 * step) & (right >= 2 * step)
+            forward = ~central & (right >= left)
+            backward = ~central & ~forward
+            derivative = np.empty_like(normals)
+
+            for mask, direction in ((central, 0), (forward, 1), (backward, -1)):
+                ids = np.flatnonzero(mask)
+                if not len(ids):
+                    continue
+                first = parameters[ids].copy()
+                second = parameters[ids].copy()
+                if direction == 0:
+                    first[:, axis] += step
+                    second[:, axis] -= step
+                    n_first = self._normals_at(first)
+                    n_second = self._normals_at(second)
+                    derivative[ids] = (n_first - n_second) / (2 * step)
+                elif direction > 0:
+                    first[:, axis] += step
+                    second[:, axis] += 2 * step
+                    n_first = self._normals_at(first)
+                    n_second = self._normals_at(second)
+                    derivative[ids] = (-3 * normals[ids] + 4 * n_first - n_second) / (2 * step)
+                else:
+                    first[:, axis] -= step
+                    second[:, axis] -= 2 * step
+                    n_first = self._normals_at(first)
+                    n_second = self._normals_at(second)
+                    derivative[ids] = (3 * normals[ids] - 4 * n_first + n_second) / (2 * step)
+            if axis == 0:
+                normal_da = derivative
+            else:
+                normal_db = derivative
+        return normal_da, normal_db
+
+    def _normals_at(self, parameters):
+        return self._normal_state(parameters)[2]
+
+
 def surface_grid_curve_lengths(xyz: np.ndarray, valid_mask: np.ndarray) -> tuple[float, float]:
     """Return representative (width, height) in mm along grid columns and rows.
 
@@ -91,11 +252,17 @@ def compute_surface_geometry(
     # K = E^T J G^-1
     k_matrix=np.einsum(
         "...ca,...cb,...bd->...ad",frame,jacobian,g_inverse,optimize=True)
+    # Express the second fundamental form in the orthonormal tangent frame.
+    # Eigenvalues are signed principal curvatures in inverse millimetres.
+    curvature = k_matrix @ second @ np.swapaxes(k_matrix, -1, -2)
+    principal_curvatures = np.linalg.eigvalsh(
+        np.where(nonsingular[..., None, None], curvature, 0))
     return {
         "valid":nonsingular,"interior":interior,"boundary":valid&~interior,
         "normal":normal,"frame":frame,"jacobian":jacobian,"metric":g,
         "metric_inverse":g_inverse,"second":second,"k":k_matrix,
         "area":np.sqrt(np.maximum(det,0)),
+        "principal_curvatures":principal_curvatures,
     }
 
 

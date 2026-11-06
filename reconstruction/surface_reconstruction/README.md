@@ -38,6 +38,14 @@ Windows 也可双击 `start.bat`，默认打开配置中的摄像头。启动器
 
 预览左侧是实际标记检测与编号，右侧是去除整体姿态后的曲面。按 **Esc** 退出，按 **R** 重新初始化编号。视频文件按计算速度处理，预览并非原速播放器。
 
+保存相机看到的第一帧有效重建图片，并在保存后退出：
+
+```bash
+uv run python -m reconstruction.surface_reconstruction.run_reconstruction --video 2 --snapshot --no-preview --no-record
+```
+
+图片保存在本次结果目录下，文件名为 `surface_snapshot.png`，例如 `reconstruction/surface_reconstruction/output/camera_2/surface_snapshot.png`；已有同名结果目录时会创建带时间后缀的新目录。图片左侧为 marker 检测，右侧为曲面形状；图中列出模板中心的相机坐标 XYZ、到相机原点的三维距离及曲面采样点的相机 Z 深度范围，单位均为 mm。局部 Z 表示去除整体姿态后的曲面高度。初始化需检测到完整网格；相机编号可根据设备调整。
+
 初始化失败时，左侧会显示全部原始十字候选：蓝框是检测区域，黄框是候选连通域，红色十字是加权中心。候选编号仅用于检查检测结果，不是模板点 ID。
 
 也可以只运行十字检测，不进入网格排序和曲面求解：
@@ -49,9 +57,9 @@ uv run python -m reconstruction.surface_reconstruction.markers --image path/to/f
 
 候选图和阈值图只在窗口显示，按 **Esc** 或 **Q** 退出；不保存检查 PNG，也不再提供 `--save-dir`。原图背景直接显示线性 RGB，检测内部使用原来的 8 位灰度强度。
 
-十字搜索的横坐标范围由 `markers.py` 中的 `DETECT_X_MIN` 和 `DETECT_X_MAX` 控制，按原图像素计算并包含上下界。该限制仅裁剪搜索框；胶皮区域 mask 保留完整轮廓，检测出的中心和组件仍使用原图坐标。范围需完整覆盖十字的臂；被搜索边界切断的连通域会被拒绝，不能仅按十字中心设置边界。
+十字搜索不再依赖固定图像横坐标。检测器按黑框内部轮廓的距离和实际十字尺寸生成独立搜索 mask，排除边框反光，并对轮廓被阴影压入的区域使用检测框距离保留真标记；胶皮区域 mask 保留完整轮廓，中心和组件仍使用原图坐标。
 
-当前搜索范围为 `x=140～485`，右边界用于排除当前机位的边框反光。更换参考图或机位后，先用上述 marker 调试命令检查候选图：初始化需要完整 48 点网格，最多支持剔除 2 个多余候选；干扰过多时应调整搜索范围或检测条件。
+更换参考图或机位后，先用上述 marker 调试命令检查候选图。初始化仍要求完整 48 点网格，最多支持剔除 2 个多余候选；不得补造缺失标记。真实试采回归验证了最右列十字完整保留，同时拒绝相邻边框反光。
 
 ## 3. 项目结构
 
@@ -108,11 +116,11 @@ reconstruction/surface_reconstruction/
 | `max_reprojection_px` | 拒绝三维估计的投影 RMS 阈值 |
 | `max_metric_error` | 局部长度/正交性误差的拒绝阈值 |
 
-主要参数：`--image` 与 `--video` 二选一，后者也支持 `capture` 保存的含 `manifest.json` 的线性帧目录；`--preview` 显示视频预览；`--no-preview` 关闭摄像头预览；`--max-frames N` 限制处理帧数；`--no-record` 仅保存数据和诊断、不保存视频；`--out` 指定输出目录；`--row-direction` 指定初始行方向（auto/down/up/left/right）。完整说明可运行 `uv run python -m reconstruction.surface_reconstruction.run_reconstruction --help`。
+主要参数：`--image` 与 `--video` 二选一，后者也支持 `capture` 保存的含 `manifest.json` 的线性帧目录；`--preview` 显示视频预览；`--no-preview` 关闭摄像头预览；`--max-frames N` 限制处理帧数；`--no-record` 仅保存数据和诊断、不保存视频；`--snapshot` 在本次结果目录保存第一帧有效重建图片后退出；`--out` 指定输出目录；`--row-direction` 指定初始行方向（auto/down/up/left/right）。完整说明可运行 `uv run python -m reconstruction.surface_reconstruction.run_reconstruction --help`。
 
 ## 6. 输出与坐标定义
 
-图片重建结果保存到 `output/<输入名>/`：`surface.obj`、`reconstructed_points.csv`、`frame_metrics.csv`、`diagnostics.json`。检测叠图和曲面只在请求预览时显示，不自动保存 PNG。
+图片重建结果保存到 `output/<输入名>/`：`surface.obj`、`reconstructed_points.csv`、`frame_metrics.csv`、`diagnostics.json`。检测叠图和曲面可通过预览显示，也可使用 `--snapshot` 保存 PNG。
 
 视频结果包括 `reconstruction.avi`、`frame_points.csv`、`frame_metrics.csv` 和 `diagnostics.json`；单独的识别录像位于 `marker_detection/<同名目录>/detected_markers.avi`。默认不会覆盖已有输出，而是新建带时间后缀的目录。
 

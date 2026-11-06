@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +16,7 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import lsmr
 from utils.color_difference import (CAMERA_RGB_TRANSFER_FUNCTION,
                                     require_camera_rgb_transfer, signed_color_difference)
-from utils.config import load_config
+from utils.config import load_config, load_contact_surface_offset_mm
 from utils.color_protection import resolve_zero_color_radii, signed_color_protection_factors
 from utils.image_io import cached_linear_rgb
 
@@ -44,6 +44,7 @@ class LocalReconstructionResult:
     trusted_no_contact_mask: np.ndarray | None = None
     photometric_valid_mask: np.ndarray | None = None
     inferred_mask: np.ndarray | None = None
+    contact_offset_mm: float | None = None
 
     def save(self,path: str | Path) -> Path:
         output=Path(path).expanduser()
@@ -69,6 +70,8 @@ class LocalReconstructionResult:
         if self.trusted_no_contact_mask is not None:
             values["trusted_no_contact_mask"]=np.asarray(
                 self.trusted_no_contact_mask,np.bool_)
+        if self.contact_offset_mm is not None:
+            values["contact_offset_mm"] = np.asarray(self.contact_offset_mm, np.float64)
         with temporary.open("wb") as stream:
             np.savez_compressed(stream,**values)
         temporary.replace(output)
@@ -676,6 +679,17 @@ def load_reconstruction_arrays(data, expected_metadata=None):
             for key in declarations:
                 if actual[key] is None or expected.get(key) is None or actual[key]!=expected[key]:
                     raise ValueError(f'LUT/input declaration mismatch: {key}')
+        if (new_path or expected.get('coordinate_kind') == COORDINATE_KIND
+                or 'contact_offset_mm' in expected or 'contact_offset_mm' in data):
+            actual_offset = data.get('contact_offset_mm', metadata.get('contact_offset_mm'))
+            expected_offset = expected.get('contact_offset_mm')
+            try:
+                offsets = np.asarray([actual_offset, expected_offset], np.float64)
+            except (TypeError, ValueError):
+                raise ValueError('LUT/input requires contact_offset_mm; rerun calibration') from None
+            if (offsets.shape != (2,) or not np.isfinite(offsets).all()
+                    or not np.isclose(offsets[0], offsets[1], rtol=0, atol=1e-9)):
+                raise ValueError('LUT/input contact_offset_mm mismatch; rerun calibration')
     if new_path and (actual['frame_convention']!=FRAME_CONVENTION
                      or actual['residual_domain']!='material_grid' or actual['color_space']!='linear_rgb'):
         raise ValueError('New coordinate input requires shared frames and material-grid linear RGB')
@@ -782,7 +796,7 @@ def load_reconstruction_arrays(data, expected_metadata=None):
 def reconstruct_from_input(data, calibration, settings) -> LocalReconstructionResult:
     """Shared inference policy for image pipelines and preassembled NPZ inputs."""
     xyz, colors, valid, photo, trusted = load_reconstruction_arrays(data, calibration.metadata)
-    return reconstruct_local_surface(
+    result = reconstruct_local_surface(
         xyz, colors, calibration, valid_mask=valid, photometric_valid_mask=photo,
         zero_color_inner_radius=settings.zero_color_inner_radius,
         zero_color_outer_radius=settings.zero_color_outer_radius,
@@ -794,6 +808,9 @@ def reconstruct_from_input(data, calibration, settings) -> LocalReconstructionRe
                                          if settings.no_contact_constraints_enabled else 0.),
         lsmr_atol=settings.lsmr_atol, lsmr_btol=settings.lsmr_btol,
         lsmr_max_iterations=settings.lsmr_max_iterations)
+    if 'contact_offset_mm' in calibration.metadata:
+        result = replace(result, contact_offset_mm=float(calibration.metadata['contact_offset_mm']))
+    return result
 
 
 def save_reconstruction_result(
@@ -846,6 +863,10 @@ def local_main() -> None:
         lsmr_atol_override=args.lsmr_atol,lsmr_btol_override=args.lsmr_btol,
         lsmr_max_iterations_override=args.lsmr_max_iterations)
     calibration=NormalCalibration.load(settings.calibration_file)
+    if 'contact_offset_mm' in calibration.metadata:
+        configured_offset = load_contact_surface_offset_mm(args.config)
+        if not np.isclose(float(calibration.metadata['contact_offset_mm']), configured_offset, rtol=0, atol=1e-9):
+            raise ValueError('LUT contact_offset_mm differs from configuration; rerun calibration')
     with np.load(settings.input_file, allow_pickle=False) as data:
         result = reconstruct_from_input(data, calibration, settings)
     save_reconstruction_result(result, settings.output_file,

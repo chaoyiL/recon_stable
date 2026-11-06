@@ -10,20 +10,25 @@ from utils.image_io import linear_rgb_to_bgr8
 from utils.annotation_editor import edit_regions
 from utils.annotation_window import AnnotationPanel
 from utils.surface_sampling import rasterize_surface_grid
-from utils.surface_projection import projected_circle_radius_px
+from utils.surface_projection import invert_surface_projection
+from utils.surface_geometry import compute_surface_geometry
+from utils.sphere_contact import SphereSurfaceContact
 
 ContactAnnotation = RegionAnnotation
 ANNOTATION_PANEL_WIDTHS = (640, 960, 280)
 ANNOTATION_PANEL_HEIGHT = 720
 
 
-def _maximum_circle_radius_px(frame, sphere_radius_mm, center_px):
-    grid = frame.systems.observation
-    depth = grid.xyz[..., 2]
-    valid = grid.valid_mask & np.isfinite(depth) & (depth > 0)
-    if not valid.any():
-        raise ValueError('A valid positive surface depth is required to limit the annotation circle')
-    return projected_circle_radius_px(center_px, sphere_radius_mm, float(depth[valid].max()), frame.camera)
+def _initial_indentation_depth(frame, annotation, radius_mm):
+    """Use old image boundaries only as an initial depth guess for manual review."""
+    boundary = invert_surface_projection(region_boundary_points(annotation, 8),
+        frame.surface, frame.camera, frame.systems.geometry)
+    center = invert_surface_projection(np.asarray(annotation.center_px)[None],
+        frame.surface, frame.camera, frame.systems.geometry)
+    if not center.valid[0] or not boundary.valid.any():
+        return .1*radius_mm
+    rho = min(float(np.median(np.linalg.norm(boundary.xyz[boundary.valid]-center.xyz[0], axis=1))), radius_mm)
+    return max(radius_mm*1e-4, radius_mm-np.sqrt(max(radius_mm**2-rho**2, 0.)))
 
 
 def _color_image_preview(frame, record):
@@ -44,7 +49,7 @@ def _color_image_preview(frame, record):
 
 
 def calibration_panels(frame, annotation, record=None, *, color_image=None,
-                       maximum_circle_radius_px=None):
+                       maximum_indentation_mm=None, maximum_boundary_px=None):
     record = {} if record is None else record
     display_frame = record.get('frame', frame)
     original = linear_rgb_to_bgr8(frame.linear_rgb)
@@ -52,7 +57,7 @@ def calibration_panels(frame, annotation, record=None, *, color_image=None,
     cv2.drawContours(original, contours, -1, (255, 200, 0), 1)
     original[frame.marker_image_mask] = original[frame.marker_image_mask]//2+np.array([0, 0, 100], np.uint8)
     grid = display_frame.systems.observation
-    stage = 'Reference' if display_frame.geometry_stage == 'preview_reference' else 'Final'
+    stage = 'Final' if display_frame.geometry_stage == 'final' else 'Initial'
     metrics = record.get('metrics', {})
     color = (_color_image_preview(display_frame, record) if color_image is None else color_image).copy()
     if annotation is not None:
@@ -61,23 +66,27 @@ def calibration_panels(frame, annotation, record=None, *, color_image=None,
         for image in (original, color):
             cv2.polylines(image, [boundary], True, (0, 255, 0), 2)
             cv2.drawMarker(image, center, (0, 0, 255), cv2.MARKER_CROSS, 12, 1)
+            if maximum_boundary_px is not None:
+                maximum = np.rint(maximum_boundary_px).astype(np.int32)
+                cv2.polylines(image, [maximum], True, (0, 160, 255), 1)
             if annotation.shape == 'polygon':
                 for point in annotation.contour_px:
                     cv2.circle(image, tuple(np.rint(point).astype(int)), 3, (0, 255, 255), -1)
     if 'color_residual_grid' in record:
         photo = record['photometric_valid_mask']
         color_lines = [f'{stage} UV colors | valid points: {int(photo.sum())}']
-        if stage == 'Reference':
-            color_lines.append('Approximate geometry; g recomputes final UV')
+        if stage == 'Initial':
+            color_lines.append('Current overall fit; g excludes contact markers')
         if 'sample_valid_mask' in record:
             sample = record['sample_valid_mask']
             color_lines.append(f'Paired samples: {int(sample.sum())}')
     else:
         color_lines = ['Color preview unavailable', 'g: recompute; see status below']
-    color_lines.append('Edit boundary here | wheel: radius | c: center | z: undo')
-    if maximum_circle_radius_px is not None:
-        color_lines.append(f'Circle diameter: {2*annotation.semi_axes_px[0]:.2f} px | '
-                           f'maximum: {2*maximum_circle_radius_px:.2f} px')
+    color_lines.append('Drag: contact position | wheel: depth | c: center | z: undo')
+    if maximum_indentation_mm is not None:
+        color_lines.append(f'Indentation: {annotation.indentation_depth_mm:.4f} mm | '
+                           f'maximum: {maximum_indentation_mm:.4f} mm')
+        color_lines.append('Green: contact | orange: maximum-depth footprint')
     if 'normal_gt_grid' in record:
         normal = np.rint(np.clip(.5+.5*record['normal_gt_grid'][..., ::-1], 0, 1)*255).astype(np.uint8)
         normal[~record['sample_valid_mask']] = 0
@@ -87,19 +96,22 @@ def calibration_panels(frame, annotation, record=None, *, color_image=None,
                         f"Reprojection: {metrics.get('reprojection_rms_px', 0):.3f}px",
                         f"{record['sphere_side']} root {record['sphere_root_sign']:+d}"]
     else:
-        z = grid.xyz[..., 2]
-        valid = grid.valid_mask
-        normal = np.zeros((*valid.shape, 3), np.uint8)
-        normal_lines = [f'{stage} overall depth | camera Z (mm)', 'Sphere normals not available']
-        if valid.any():
-            values = np.clip((z-z[valid].min())/max(float(np.ptp(z[valid])), 1e-6), 0, 1)
-            normal = cv2.applyColorMap(np.rint(values*255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
-            normal[~valid] = 0
-            normal_lines.append(f'Z: {z[valid].min():.3f} .. {z[valid].max():.3f} mm')
-        if stage == 'Reference':
-            normal_lines.append('preview_reference | g: recompute')
+        if 'principal_curvatures_per_mm' in record:
+            valid = record['curvature_valid_mask']
+            principal = record['principal_curvatures_per_mm']
         else:
-            normal_lines.append(f"Reprojection: {metrics.get('reprojection_rms_px', 0):.3f}px")
+            geometry = compute_surface_geometry(grid.xyz, grid.valid_mask)
+            valid, principal = geometry['valid'], geometry['principal_curvatures']
+        curvature = np.max(np.abs(principal), axis=-1)
+        normal = np.zeros((*valid.shape, 3), np.uint8)
+        normal_lines = [f'{stage} overall curvature', 'max(abs(k1), abs(k2)) | 1/mm',
+                        'Sphere normals: g recompute']
+        if valid.any():
+            maximum = max(float(curvature[valid].max()), 1e-12)
+            values = np.where(valid, curvature/maximum, 0.)
+            normal = cv2.applyColorMap(np.rint(np.clip(values, 0, 1)*255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
+            normal[~valid] = 0
+            normal_lines.append(f'Max curvature: {maximum:.5f} 1/mm')
     errors = record.get('preview_errors', [])
     if errors:
         codes = ', '.join(item.split(':', 1)[0] for item in errors)
@@ -115,73 +127,104 @@ def calibration_panels(frame, annotation, record=None, *, color_image=None,
 def annotate_images(settings, *, edit=False):
     # Import orchestration only in this adapter, never from the generic editor.
     from calibrate.utils.norm_pipeline import (FrameCalibrationError, compute_frame_colors,
-        load_manifest, load_frame_calibration_data, finalize_image)
+        load_manifest, load_frame_calibration_data, finalize_image, initial_calibration_surface)
     settings.require_sphere()
     manifest = load_manifest(settings)
     root = Path(manifest['image_root'])
     regions = load_regions(settings.annotations_file, image_root=root)
-    reference = load_frame_calibration_data(settings.work_dir/'reference_surface.npz')
+    reference = load_frame_calibration_data(settings.work_dir/'reference_surface.npz', settings)
     for entry in manifest['images']:
         if entry['status'] == 'skip':
             continue
         key = entry['key']
-        frame = load_frame_calibration_data(settings.work_dir/'prepared'/f"{entry['index']:06d}.npz")
+        frame = load_frame_calibration_data(settings.work_dir/'prepared'/f"{entry['index']:06d}.npz", settings)
         annotation = regions.get(key)
-        if annotation is not None and annotation.status in {'accepted', 'skip'} and not edit:
+        if (annotation is not None and annotation.status in {'accepted', 'skip'} and not edit
+                and (annotation.status == 'skip' or annotation.shape == 'sphere_contact')):
             continue
+        frame = initial_calibration_surface(frame, reference)
         if annotation is None:
-            yy, xx = np.nonzero(frame.surface_mask)
-            center = (float(np.median(xx)), float(np.median(yy)))
-            annotation = RegionAnnotation(key, frame.linear_rgb.shape[1::-1], center_px=center,
-                                          shape='circle', semi_axes_px=(40., 40.),
-                                          semantics='contact_boundary')
-        elif annotation.shape != 'circle':
-            # Preserve the old contact area as an initial guess for manual review.
-            if annotation.shape == 'ellipse':
-                radius = float(np.sqrt(np.prod(annotation.semi_axes_px)))
-            else:
-                area = cv2.contourArea(np.asarray(annotation.contour_px, np.float32))
-                radius = max(float(np.sqrt(area/np.pi)), 2.)
-            annotation = replace(annotation, shape='circle', semi_axes_px=(radius, radius),
-                                 angle_degrees=0., contour_px=None)
+            grid = frame.systems.geometry
+            pixels = grid.uv[grid.valid_mask]
+            if not len(pixels):
+                raise ValueError(f'{key}: reconstructed surface has no visible points')
+            center = pixels[np.argmin(np.linalg.norm(pixels-np.median(pixels, axis=0), axis=1))]
+            annotation = RegionAnnotation(key, frame.linear_rgb.shape[1::-1], center_px=tuple(center),
+                shape='circle', semi_axes_px=(40., 40.), semantics='contact_boundary')
+            depth_mm = .1*settings.sphere_radius_mm
+        elif annotation.shape == 'sphere_contact':
+            depth_mm = annotation.indentation_depth_mm
+        else:
+            depth_mm = _initial_indentation_depth(frame, annotation, settings.sphere_radius_mm)
+        contour = region_boundary_points(annotation).tolist()
+        annotation = replace(annotation, shape='sphere_contact', contour_px=contour,
+            angle_degrees=0., indentation_depth_mm=float(np.clip(depth_mm,
+                settings.sphere_radius_mm*1e-4, settings.sphere_radius_mm)))
         regions[key] = annotation
         annotation.status = 'draft'
-        initial_preview = dict(frame=frame)
+        grid = frame.systems.observation
+        geometry = compute_surface_geometry(grid.xyz, grid.valid_mask)
+        initial_preview = dict(frame=frame,
+            principal_curvatures_per_mm=geometry['principal_curvatures'], curvature_valid_mask=geometry['valid'])
         try:
             initial_preview.update(compute_frame_colors(frame, reference, settings))
         except FrameCalibrationError as error:
             initial_preview['preview_errors'] = [str(error)]
         preview_record, color_image = None, None
-        limit_frame = frame
+        contact_frame = frame
+        projector = SphereSurfaceContact(frame.surface, frame.camera, frame.systems.geometry)
+        maximum_boundary, maximum_key = None, None
 
-        def maximum_radius(region):
-            return _maximum_circle_radius_px(limit_frame, settings.sphere_radius_mm, region.center_px)
+        def update_geometry(region):
+            nonlocal maximum_boundary, maximum_key
+            contact = projector.compute(region.center_px, region.indentation_depth_mm,
+                                         settings.sphere_radius_mm, settings.side)
+            region.contour_px = contact.boundary_px.tolist()
+            cache_key = tuple(region.center_px), id(contact_frame)
+            if cache_key != maximum_key:
+                maximum_boundary = None
+                try:
+                    maximum_boundary = projector.compute(region.center_px, settings.sphere_radius_mm,
+                        settings.sphere_radius_mm, settings.side).boundary_px
+                except ValueError:
+                    # A valid shallow contact may have its maximum-depth outline outside the patch.
+                    pass
+                maximum_key = cache_key
+
+        def use_surface(record):
+            nonlocal contact_frame, projector, maximum_key, initial_preview
+            contact_frame = record['frame']
+            projector = SphereSurfaceContact(contact_frame.surface, contact_frame.camera,
+                                             contact_frame.systems.geometry)
+            maximum_key = None
+            # Editing invalidates labels, but retains colors from the latest overall fit.
+            initial_preview = {name: record[name] for name in (
+                'frame', 'color_residual_grid', 'photometric_valid_mask',
+                'principal_curvatures_per_mm', 'curvature_valid_mask') if name in record}
 
         def recompute(region):
-            nonlocal limit_frame
             try:
                 record = finalize_image(frame, reference, region, settings, diagnostic_preview=True)
             except FrameCalibrationError as error:
                 if error.preview is not None:
-                    limit_frame = error.preview['frame']
+                    use_surface(error.preview)
                 raise
-            limit_frame = record['frame']
+            use_surface(record)
             return record
 
         def panels(region, record, _status):
             nonlocal preview_record, color_image
             record = initial_preview if record is None else record
             if record is not preview_record:
-                # Geometry and colors change on recompute, not while dragging the annotation.
                 color_image = _color_image_preview(record.get('frame', frame), record)
                 preview_record = record
             return calibration_panels(frame, region, record, color_image=color_image,
-                                      maximum_circle_radius_px=maximum_radius(region))
+                maximum_indentation_mm=settings.sphere_radius_mm, maximum_boundary_px=maximum_boundary)
 
         completed = edit_regions([annotation],
             editable_panel=1, panel_widths=ANNOTATION_PANEL_WIDTHS, panel_height=ANNOTATION_PANEL_HEIGHT,
-            panel_callback=panels,
-            recompute_callback=recompute, maximum_circle_radius=maximum_radius,
+            panel_callback=panels, recompute_callback=recompute, update_geometry=update_geometry,
+            indentation_range_mm=(settings.sphere_radius_mm*1e-4, settings.sphere_radius_mm),
             save_callback=lambda: save_regions(settings.annotations_file, regions, image_root=root))
         if not completed:
             return False

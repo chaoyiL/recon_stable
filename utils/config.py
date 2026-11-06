@@ -80,6 +80,26 @@ def load_config_sections(
     return tuple(sections)
 
 
+def load_contact_surface_offset_mm(config_path: str | Path) -> float:
+    """Read the signed contact-surface offset along the marker surface normal, in mm."""
+    section = load_config(config_path).get("contact_surface")
+    if not isinstance(section, Mapping) or "offset_mm" not in section:
+        raise ConfigError("contact_surface.offset_mm 必须明确配置")
+    unknown = set(section) - {"offset_mm"}
+    if unknown:
+        raise ConfigError(f"contact_surface 包含未知字段: {sorted(unknown)}")
+    value = section["offset_mm"]
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ConfigError("contact_surface.offset_mm 必须是有限数字，单位 mm")
+    try:
+        offset = float(value)
+    except OverflowError as error:
+        raise ConfigError("contact_surface.offset_mm 必须是有限数字，单位 mm") from error
+    if not math.isfinite(offset):
+        raise ConfigError("contact_surface.offset_mm 必须是有限数字，单位 mm")
+    return offset
+
+
 def require_keys(section: Mapping[str, Any], section_name: str, *keys: str) -> None:
     missing = [key for key in keys if key not in section]
     if missing:

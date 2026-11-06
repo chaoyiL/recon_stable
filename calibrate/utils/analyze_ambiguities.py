@@ -22,7 +22,7 @@ from scipy.ndimage import convolve
 from scipy.spatial import cKDTree
 from scipy.spatial.distance import pdist
 
-from calibrate.utils.visualize_norm import _load_samples
+from calibrate.utils.visualize_norm import _check_declarations, _frame_paths, _load_samples
 from utils.normal_mapping import NormalCalibration, build_normal_lut, find_ambiguous_color_pairs, lookup_slopes_raw
 from utils.image_io import cached_linear_rgb
 from utils.region_annotations import load_regions
@@ -416,7 +416,7 @@ def _classification_figure(samples, classes, report, output):
     _save(figure, output/'branch_classification.png')
 
 
-def _spatial_context(work, samples):
+def _spatial_context(work, samples, frame_paths):
     groups = samples['image_index']
     shape = len(groups)
     context = dict(uv=np.empty((shape, 2)), radial_fraction=np.empty(shape),
@@ -426,10 +426,14 @@ def _spatial_context(work, samples):
     kernel = np.ones((3, 3))
     kernel[1, 1] = 0
     for index, name in enumerate(samples['image_paths']):
-        with np.load(work/'frames'/f'{index:06d}.npz', allow_pickle=False) as frame:
+        name = str(name)
+        group = groups == index
+        with np.load(frame_paths[name], allow_pickle=False) as frame:
             selected, valid = frame['sample_valid_mask'], frame['sphere_label_valid']
-            if (str(frame['image_key']) != name or
-                    not np.array_equal(frame['slope_grid'][selected], samples['slope_samples'][groups == index])):
+            if (str(frame['image_key']) != name
+                    or not np.array_equal(frame['slope_grid'][selected], samples['slope_samples'][group])
+                    or not np.array_equal(frame['color_residual_grid'][selected],
+                                          samples['color_residual_samples'][group])):
                 raise ValueError(f'Frame/sample mismatch: {name}')
             slopes = frame['slope_grid']
             normals = _normals(slopes)
@@ -583,7 +587,7 @@ def _examples_figure(samples, examples, output):
     return report
 
 
-def _spatial_figure(work, samples, context, regions, bad, patterns, output):
+def _spatial_figure(work, samples, frame_paths, calibration, context, regions, bad, patterns, output):
     figure = _figure((17, 7))
     axes = figure.subplots(2, int(np.ceil(len(samples['image_paths'])/2)), squeeze=False)
     for index, axis in enumerate(axes.flat):
@@ -592,7 +596,14 @@ def _spatial_figure(work, samples, context, regions, bad, patterns, output):
             continue
         name = str(samples['image_paths'][index])
         region = regions[name]
-        with np.load(work/'overall'/f'{index:06d}.npz', allow_pickle=False) as frame:
+        overall_path = work/'overall'/frame_paths[name].name
+        if not overall_path.is_file():
+            raise ValueError(f'Missing overall geometry cache for image {name}: {overall_path.name}')
+        with np.load(overall_path, allow_pickle=False) as frame:
+            if str(frame['image_key']) != name:
+                raise ValueError(f'Overall geometry cache refers to a different image: {name}')
+            _check_declarations(frame, calibration,
+                                ('coordinate_kind', 'coordinate_chart_id', 'frame_convention'))
             axis.imshow(cached_linear_rgb(frame), origin='upper', interpolation='nearest')
         points = context['uv'][(samples['image_index'] == index) & bad]
         axis.scatter(points[:, 0], points[:, 1], color='red', s=4, edgecolors='white', linewidths=.12)
@@ -749,6 +760,7 @@ def analyze_ambiguities(work_dir: str | Path, output_dir: str | Path | None = No
     hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in sources}
     model = NormalCalibration.load(work/'normal_lut.npz')
     samples = _load_samples(work/'normal_samples.npz', model)
+    frame_paths = _frame_paths(work, samples, model)
     with np.load(work/'normal_samples.npz', allow_pickle=False) as data:
         st = data['st_samples'].astype(float)
     if st.shape != (len(samples['image_index']), 2) or not np.isfinite(st).all():
@@ -759,7 +771,7 @@ def analyze_ambiguities(work_dir: str | Path, output_dir: str | Path | None = No
     bad = np.zeros(len(colors), bool)
     bad[pairs.ravel()] = True
     near_pairs = cKDTree(colors.astype(float)).query_pairs(color_distance_threshold, output_type='ndarray')
-    context, regions = _spatial_context(work, samples)
+    context, regions = _spatial_context(work, samples, frame_paths)
     patterns, near_degree, bad_degree, tilt = _pattern_statistics(samples, context, bad, pairs, near_pairs)
     classes, counts, sensitivity, examples = _neighborhoods(colors, _normals(slopes), groups, bad,
                                                            color_distance_threshold, normal_angle_threshold_degrees)
@@ -768,7 +780,7 @@ def analyze_ambiguities(work_dir: str | Path, output_dir: str | Path | None = No
         staging = Path(directory)/'report'
         staging.mkdir()
         _patterns_figure(colors, bad, patterns, staging)
-        _spatial_figure(work, samples, context, regions, bad, patterns, staging)
+        _spatial_figure(work, samples, frame_paths, model, context, regions, bad, patterns, staging)
         for example in examples.values():
             example.update(color_distance_threshold=color_distance_threshold,
                            normal_angle_threshold_degrees=normal_angle_threshold_degrees)

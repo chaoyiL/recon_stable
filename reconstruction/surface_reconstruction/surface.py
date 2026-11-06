@@ -338,3 +338,10 @@ class BicubicSurfaceAdapter:
         parameters = np.asarray(parameters, np.float64)
         return (self.model.basis(parameters, dx=1, dy=0) @ self.coefficients,
                 self.model.basis(parameters, dx=0, dy=1) @ self.coefficients)
+
+    def second_derivatives(self, parameters):
+        """Return d²Q/da², d²Q/dadb and d²Q/db² in camera coordinates."""
+        parameters = np.asarray(parameters, np.float64)
+        return (self.model.basis(parameters, dx=2, dy=0) @ self.coefficients,
+                self.model.basis(parameters, dx=1, dy=1) @ self.coefficients,
+                self.model.basis(parameters, dx=0, dy=2) @ self.coefficients)

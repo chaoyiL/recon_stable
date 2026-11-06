@@ -1,5 +1,6 @@
 """Image-space region annotations, independent of camera and contact geometry."""
 from dataclasses import asdict, dataclass
+from numbers import Real
 from pathlib import Path
 import os
 import cv2
@@ -22,9 +23,10 @@ class RegionAnnotation:
     angle_degrees: float = 0.
     contour_px: list | None = None
     semantics: str = 'region'
+    indentation_depth_mm: float | None = None
 
     def __post_init__(self):
-        if self.status not in {'draft', 'accepted', 'skip'} or self.shape not in {'circle', 'ellipse', 'polygon'}:
+        if self.status not in {'draft', 'accepted', 'skip'} or self.shape not in {'circle', 'ellipse', 'polygon', 'sphere_contact'}:
             raise ValueError('Invalid annotation status or shape')
         if (len(self.image_size) != 2 or min(self.image_size) <= 0
                 or len(self.center_px) != 2 or not np.isfinite(self.center_px).all()
@@ -33,10 +35,15 @@ class RegionAnnotation:
             raise ValueError('Invalid image size or region geometry')
         if self.shape == 'circle' and self.semi_axes_px[0] != self.semi_axes_px[1]:
             raise ValueError('A circle needs two equal semi_axes_px radii')
-        if self.shape == 'polygon':
+        if self.shape == 'sphere_contact':
+            depth = self.indentation_depth_mm
+            if isinstance(depth, bool) or not isinstance(depth, Real) or not np.isfinite(depth) or depth <= 0:
+                raise ValueError('A sphere contact needs a positive finite indentation_depth_mm')
+            self.indentation_depth_mm = float(depth)
+        if self.shape in {'polygon', 'sphere_contact'}:
             contour = np.asarray(self.contour_px, np.float64)
             if contour.ndim != 2 or contour.shape[1] != 2 or len(contour) < 3 or not np.isfinite(contour).all():
-                raise ValueError('A polygon needs at least three finite image-space vertices')
+                raise ValueError(f'A {self.shape} needs at least three finite image-space vertices')
 
 
 def load_regions(path, image_root=None):
@@ -94,6 +101,8 @@ def region_boundary_points(region: RegionAnnotation, count=BOUNDARY_SAMPLE_COUNT
         theta = 0. if region.shape == 'circle' else np.deg2rad(region.angle_degrees)
         rotation = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
         return local @ rotation.T+region.center_px
+    if region.shape not in {'polygon', 'sphere_contact'}:
+        raise ValueError(f'Unknown region shape: {region.shape}')
     polygon = np.asarray(region.contour_px, np.float64)
     edges = np.roll(polygon, -1, axis=0)-polygon
     lengths = np.linalg.norm(edges, axis=1)

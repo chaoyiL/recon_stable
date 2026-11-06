@@ -31,10 +31,6 @@ MIN_WIDTH = 2
 MAX_WIDTH = 30
 MIN_HEIGHT = 2
 MAX_HEIGHT = 30
-# Search limits must include complete cross arms, not only their centers.
-# Exclude the reflective right frame from the current camera view.
-DETECT_X_MAX = 485
-DETECT_X_MIN = 140
 
 
 def _analyze_components(gray, roi_rect):
@@ -42,17 +38,6 @@ def _analyze_components(gray, roi_rect):
     x, y, w, h = map(int, roi_rect)
     if x < 0 or y < 0 or w < 3 or h < 3 or x + w > gray.shape[1] or y + h > gray.shape[0]:
         raise ValueError("ROI must be a positive rectangle inside the image")
-    # Clip the search in source-image pixels; both X limits are inclusive.
-    right = min(x + w, DETECT_X_MAX + 1)
-    x = max(x, DETECT_X_MIN)
-    w = right - x
-    if w < 3:
-        return (
-            np.empty((0, 2), dtype=float),
-            np.empty((h, 0), dtype=np.uint8),
-            [],
-            [],
-        )
     # Compute on the full image so the ROI boundary cannot affect thresholding.
     binary = cv2.adaptiveThreshold(
         gray,
@@ -103,6 +88,15 @@ def _analyze_components(gray, roi_rect):
                 bbox=(x + left, y + top, width, height),
             )
         )
+    if len(debug) >= 8:
+        sizes = np.asarray(
+            [(item["width"], item["height"]) for item in debug], dtype=float
+        )
+        min_size = np.maximum((MIN_WIDTH, MIN_HEIGHT), 0.5 * np.median(sizes, axis=0))
+        keep = np.all(sizes >= min_size, axis=1)
+        centers = np.asarray(centers, dtype=float)[keep].tolist()
+        debug = [item for item, accepted in zip(debug, keep) if accepted]
+        components = [item for item, accepted in zip(components, keep) if accepted]
     return np.asarray(centers, dtype=float).reshape(-1, 2), crop, debug, components
 
 
@@ -115,6 +109,57 @@ class InnerRegion:
     roi: tuple[int, int, int, int]
     contour: np.ndarray
     mask: np.ndarray
+    marker_mask: np.ndarray
+
+
+def _marker_edge_margin(diagnostics):
+    """Return one typical marker dimension as a frame-edge safety margin."""
+    if len(diagnostics) < 8:
+        return None
+    sizes = np.asarray(
+        [(item["width"], item["height"]) for item in diagnostics], dtype=float
+    )
+    return int(np.ceil(np.median(sizes, axis=0).max()))
+
+
+def filter_centers_by_mask(centers, diagnostics, allowed_mask):
+    """Keep candidates whose centers lie inside an allowed image mask."""
+    centers = np.asarray(centers, dtype=float).reshape(-1, 2)
+    mask = np.asarray(allowed_mask, dtype=bool)
+    if len(diagnostics) != len(centers):
+        raise ValueError("Candidate diagnostics must match candidate centers")
+    pixels = np.rint(centers).astype(int)
+    inside = (
+        (pixels[:, 0] >= 0)
+        & (pixels[:, 1] >= 0)
+        & (pixels[:, 0] < mask.shape[1])
+        & (pixels[:, 1] < mask.shape[0])
+    )
+    keep = np.zeros(len(centers), dtype=bool)
+    indices = np.flatnonzero(inside)
+    keep[indices] = mask[pixels[indices, 1], pixels[indices, 0]]
+    return centers[keep], [item for item, accepted in zip(diagnostics, keep) if accepted]
+
+
+def _marker_search_mask(frame_mask, roi_rect, diagnostics):
+    """Erode reliable frame edges by one marker size, keeping shadow notches."""
+    margin = _marker_edge_margin(diagnostics)
+    if margin is None:
+        return None
+    x, y, w, h = map(int, roi_rect)
+    box_mask = np.zeros(frame_mask.shape, np.uint8)
+    box_mask[y : y + h, x : x + w] = 1
+    frame_mask = np.asarray(frame_mask, dtype=np.uint8)
+    contour_distance = cv2.distanceTransform(
+        frame_mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE
+    )
+    box_distance = cv2.distanceTransform(
+        box_mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE
+    )
+    # The paper contour can cave inward around marker shadows. In those pixels,
+    # use the detected frame rectangle as a fallback rather than clipping marks.
+    distance = np.where(frame_mask != 0, contour_distance, box_distance)
+    return distance > margin
 
 
 def find_inner_region(gray):
@@ -137,29 +182,40 @@ def find_inner_region(gray):
             parent = hierarchy[0, idx, 3]
             area = cv2.contourArea(contour)
             x, y, w, h = cv2.boundingRect(contour)
-            # Keep ROI discovery consistent with component detection.
-            search_x = max(x, DETECT_X_MIN)
-            search_w = min(x + w, DETECT_X_MAX + 1) - search_x
-            if search_w < 3:
-                continue
-            rect = (search_x, y, search_w, h)
+            rect = (x, y, w, h)
             if parent < 0 or not 1000 < area < 0.8 * gray.size or min(w, h) < 35:
                 continue
             if cv2.contourArea(contours[parent]) > 8 * area:
                 continue
             if rect not in candidates:
-                centers, _, _ = _detect_components(gray, rect)
+                _, _, diagnostics, _ = _analyze_components(gray, rect)
+                contour_mask = np.zeros(gray.shape, np.uint8)
+                cv2.drawContours(contour_mask, [contour], -1, 1, cv2.FILLED)
+                marker_mask = _marker_search_mask(
+                    contour_mask, rect, diagnostics
+                )
+                if marker_mask is None:
+                    continue
+                search_roi = cv2.boundingRect(marker_mask.astype(np.uint8))
+                if search_roi[2] < 3 or search_roi[3] < 3:
+                    continue
+                centers, _, local_diagnostics = _detect_components(gray, search_roi)
+                centers, local_diagnostics = filter_centers_by_mask(
+                    centers, local_diagnostics, marker_mask
+                )
                 if len(centers) >= 8:
-                    candidates[rect] = ((len(centers), -area), contour.copy())
+                    candidates[rect] = (
+                        (len(centers), -area), search_roi, contour.copy(), marker_mask
+                    )
     if not candidates:
         raise RuntimeError(
             "Paper border not found; show the complete marked region for initialization"
         )
-    roi = max(candidates, key=lambda rect: candidates[rect][0])
-    contour = candidates[roi][1]
+    candidate = max(candidates.values(), key=lambda value: value[0])
+    _, roi, contour, marker_mask = candidate
     mask = np.zeros(gray.shape, np.uint8)
     cv2.drawContours(mask, [contour], -1, 1, cv2.FILLED)
-    return InnerRegion(roi, contour, mask.astype(bool))
+    return InnerRegion(roi, contour, mask.astype(bool), marker_mask)
 
 
 
@@ -303,8 +359,12 @@ def inspect_cross_candidates(frame_linear_rgb, message=""):
     tracking_bgr = linear_rgb_to_tracking_bgr8(frame_linear_rgb)
     gray = cv2.cvtColor(tracking_bgr, cv2.COLOR_BGR2GRAY)
     try:
-        roi = find_inner_roi(gray)
+        region = find_inner_region(gray)
+        roi = region.roi
         centers, binary, diagnostics = detect_cross_centers(gray, roi)
+        centers, diagnostics = filter_centers_by_mask(
+            centers, diagnostics, region.marker_mask
+        )
         error = ""
     except (ValueError, RuntimeError, cv2.error) as exc:
         roi = None

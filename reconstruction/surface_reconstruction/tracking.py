@@ -14,9 +14,12 @@ except ImportError:  # Direct execution from this directory.
 
 
 def detect_candidates(gray):
-    roi = detector.find_inner_roi(gray)
-    centers, _, _ = detector.detect_cross_centers(gray, roi)
-    return centers, roi
+    region = detector.find_inner_region(gray)
+    centers, _, diagnostics = detector.detect_cross_centers(gray, region.roi)
+    centers, _ = detector.filter_centers_by_mask(
+        centers, diagnostics, region.marker_mask
+    )
+    return centers, region.roi
 
 
 def select_complete_grid(centers, rows, cols, direction="auto"):
@@ -99,8 +102,12 @@ class TrackingSeed:
             tracking_bgr = linear_rgb_to_tracking_bgr8(frame_linear_rgb)
         gray = cv2.cvtColor(tracking_bgr, cv2.COLOR_BGR2GRAY)
         rows, cols = require_regular_template(ids, xy)
-        roi = detector.find_inner_roi(gray) if region is None else region.roi
-        centers, _, _ = detector.detect_cross_centers(gray, roi)
+        region = detector.find_inner_region(gray) if region is None else region
+        roi = region.roi
+        centers, _, diagnostics = detector.detect_cross_centers(gray, roi)
+        centers, _ = detector.filter_centers_by_mask(
+            centers, diagnostics, region.marker_mask
+        )
         pixels, meta = select_complete_grid(centers, rows, cols, direction)
         return cls(ids.copy(), pixels, gray), roi, meta
 

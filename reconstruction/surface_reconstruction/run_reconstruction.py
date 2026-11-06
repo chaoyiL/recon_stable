@@ -178,8 +178,11 @@ class SurfaceReconstructionSession:
 class SurfaceReconstructionProvider:
     """Sample every frame through one frozen reference coordinate chart."""
 
-    def __init__(self, config_path=ROOT / 'config.json', row_direction='auto'):
+    def __init__(self, config_path=ROOT / 'config.json', row_direction='auto', *, contact_offset_mm=0.0):
         self.session = SurfaceReconstructionSession(config_path, row_direction)
+        self.contact_offset_mm = float(contact_offset_mm)
+        if not np.isfinite(self.contact_offset_mm):
+            raise ValueError('Contact-surface offset must be finite')
         self.last_frame_result = None
         self.coordinate_chart = None
         self.coordinate_chart_file = None
@@ -224,6 +227,9 @@ class SurfaceReconstructionProvider:
         except ImportError:
             from surface import BicubicSurfaceAdapter
         surface = BicubicSurfaceAdapter(self.session.model, coefficients)
+        if self.contact_offset_mm != 0:
+            from utils.surface_geometry import OffsetSurface
+            surface = OffsetSurface(surface, self.contact_offset_mm)
         if self.coordinate_chart is None:
             self.bind_coordinate_chart(build_arclength_chart(surface))
         chart = self.coordinate_chart
@@ -401,6 +407,39 @@ def save_points(writer, index, timestamp, segment, result, points, xy):
         )
 
 
+def snapshot_image(combined, viewer, coeff):
+    """Append camera-coordinate center and depth readings to a rendered frame."""
+    parameters = viewer.uv
+    center_parameter = (parameters.min(axis=0) + parameters.max(axis=0)) * 0.5
+    sampled_xyz = viewer.basis @ coeff
+    center_xyz = (viewer.model.basis(center_parameter[None, :]) @ coeff)[0]
+    camera_z = sampled_xyz[:, 2]
+    band_height = 56
+    image = np.full(
+        (combined.shape[0] + band_height, combined.shape[1], 3), 247, dtype=np.uint8
+    )
+    image[:combined.shape[0]] = combined
+    lines = (
+        f"Template parameter center X/Y=({center_parameter[0]:.2f}, {center_parameter[1]:.2f}) mm | "
+        f"Camera XYZ=({center_xyz[0]:.2f}, {center_xyz[1]:.2f}, {center_xyz[2]:.2f}) mm | "
+        f"distance to camera origin={np.linalg.norm(center_xyz):.2f} mm",
+        f"Camera Z depth: center={center_xyz[2]:.2f} mm | "
+        f"SurfaceView sampled grid min={camera_z.min():.2f} mm, max={camera_z.max():.2f} mm",
+    )
+    for row, line in enumerate(lines):
+        cv2.putText(
+            image,
+            line,
+            (12, combined.shape[0] + 21 + row * 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.43,
+            (35, 35, 35),
+            1,
+            cv2.LINE_AA,
+        )
+    return image
+
+
 def run(args):
     session = SurfaceReconstructionSession(args.config, args.row_direction)
     config, ids, xy = session.config, session.ids, session.xy
@@ -419,6 +458,7 @@ def run(args):
     viewer = SurfaceView(model, *expected)
     basename = Path(source).stem if not is_camera else "camera_" + str(source)
     output = unique_output(args.out or ROOT / "output" / basename)
+    snapshot_path = output / "surface_snapshot.png" if args.snapshot else None
     marker_dir = ROOT / "marker_detection" / output.name
     if not is_image and not args.no_record:
         marker_dir.mkdir(parents=True, exist_ok=False)
@@ -448,6 +488,7 @@ def run(args):
     segment = 0
     fps_smooth = 0.0
     count = 0
+    snapshot_saved = False
     metrics = []
     start = time.perf_counter()
     last_index = 0
@@ -575,6 +616,15 @@ def run(args):
                         )
                     video_writer.write(combined)
                     marker_writer.write(overlay)
+                if (
+                    snapshot_path is not None
+                    and coeff is not None
+                    and info["status"] != "ambiguous"
+                ):
+                    snapshot = snapshot_image(combined, viewer, coeff)
+                    if not cv2.imwrite(str(snapshot_path), snapshot):
+                        raise OSError(f"Cannot write snapshot PNG: {snapshot_path}")
+                    snapshot_saved = True
                 key = -1
                 if args.preview or (is_camera and not args.no_preview):
                     cv2.imshow("Surface reconstruction | Esc: exit | R: reacquire", combined)
@@ -617,8 +667,17 @@ def run(args):
                     )
                 if key == 27:
                     break
+                if snapshot_saved:
+                    break
                 if key in (ord("r"), ord("R")):
                     session.reset()
+            if snapshot_path is not None and not snapshot_saved:
+                if count == 0:
+                    raise ValueError("Snapshot requested, but no decodable frames were received")
+                raise ValueError(
+                    "Snapshot requested, but no valid non-ambiguous reconstruction was found "
+                    f"in {count} frame(s)"
+                )
             if count == 0:
                 raise ValueError("No decodable frames")
             summary["complete"] = True
@@ -662,6 +721,8 @@ def run(args):
         )
     )
     print(f"Results: {output}\nMarkers: {marker_dir}")
+    if snapshot_saved:
+        print(f"Snapshot: {snapshot_path}")
     return summary
 
 
@@ -670,6 +731,10 @@ def main():
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--video", help="Video file, linear frame directory, or camera index (default from config)")
     source.add_argument("--image", help="Single image; no reference image required")
+    parser.add_argument(
+        "--snapshot", action="store_true",
+        help="Save the first valid reconstruction as surface_snapshot.png in the output directory",
+    )
     parser.add_argument("--config", type=Path, default=ROOT / "config.json")
     parser.add_argument("--out", type=Path)
     parser.add_argument("--max-frames", type=int)

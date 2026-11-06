@@ -2,17 +2,21 @@
 
 核对日期：2026-11-03。压球图片标定的算法和文件契约见 [cali_norm_plan.md](cali_norm_plan.md)。
 
+2026-11-06 更新：`physical_model/` 与 `sim2real_trial/` 两条光场路线已暂时废弃。代码、配置和历史产物仅在本地保留，整目录加入 Git 忽略并移出跟踪，相关包、CLI 和专用 GPU 可选依赖不再注册。它们不属于下述当前标定与重建主链路。
+
 ## 1. 主链路与坐标约定
 
 ```text
-底色图 → 黑框内部轮廓/marker → 参考整体曲面 → 冻结参考弧长图
+底色图 → 黑框内部轮廓/marker → 参考 marker 曲面 → 法向等距偏移 → 冻结接触面参考弧长图
                                                ↓
-压球图 → 从参考图恢复 ID → 只跟踪 → 标注接触边界 → 排除接触 marker 后拟合
+压球图 → 从参考图恢复 ID → 整体拟合及曲率 → 位置/深度标注 → 排除接触 marker 后拟合
+                                               ↓
+                              marker 曲面法向等距偏移 → 当前接触面
                                                ↓
 规则 st → 同一个参考弧长图反解 → 原生 a,b → 当前/参考 XYZ 和各自 UV
                                                ↓
 入口读取线性 RGB → 两张图分别采样 → 有符号曲面域色差
-接触边界 + 最终整体曲面 + 真实球半径/侧 → 球心 → 同 UV 射线的固定球冠 → 法向/坡度
+位置/深度 + 最终整体曲面 + 真实球半径/侧 → 球心及接触交线 → 同 UV 射线的固定球冠 → 法向/坡度
                                                ↓
 统一有效索引配对 → 整张图片留出验证 → 通过后发布最终 LUT
 ```
@@ -25,9 +29,13 @@
 
 弧长图从 129² 原生网格开始积分，加密至 257²、513²、1025²；收敛和每个 cell 的正 Jacobian 均通过才接受。正向插值和二维 Newton 逆解共用同一表达式。坐标图 UUID 随文件保存/加载保持不变，当前形变不会重新定义材料身份。
 
+图片法向标定和完整重建使用 `contact_surface.offset_mm` 指定的接触面。对 marker 曲面 `Q(a,b)`，单位法向 `n = (Q_a × Q_b)/|Q_a × Q_b|`，接触面为 `Q_contact = Q + d n`，其中 `d` 单位 mm，当前配置为 7。正方向与材料网格列×行法向一致；负数反向，零表示不偏移。参考弧长、XYZ、UV、球边界反投影及局部重建均由接触面计算。独立整体重建和 `get-surface` 仍输出 marker 下曲面。
+
+几何缓存、样本、LUT 和冻结材料网格记录 `contact_offset_mm`；调整距离后须从 `prepare` 开始重新标定，旧产物不可混用。当前旧法向标定缓存和 LUT 已清除，原始图片及人工标注保留。
+
 ## 2. 黑框区域与整体重建
 
-`get-surface` 和图片标定均直接使用 `markers.find_inner_region` 返回的 `InnerRegion(roi, contour, mask)`，不初始化独立分割后端。mask 填充实际内部轮廓，包含黑色 marker；`DETECT_X_MIN / DETECT_X_MAX` 仅将 marker 搜索框限制在原图横坐标的闭区间内，不裁剪胶皮 mask。两个常量可在 `markers.py` 中调整，输出的十字中心和连通域仍使用原图坐标。旧 `find_inner_roi` 仍返回矩形。
+`get-surface` 和图片标定均直接使用 `markers.find_inner_region` 返回的 `InnerRegion(roi, contour, mask, marker_mask)`，不初始化独立分割后端。mask 填充实际内部轮廓，包含黑色 marker；marker 搜索使用根据黑框距离与实际十字尺寸得到的独立 `marker_mask`，排除边框反光并保留阴影内凹处的标记。搜索不再使用固定图像横坐标，输出的中心和连通域仍使用原图坐标。旧 `find_inner_roi` 仍返回搜索矩形。
 
 `SurfaceReconstructionSession.process(frame, fit=False)` 只推进跟踪，不拟合、不累计拟合失败。`fit_observations` 读取已有观测，按接触排除区修改 `marker_fit_valid`，保留跟踪位置供光度屏蔽。每张独立照片重新从同一底色图初始化；重复调整标注使用同一缓存。
 
@@ -50,7 +58,7 @@ uv run get-surface --image input.png --output overall_surface.npz \
   --coordinate-reference assets/normal_calibration/reference_coordinates.npz
 ```
 
-未指定参考图时，首个有效曲面建立坐标图，另存为 `<output_stem>_coordinates.npz`。本批次局部重建应复用标定时的坐标图。
+未指定参考图时，首个有效曲面建立坐标图，另存为 `<output_stem>_coordinates.npz`。完整局部重建使用标定时建立的接触面坐标图；独立 `get-surface` 输出仍是 marker 曲面。
 
 ## 3. 图片标定命令
 
@@ -93,46 +101,30 @@ CLI 还可使用 `--images`、`--reference-image`、`--sphere-radius-mm`、`--sp
 uv run calibrate-norm --input external_samples.npz --output external_lut.npz
 ```
 
-只有 `color_residual_samples(N×3)` 和 `slope_samples(N×2)` 的外部样本输出标记为 `unvalidated_external_samples`。缺少新坐标声明的旧 LUT 不能直接用于 `reference_arclength` 输入。
+外部样本须包含 `color_residual_samples(N×3)`、`slope_samples(N×2)` 和与配置一致的 `contact_offset_mm`；输出标记为 `unvalidated_external_samples`。缺少接触面或坐标声明的旧 LUT 不能直接用于 `reference_arclength` 输入。
 
 ### 标注操作
 
-三个面板显示原图与 marker 屏蔽、曲面色差与 sample mask、整体曲面深度预览或球面法向/拟合误差。直接在中间色差图上编辑绿色接触轮廓和红色圆心，左侧原图同步显示轮廓供对照；鼠标编辑只作用于中间面板。进入标注即显示基于参考曲面 UV 的近似色差，标记为 `Reference UV colors`；按 `g` 后改用重拟合曲面的 UV，标记为 `Final UV colors`。面板列出有效颜色点和配对样本数。色差图的显示缩放及面板偏移显式转换回原图像素坐标。
+三个面板显示原图与 marker 屏蔽、投影回原图的曲面色差、整体曲面主曲率或球面法向。初始色差使用当前压球图实际整体重建的 UV（`Initial UV colors`）；按 `g` 后使用排除接触 marker 后的最终 UV。右图初始显示 `max(|k1|,|k2|)`（mm⁻¹），球面标签通过后显示 RGB 编码的相机 XYZ 法向。
 
-右侧在球面法向尚未算出时显示整体曲面的相机深度 `Z`（mm）：按当前有效区域的最小、最大 Z 映射为 VIRIDIS 颜色，深紫色较近、黄色较远；每张图单独归一化，不能跨图直接比较颜色。`Reference overall depth` 使用准备阶段的参考曲面，`Final overall depth` 使用按当前标注重拟合的整体曲面。球面拟合成功后切换为 `Sphere normals`：RGB 分别编码相机坐标系的 `nx / ny / nz`，分量从 `[-1,1]` 映射到 `[0,255]`；黑色为未参与配对的样本区域。该图来自球面几何标签，不是 LUT 预测、置信度或局部位移。右图使用材料采样网格行列，不是原图像素坐标。编辑圆后清除旧球面标签，恢复参考深度预览；按 `g` 重新计算。
-
-标注窗口使用 Matplotlib 的 PyQt5 画布，禁用导航工具和画面缩放。三栏显示宽度依次为 640、960、280 像素，图像区高度为 720 像素；左侧原图和中间色差图等比例显示，右侧预览紧凑排列，说明文字在上方换行。说明文字和状态栏采用 22 像素字号、30 像素行距，使用独立字体图层按窗口实际分辨率绘制；不再先把小字画进源图后随图像插值放大。文字按实际字宽换行，底部预留四行状态区。窗口初始大小适配屏幕，可手动调整；鼠标位置仍按固定图像坐标转换，滚轮仅修改中间面板内的标注圆半径。标注只在窗口预览，保存动作仅写入标注 YAML。首次安装新增 GUI 依赖时运行 `uv sync`。
-
-使用 Conda 或其他已激活环境时，依赖必须安装到实际运行程序的 Python 中；`uv sync` 默认管理项目 `.venv`，不会自动同步其他环境。可用 `python -c "import sys; print(sys.executable)"` 确认解释器。在该环境安装 PyQt5 后，可直接运行 `python -m calibrate.calibrate_norm --config config.yaml --stage annotate` 继续标注，无需重新 prepare。
-
-中间面板按当前预览几何的 UV 将曲面色差及 sample mask 映射回原图像素坐标。各面板分别等比例缩放，鼠标位置按中间面板的偏移与缩放换算回原图，保存的轮廓仍使用原图像素坐标。投影外、无效颜色和 marker 区域显示为黑色。该反投影仅用于显示，训练仍使用材料网格中的原始色差和有效 mask；编辑轮廓时复用色差预览，重算几何后刷新。
+在中间色差图拖动绿色轮廓，移动压入轴与整体曲面的交点；滚轮每格改变 `0.01R` mm 的压入量。每次编辑实时计算球与重建曲面的交线并含畸变投影，轮廓可非圆。球心为 `C=A+sigma*(R-d)*n0`，其中 A 是选点的曲面逆投影、n0 为曲面单位法向、sigma 为配置侧别。最大压入量是球半径 R，允许 `d=R`；编辑下限 `1e-4R` 避免零面积接触。面板显示当前/最大压入量，橙线显示能完整投影时的最大深度轮廓。模型沿用零边界位移假设，平面情形退化为半径 `sqrt(2Rd-d²)` 的空间圆。
 
 | 操作 | 行为 |
 |---|---|
-| 在中间色差图拖动圆内部 / 圆周 | 平移圆心 / 调整半径，始终保持圆形且不超过物理尺寸上限 |
-| 中间色差图内使用鼠标滚轮 | 在物理上限内调整圆半径，不缩放画面；其他面板和空白区域不响应 |
-| `c` 后点击中间色差图 | 设置圆心，同时作为接触区内部代表点 |
-| `z` | 撤回当前图片的上一步编辑，可连续撤回；完整拖动算一步 |
-| `g` | 用当前标注重新计算最终几何、背景检查和球面标签 |
+| 拖动绿色轮廓内部或边缘 | 移动接触位置并实时更新形状 |
+| 中间面板滚轮 | 调整法向压入量，裁到允许范围 |
+| `c` 后点击 | 设置接触锚点 |
+| `z` | 撤回；完整拖动算一步 |
+| `g` | 重新拟合整体曲面，检查背景和球面标签 |
 | `Enter` | 重算通过后接受并继续 |
-| `x` | 跳过图片 |
-| `Esc` 或关闭窗口 | 保存 draft 并退出；再次运行 annotate 续标 |
+| `x` | 跳过 |
+| `Esc` 或关闭 | 保存草稿并退出 |
 
-标定默认使用原图像素空间中的圆形接触边界，`shape: circle`，`semi_axes_px` 的两个数值均为半径；拖动和缩放都不能改变为椭圆，`a / d / p` 在圆形模式下不生效。球面标签继续通过相机投影和真实球半径计算。
+保留原三栏大小、字号与等比例显示；鼠标按面板偏移和缩放转换到原图像素。只写标注 YAML，不自动保存检查图片。形状由球—曲面相交决定，不提供手调半径或顶点。无效编辑回退并显示原因，过期结果不能接受。
 
-标注圆直径受真实球尺寸限制。这里“最高深度”指有效整体曲面的最大正相机深度 `Z_max`（mm），不是离相机最近的点。令球半径为配置中的 `R`（mm）、标注圆心为原图像素 `c`，将圆心相机射线与 `Z=Z_max` 平面相交得到 `C`。在该平面投影球的最大截面：对 128 个均匀角度计算 `q(theta) = C + R * (cos(theta), sin(theta), 0)`，上限为 `r_max = min ||project(q(theta)) - c||`（pixel）。`project` 使用相机内参和畸变；无畸变时简化为 `D_max = 2 * min(fx, fy) * R / Z_max`，圆形标注采用较小方向的投影尺度。这个尺寸约束使用平行于成像平面的最大截面，不替代后续球面拟合验收。
+标注 YAML v2 新增 `shape=sphere_contact`、`indentation_depth_mm`，`center_px` 为整体曲面上的压入锚点投影，`contour_px` 为计算轮廓。旧圆/椭圆/多边形仍能读，打开时保留中心并估计初始深度，须在新流程重新确认。新格式 accepted 默认复用，`--edit` 可重开。图片 key 为相对 `image_root` 的完整路径。
 
-初始使用 prepared 曲面，重算后使用最近一次得到的最终曲面；移动圆心时重新计算畸变对尺寸的影响。面板显示当前直径和最大直径。新圆、重新打开的旧圆、拖动、滚轮与撤回均限制在上限内。若重算后上限变小，自动收缩并清除过期预览，再次重算通过才能接受；没有有效正深度时报错，不使用默认上限。未打开的 accepted/skip 标注保持不变。
-
-旧椭圆或多边形标注仍可读取；在 annotate 中重新打开该图片时，保留圆心位置并以等面积圆作为编辑初值（多边形转换的最小半径为 2 px），重新确认后保存。已接受或跳过的图片需用 `--stage annotate --edit` 打开；不会批量改写未打开的旧标注。
-
-撤回支持圆心平移、半径调整、滚轮调整半径和中心设置。撤回后按 `g` 重算预览；中心选择尚未点击时，`z` 先取消选择。历史仅保留在当前图片本次编辑过程中。
-
-标注 YAML v2 使用统一 `image_root` 下的完整相对图片路径，支持不同目录同名图片。标注语义固定为 `contact_boundary`。修改标注后从 samples 重跑；相机、模板或参考坐标图变化后重新 prepare。
-
-重算未通过时，保留已经计算出的色差和几何预览，并标记 `REJECTED`。标注模式下，即使背景检查失败，也会继续尝试计算球面法向供诊断；球面失败时右侧显示最终整体深度和失败原因。窗口底部及终端均输出失败详情，标注保存为 draft，`Enter` 不会接受失败图片。诊断预览不能导出为训练样本，原有验收阈值保持不变。
-
-`background_mismatch` 消息同时显示实测值和阈值；需检查接触边界、参考图及拍摄条件。修改轮廓或撤回后，清除上次重算结果并恢复参考曲面下的近似色差，按 `g` 再次重算。鼠标编辑产生的 NumPy 数值在保存时转换为普通 YAML 数值。
+最终重算保持原图锚点和深度不变，重复“生成轮廓 → 外扩 20 px 排除 marker → 拟合 → 更新轮廓”，直到输入拟合的 marker 排除集合稳定，最多 6 次；不收敛拒绝。颜色、球心、轮廓与标签来自同一最终曲面。`REJECTED` 诊断预览只供检查，不能导出训练样本。修改后从 samples、fit 重跑；相机、模板或参考坐标图变化后重跑 prepare。
 
 ## 4. 颜色、球面标签与 LUT 验证
 
@@ -212,9 +204,9 @@ uv run calibrate-norm --config config.yaml --stage fit
 
 直接对入口提供的线性 RGB 分别按各自 UV 做严格四邻域双线性采样，最后计算 `observed-reference`。标注重算和样本生成不重复解码整图。保留三通道正负号，不给 marker 补色。几何 mask 保留 marker 材料位置，光度 mask 表示两侧颜色都有效。
 
-边界按 128 点采样；标签直接使用标注圆盘，不缩小半径或内缩边界，外扩 20 px 仅用于排除整体拟合和背景统计。UV 三角形提供原生参数初值，再在归一化原生参数中优化反投影。边界至少 96 点有效且连续缺失不超过 32 点；多解拒绝。
+中心通过 UV 三角形给出参数初值后唯一逆投影。球—曲面交线使用 128 个参数方向采样、向量化变号搜索及二分求根；截断、多次交叉或退化投影拒绝。有限采样仅支持可辨认的单个星形接触区。标签使用完整最终接触轮廓，不内缩，外扩 20 px 仅用于拟合与背景统计。
 
-固定真实半径，用带鲁棒损失的优化拟合球心。先在中心射线选择唯一球冠分支，再将 minus/plus 分支锁定整张图片。每个颜色点沿同一个当前 UV 的射线求真实球面交点，法向转换成共用局部基的坡度。
+球心由真实半径、位置和法向压入量直接构造。先在中心射线选择唯一球冠分支，再将 minus/plus 分支锁定整张图片。每个颜色点沿同一个当前 UV 的射线求真实球面交点，法向转换成共用局部基的坡度。
 
 最终只用同一个 sample mask 提取颜色、坡度、st、原生参数和图片索引。
 
@@ -271,6 +263,8 @@ uv run python -m calibrate.analyze_ambiguities \
 
 默认输出到本批目录的 `ambiguity_analysis/`：PNG 展示统计规律、原图中的不良点、局部 p/q 分支、外围分支支撑及改进实验；`analysis.json` 记录定义、源文件哈希和完整统计，`samples.csv` 保存逐点诊断。颜色图统计不良点比例，不使用红点数量代替风险；另记录每个近色邻居的冲突比例，避免混淆样本密度与歧义。
 
+分析通过 `image_key` 匹配逐图样本和 `frames/`、`overall/` 缓存。缓存文件名沿用原始图片序号，跳过部分标定图时允许出现编号空缺。
+
 局部颜色球以不良点为中心、RGB 距离为半径，因此不同球可以重叠，分类数不代表独立板块数。原颜色球的连通分量描述保留在 `neighbourhood_classification`：法向图用 ≤10° 的边连接样本，并记录 7.5°、10°、15° 连边阈值的敏感性；其中少于 6 点只描述原颜色球内的数量。正式的“主支撑簇／多分支重叠”分类使用下面的外围扩展证据，不以原颜色球点数停止分析。
 
 少于 6 点只描述原颜色球内的数量，不停止分析或删除样本。对全部冲突对，继续以两端色差中点查询 2、3、4 倍色差阈值的外围邻域，并排除两端各自的原颜色球，防止冲突点和原邻域给自身提供支撑。分别记录外围法向与两端法向相差 ≤原法向阈值一半的点数、图片数、其他图片数、最近色差距离和外围最小法向差。`branch_continuation.csv` 保存全部逐对、多尺度证据，`branch_continuation.png` 展示两支都有外围支撑和仅一支有支撑的实例。此处用已知端点法向追踪候选分支，不是无偏预测验证；外围没有支撑也不自动等于错点，可能是覆盖不足或分支变化快。
@@ -299,6 +293,8 @@ uv run python -u -m calibrate.compare_mixed_norm --config config.yaml
 
 ## 5. 输出与缓存契约
 
+原始拍照文件保存在 `assets/cali_norm_pics/`，法向标定的缓存、标注、样本、LUT 和诊断报告集中在 `assets/normal_calibration/`。重建读取同一目录的 LUT 和采样网格；扫描照片时排除产物目录，避免递归匹配缓存。
+
 ```text
 assets/normal_calibration/
   manifest.json
@@ -323,8 +319,8 @@ assets/normal_calibration/
 | 文件 | 关键内容 |
 |---|---|
 | 坐标图 v1 | UUID、原生轴/范围、累计弧长、行列总长和 st 表，float64，只保存数组 |
-| 几何 v3 | 三套 XYZ/UV/coordinates/st/mask、16×3 系数、相机、模板、`observed_linear_rgb` 浮点整图/区域、marker 观测与尺寸、颜色声明、拟合信息和 geometry_stage；旧 v2 的 BGR 仅在加载时解码 |
-| prepared | `geometry_stage=preview_reference`，可从观测重算；不允许直接训练 |
+| 图片标定几何 v4 | 接触面的三套 XYZ/UV/coordinates/st/mask、marker 曲面 16×3 系数、`contact_offset_mm`、相机、模板、`observed_linear_rgb` 浮点整图/区域、marker 观测与尺寸、颜色声明、拟合信息和 geometry_stage；旧缓存须重新 prepare |
+| prepared | `geometry_stage=initial`，当前观测整体拟合；不允许直接训练 |
 | overall | `geometry_stage=final`，含 `marker_fit_valid` 和最终系数 |
 | frames | 最终 XYZ/UV/st/原生参数、参考/当前颜色和有符号差、几何/光度/sample mask、球面坡度/法向/球心/根分支与诊断 |
 | 样本 v1 | 逐点颜色、坡度、图片分组、st/原生参数、局部法向与切向基，参考背景和几何模型 |
@@ -389,8 +385,9 @@ uv run local-recon --view assets/reconstruction/pc/000000_local_result.npz
 分别累加行、列相邻有效 XYZ 的三维距离，并取各条曲线长度的中位数作为代表宽度与高度；
 缺失段按同条曲线的可见平均步长估算。该比例用于整个显示框，不表示弯曲曲面能严格无失真地展开到平面。
 
-完整重建和独立局部重建默认只将结果 NPZ 保存到 `reconstruction.output_dir/pc/`，目录自动创建。
-显式 `--output` 指定结果路径；加 `--show` 打开窗口，不自动保存预览 PNG。已有结果可直接查看：
+完整重建和独立局部重建默认将结果 NPZ 保存到 `reconstruction.output_dir/pc/`，目录自动创建。
+完整重建同时在 `assets/reconstruction/pics/` 保存与 NPZ 同名的预览 PNG；独立局部重建默认不保存预览图片。
+显式 `--output` 指定结果路径；加 `--show` 打开窗口。已有结果可直接查看：
 
 ```bash
 uv run local-recon --view assets/reconstruction/pc/000000_local_result.npz
@@ -412,7 +409,7 @@ uv run recon --image input.png --output assets/reconstruction/pc/result.npz --sh
 
 配置段 `reconstruction` 指定 `reference_image`、`material_grid_file`、`output_dir` 和 `match_surface_aspect`。
 程序用参考图固定 marker ID，独立拟合当前曲面，按与 LUT 配套的材料网格分别采样两张图，
-然后调用相同的局部求解和保存函数。默认只在 `output_dir/pc/` 保存 `<图片名>_local_result.npz`，不生成检查 PNG 或中间输入包。
+然后调用相同的局部求解和保存函数。默认在 `output_dir/pc/` 保存 `<图片名>_local_result.npz`，在 `assets/reconstruction/pics/` 保存同名 PNG，不生成中间输入包。
 相机、模板、材料身份及颜色约定不一致时拒绝使用；不自动训练或替换 LUT。
 
 `assets/normal_calibration/lut_material_grid.npz` 随图片法向标定的最终 LUT 更新，
@@ -451,7 +448,8 @@ uv run recon --image input.png --output assets/reconstruction/pc/result.npz --sh
 | `utils/surface_sampling.py` | 精度保持的四邻域采样和解析 Jacobian |
 | `utils/surface_coordinates.py` | 弧长积分、冻结坐标图、正反解与多分辨率缓存 |
 | `utils/surface_projection.py` | 相机、投影、射线与唯一曲面逆投影 |
-| `utils/sphere_geometry.py` | 固定半径球拟合、双根求交和球冠选择 |
+| `utils/sphere_geometry.py` | 双根求交和球冠选择 |
+| `utils/sphere_contact.py` | 位置/深度驱动球—曲面交线及相机投影 |
 | `utils/region_annotations.py` | 通用区域数据、YAML、边界和 mask |
 | `utils/annotation_editor.py` | 仅依赖回调的通用编辑器 |
 | `utils/annotation_window.py` | 固定图像范围的标注窗口，屏蔽导航缩放并转换鼠标与键盘事件 |

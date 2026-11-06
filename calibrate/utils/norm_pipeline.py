@@ -9,20 +9,21 @@ import json
 import math
 import os
 import numpy as np
-from utils.config import load_config
-from utils.image_io import cached_linear_rgb, load_linear_image, validate_linear_rgb
+from utils.config import load_config, load_contact_surface_offset_mm
+from utils.image_io import load_linear_image, validate_linear_rgb
 from utils.surface_coordinates import (ArcLengthChart, COORDINATE_KIND, FRAME_CONVENTION, load_arclength_chart,
                                        save_arclength_chart, build_material_sampling_grid)
-from utils.surface_geometry import (ParametricSurface, compute_surface_geometry, normals_to_local_slopes,
+from utils.surface_geometry import (OffsetSurface, ParametricSurface, compute_surface_geometry, normals_to_local_slopes,
                                     local_slopes_to_normals)
-from utils.surface_projection import CameraModel, invert_surface_projection, unproject_rays
-from utils.surface_sampling import (bilinear_sample, sample_mask_to_surface,
+from utils.surface_projection import CameraModel, unproject_rays
+from utils.surface_sampling import (sample_mask_to_surface,
                                     sample_linear_rgb_to_surface)
-from utils.sphere_geometry import (fit_sphere_center, intersect_sphere_rays, select_sphere_cap,
+from utils.sphere_geometry import (intersect_sphere_rays, select_sphere_cap,
                                    sphere_normals)
+from utils.sphere_contact import SphereSurfaceContact
 from utils.color_difference import (CAMERA_RGB_TRANSFER_FUNCTION,
                                     require_camera_rgb_transfer, signed_color_difference)
-from utils.region_annotations import BOUNDARY_SAMPLE_COUNT, load_regions, region_boundary_points, region_masks
+from utils.region_annotations import load_regions, region_masks
 from utils.reconstruction_interface import (load_material_coordinate_specs, MaterialCoordinateMap,
                                             MaterialCoordinateSystems)
 from utils.normal_mapping import NormalCalibration, build_normal_lut, lookup_slopes_raw
@@ -32,8 +33,7 @@ from reconstruction.surface_reconstruction.markers import InnerRegion, marker_re
 
 
 CONTACT_OUTER_MARGIN_PX = 20
-MINIMUM_BOUNDARY_VALID_COUNT = 96
-MAXIMUM_BOUNDARY_MISSING_RUN = 32
+MAXIMUM_CONTACT_FIT_ITERATIONS = 6
 
 
 class FrameCalibrationError(ValueError):
@@ -58,6 +58,7 @@ class CalibrationSettings:
     input_file: Path
     output: Path
     annotations_file: Path
+    contact_offset_mm: float
     images: tuple[str, ...] = ()
     reference_image: Path | None = None
     image_root: Path | None = None
@@ -73,6 +74,8 @@ class CalibrationSettings:
     maximum_out_of_range_fraction: float = .05
 
     def __post_init__(self):
+        if not np.isfinite(self.contact_offset_mm):
+            raise ValueError('contact_surface.offset_mm must be finite')
         positive = (self.maximum_rms_angle_degrees, self.validation_rms_degrees)
         if not np.isfinite(positive).all() or min(positive) <= 0 or self.lut_size < 2:
             raise ValueError('Invalid LUT settings')
@@ -114,6 +117,7 @@ def parse_settings(config_path, overrides=None):
         input_file=_path(raw.get('input_file') or work/'normal_samples.npz', base, 'input_file'),
         output=_path(raw.get('output') or work/'normal_lut.npz', base, 'output'),
         annotations_file=_path(raw.get('annotations_file') or work/'manual_regions.yaml', base, 'annotations_file'),
+        contact_offset_mm=load_contact_surface_offset_mm(config_path),
         images=patterns, reference_image=_path(reference, base, 'reference_image') if reference else None,
         sphere_radius_mm=raw.get('sphere_radius_mm'), sphere_side=raw.get('sphere_side'),
         boundary_model=raw.get('boundary_model'),
@@ -167,6 +171,7 @@ class FrameCalibrationData:
     marker_image_mask: np.ndarray
     coefficients: np.ndarray
     surface: ParametricSurface
+    contact_offset_mm: float
     camera: CameraModel
     chart: ArcLengthChart
     chart_file: Path
@@ -190,10 +195,12 @@ def _provider_from_frame(frame):
     session.tracker = None
     provider = SurfaceReconstructionProvider.__new__(SurfaceReconstructionProvider)
     provider.session = session
+    provider.contact_offset_mm = frame.contact_offset_mm
     provider.coordinate_chart = frame.chart
     provider.coordinate_chart_file = frame.chart_file
     provider.last_frame_result = dict(tracking=frame.tracking,
-        inner_region=InnerRegion((0, 0, *session.expected_size), np.empty((0, 1, 2), int), frame.surface_mask),
+        inner_region=InnerRegion((0, 0, *session.expected_size), np.empty((0, 1, 2), int),
+                                 frame.surface_mask, frame.surface_mask),
         coefficients=frame.coefficients, info=frame.fit_info)
     return provider
 
@@ -214,28 +221,50 @@ def _save_frame(path, frame):
         metadata=dict(image_key=frame.image_key, image_index=frame.image_index, source_image=str(frame.source_image)))
     with np.load(path, allow_pickle=False) as data:
         values = {key: data[key] for key in data.files}
+    grid = frame.systems.observation
+    geometry = compute_surface_geometry(grid.xyz, grid.valid_mask)
+    values.update(principal_curvatures_per_mm=geometry['principal_curvatures'].astype(np.float32),
+                  curvature_valid_mask=geometry['valid'])
     values.update(reference_marker_sizes=np.asarray(frame.reference_marker_sizes, np.float64),
                   marker_image_mask=np.asarray(frame.marker_image_mask, bool),
-                  solver_options=np.asarray(json.dumps(frame.solver_options)))
+                  solver_options=np.asarray(json.dumps(frame.solver_options)),
+                  format_version=np.asarray(4, np.int32),
+                  contact_offset_mm=np.asarray(frame.contact_offset_mm, np.float64))
     return _save_npz(path, **values)
 
 
-def load_frame_calibration_data(path: str | Path) -> FrameCalibrationData:
+def _require_contact_offset(actual, expected, artifact_name):
+    try:
+        actual = float(actual)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f'{artifact_name} has no valid contact_offset_mm; rerun prepare and calibration') from exc
+    if not np.isfinite(actual) or not np.isclose(actual, expected, atol=1e-9, rtol=0):
+        raise ValueError(
+            f'{artifact_name} contact_offset_mm={actual!r} differs from configured '
+            f'{expected!r}; rerun prepare and calibration')
+
+
+def _frame_surface(model, coefficients, contact_offset_mm):
+    return OffsetSurface(BicubicSurfaceAdapter(model, coefficients), contact_offset_mm)
+
+
+def load_frame_calibration_data(path: str | Path, settings: CalibrationSettings) -> FrameCalibrationData:
     """Replay cached geometry; refresh marker photometry masks with current padding."""
     path = Path(path).resolve()
     try:
         with np.load(path, allow_pickle=False) as data:
             version = int(data['format_version'])
-            if version == 3:
+            if version == 4:
                 if str(data['color_space']) != 'linear_rgb':
                     raise ValueError('Geometry cache requires linear RGB')
                 require_camera_rgb_transfer({'rgb_transfer_function': str(data['rgb_transfer_function'])}, '几何缓存')
                 linear_rgb = validate_linear_rgb(data['observed_linear_rgb'])
-            elif version == 2:
-                # Decode historical caches only at the input boundary.
-                linear_rgb = cached_linear_rgb(data)
             else:
-                raise ValueError('Unsupported geometry cache version; rerun prepare')
+                raise ValueError('Geometry cache predates contact-surface support; rerun prepare')
+            if 'contact_offset_mm' not in data:
+                raise ValueError('Geometry cache has no contact_offset_mm; rerun prepare')
+            contact_offset_mm = float(data['contact_offset_mm'])
+            _require_contact_offset(contact_offset_mm, settings.contact_offset_mm, 'Geometry cache')
             chart_file = (path.parent/str(data['coordinate_chart_file'])).resolve()
             chart = load_arclength_chart(chart_file)
             if (str(data['coordinate_chart_id']) != chart.chart_id
@@ -247,7 +276,7 @@ def load_frame_calibration_data(path: str | Path) -> FrameCalibrationData:
             options = json.loads(str(data['solver_options']))
             model = SurfaceModel(template, camera.matrix, camera.distortion, options)
             coefficients = np.asarray(data['surface_coefficients'], np.float64)
-            surface = BicubicSurfaceAdapter(model, coefficients)
+            surface = _frame_surface(model, coefficients, contact_offset_mm)
             maps = {}
             for name in ('geometry', 'lightfield', 'observation'):
                 mask_key = ('geometry_grid_valid_mask' if name == 'geometry' and 'geometry_grid_valid_mask' in data
@@ -262,10 +291,12 @@ def load_frame_calibration_data(path: str | Path) -> FrameCalibrationData:
             return FrameCalibrationData(str(data['image_key']), int(data['image_index']),
                 Path(str(data['source_image'])), linear_rgb, data['surface_mask'],
                 dict(pixels=data['marker_pixels'], valid=data['marker_valid'], confidence=data['marker_confidence']),
-                template, data['reference_marker_sizes'], marker_mask, coefficients, surface,
+                template, data['reference_marker_sizes'], marker_mask, coefficients, surface, contact_offset_mm,
                 camera, chart, chart_file, MaterialCoordinateSystems(**maps), str(data['geometry_stage']),
                 json.loads(str(data['fit_info'])), options,
                 data['marker_fit_valid'] if 'marker_fit_valid' in data else None)
+    except FrameCalibrationError:
+        raise
     except (KeyError, ValueError) as exc:
         raise FrameCalibrationError('coordinate_chart_invalid', str(exc)) from exc
 
@@ -273,10 +304,11 @@ def load_frame_calibration_data(path: str | Path) -> FrameCalibrationData:
 def _frame_from_provider(provider, systems, image, source, key, index, sizes, coefficients, stage):
     result = provider.last_frame_result
     session = provider.session
+    contact_offset_mm = float(provider.contact_offset_mm)
     return FrameCalibrationData(key, index, Path(source), image, result['inner_region'].mask,
         result['tracking'], session.xy.copy(), sizes,
         build_marker_image_mask(image, result['tracking']['pixels'], result['tracking']['valid'], sizes),
-        coefficients.copy(), BicubicSurfaceAdapter(session.model, coefficients),
+        coefficients.copy(), _frame_surface(session.model, coefficients, contact_offset_mm), contact_offset_mm,
         CameraModel(session.camera, session.distortion, image.shape[:2]), provider.coordinate_chart,
         provider.coordinate_chart_file, systems, stage, dict(result['info']), dict(session.model.options),
         result.get('marker_fit_valid'))
@@ -287,7 +319,8 @@ def prepare_reference(config_path: str | Path, settings: CalibrationSettings) ->
     if settings.reference_image is None:
         raise ValueError('reference_image must name the fixed background for this batch')
     image = load_linear_image(settings.reference_image)
-    provider = build_reconstruction_provider(config_path)
+    provider = build_reconstruction_provider(config_path, contact_surface=True)
+    _require_contact_offset(provider.contact_offset_mm, settings.contact_offset_mm, 'Reconstruction provider')
     try:
         systems = provider.reconstruct(image, load_material_coordinate_specs(config_path))
     except (ValueError, RuntimeError) as exc:
@@ -312,7 +345,9 @@ def prepare_image(config_path, settings: CalibrationSettings, reference: FrameCa
         image = load_linear_image(source)
     except (OSError, ValueError) as exc:
         raise FrameCalibrationError('tracking_failed', f'Cannot read {source}: {exc}') from exc
-    provider = build_reconstruction_provider(config_path)
+    _require_contact_offset(reference.contact_offset_mm, settings.contact_offset_mm, 'Reference cache')
+    provider = build_reconstruction_provider(config_path, contact_surface=True)
+    _require_contact_offset(provider.contact_offset_mm, settings.contact_offset_mm, 'Reconstruction provider')
     if (not np.array_equal(provider.session.xy, reference.template_xy_mm)
             or not np.array_equal(provider.session.camera, reference.camera.matrix)
             or not np.array_equal(provider.session.distortion, reference.camera.distortion)):
@@ -328,20 +363,22 @@ def prepare_image(config_path, settings: CalibrationSettings, reference: FrameCa
     if result['tracking']['valid'].sum() < 32:
         raise FrameCalibrationError('tracking_failed', 'Too few tracked marker observations')
     try:
-        systems = provider.sample_coefficients(reference.coefficients, load_material_coordinate_specs(config_path))
-    except ValueError as exc:
-        raise FrameCalibrationError('coordinate_chart_invalid', str(exc)) from exc
+        systems = provider.fit_tracked_frame(load_material_coordinate_specs(config_path),
+            result['inner_region'].mask, prior_coefficients=reference.coefficients)
+    except (ValueError, RuntimeError) as exc:
+        raise FrameCalibrationError('geometry_rejected', str(exc)) from exc
     root = settings.image_root or source.parent
     key = Path(os.path.relpath(source, root)).as_posix()
     return _frame_from_provider(provider, systems, image, source, key, -1, reference.reference_marker_sizes,
-                                 reference.coefficients, 'preview_reference')
+                                 provider.last_frame_result['coefficients'], 'initial')
 
 
 def _coordinate_metadata(frame, output_path):
     return dict(coordinate_kind=COORDINATE_KIND, coordinate_chart_id=frame.chart.chart_id,
                 coordinate_chart_file=os.path.relpath(frame.chart_file, Path(output_path).resolve().parent),
                 frame_convention=FRAME_CONVENTION, residual_domain='material_grid', color_space='linear_rgb',
-                rgb_transfer_function=CAMERA_RGB_TRANSFER_FUNCTION)
+                rgb_transfer_function=CAMERA_RGB_TRANSFER_FUNCTION,
+                contact_offset_mm=frame.contact_offset_mm)
 
 
 def compute_frame_colors(final_frame, reference, settings):
@@ -361,55 +398,78 @@ def compute_frame_colors(final_frame, reference, settings):
                 geometry_valid_mask=geometry_valid, photometric_valid_mask=photo)
 
 
-def _max_cyclic_missing(valid):
-    valid = np.asarray(valid, bool)
-    if not valid.any():
-        return len(valid)
-    missing = np.tile(~valid, 2)
-    maximum = run = 0
-    for absent in missing:
-        run = run+1 if absent else 0
-        maximum = max(maximum, run)
-    return min(maximum, len(valid))
-
-
-def fit_ball_center(frame, annotation, settings):
-    grid = frame.systems.observation
-    boundary = invert_surface_projection(region_boundary_points(annotation, BOUNDARY_SAMPLE_COUNT), frame.surface, frame.camera, grid)
-    if boundary.valid.sum() < MINIMUM_BOUNDARY_VALID_COUNT or _max_cyclic_missing(boundary.valid) > MAXIMUM_BOUNDARY_MISSING_RUN:
-        raise FrameCalibrationError('sphere_fit_failed', 'Contact boundary has insufficient or discontinuous inverse projections')
-    center = invert_surface_projection(np.asarray(annotation.center_px)[None], frame.surface, frame.camera, grid)
-    if not center.valid[0]:
-        raise FrameCalibrationError('sphere_fit_failed', 'Contact center has no unique surface inverse')
-    geometry = compute_surface_geometry(grid.xyz, grid.valid_mask)
-    center_st, ok = frame.chart.to_st(center.parameters)
-    if not ok[0]:
-        raise FrameCalibrationError('coordinate_chart_invalid', 'Contact center outside reference chart')
-    h, w = grid.valid_mask.shape
-    xy = center_st[0]*[w-1, h-1]
-    e1_sample = bilinear_sample(geometry['frame'][..., :, 0], xy, geometry['valid'])
-    n_sample = bilinear_sample(geometry['normal'], xy, geometry['valid'])
-    if not e1_sample.valid or not n_sample.valid:
-        raise FrameCalibrationError('sphere_fit_failed', 'Contact center has no valid local frame')
-    n0 = n_sample.values/np.linalg.norm(n_sample.values)
-    e1 = e1_sample.values-n0*np.dot(e1_sample.values, n0)
-    e1 /= np.linalg.norm(e1)
-    e2 = np.cross(n0, e1)
-    center_frame = (center.xyz[0], e1, e2, n0)
+def sphere_contact_for_annotation(frame, annotation, settings):
+    """Construct the prescribed ball; center_px is the surface anchor projection."""
+    if annotation.shape != 'sphere_contact' or annotation.indentation_depth_mm is None:
+        raise FrameCalibrationError('annotation_missing',
+            'Contact position and indentation depth are required; rerun annotate --edit')
     try:
-        sphere, rms = fit_sphere_center(boundary.xyz[boundary.valid], boundary.sigma_mm[boundary.valid],
-                                        settings.sphere_radius_mm, center_frame, settings.side)
+        contact = SphereSurfaceContact(frame.surface, frame.camera, frame.systems.geometry).compute(
+            annotation.center_px, annotation.indentation_depth_mm, settings.sphere_radius_mm, settings.side)
     except ValueError as exc:
-        raise FrameCalibrationError('sphere_fit_failed', str(exc)) from exc
-    metrics = dict(boundary_valid_count=int(boundary.valid.sum()),
-                   boundary_max_missing=_max_cyclic_missing(boundary.valid), sphere_boundary_rms=rms)
-    return sphere, center_frame, float(center.sigma_mm[0]), geometry, metrics
+        raise FrameCalibrationError('sphere_contact_failed', str(exc)) from exc
+    return contact
+
+
+def _contact_annotation(annotation, contact):
+    return replace(annotation, shape='sphere_contact', contour_px=contact.boundary_px.tolist())
+
+
+def _excluded_marker_ids(frame, exclusion):
+    pixels = np.asarray(frame.tracking['pixels'])
+    valid = np.asarray(frame.tracking['valid'], bool) & np.isfinite(pixels).all(axis=1)
+    ij = np.rint(np.nan_to_num(pixels)).astype(int)
+    h, w = exclusion.shape
+    inside = valid & (ij[:, 0] >= 0) & (ij[:, 0] < w) & (ij[:, 1] >= 0) & (ij[:, 1] < h)
+    excluded = np.zeros(len(pixels), bool)
+    excluded[inside] = exclusion[ij[inside, 1], ij[inside, 0]]
+    return excluded
+
+
+def _refit_frame(prepared, reference, provider, exclusion=None, *, stage='initial'):
+    try:
+        systems = provider.fit_tracked_frame(_specs(prepared), prepared.surface_mask,
+                                             exclusion, reference.coefficients)
+    except (ValueError, RuntimeError) as exc:
+        raise FrameCalibrationError('geometry_rejected', str(exc)) from exc
+    result = provider.last_frame_result
+    return replace(prepared, coefficients=result['coefficients'],
+        surface=_frame_surface(provider.session.model, result['coefficients'], prepared.contact_offset_mm),
+        systems=systems, geometry_stage=stage, fit_info=result['info'],
+        marker_fit_valid=result['marker_fit_valid'])
+
+
+def initial_calibration_surface(frame, reference):
+    """Upgrade reference-only previews to an actual fit of the current observations."""
+    if frame.geometry_stage == 'preview_reference':
+        return _refit_frame(frame, reference, _provider_from_frame(frame))
+    return frame
+
+
+def _fit_contact_surface(prepared, reference, annotation, settings):
+    """Keep the image anchor fixed and iterate until the excluded markers agree."""
+    provider = _provider_from_frame(prepared)
+    contact = sphere_contact_for_annotation(prepared, annotation, settings)
+    for _ in range(MAXIMUM_CONTACT_FIT_ITERATIONS):
+        region = _contact_annotation(annotation, contact)
+        masks = region_masks(region, prepared.linear_rgb.shape, outer_margin_px=CONTACT_OUTER_MARGIN_PX)
+        excluded = _excluded_marker_ids(prepared, masks['exclusion'])
+        final = _refit_frame(prepared, reference, provider, masks['exclusion'], stage='final')
+        contact = sphere_contact_for_annotation(final, annotation, settings)
+        region = _contact_annotation(annotation, contact)
+        masks = region_masks(region, final.linear_rgb.shape, outer_margin_px=CONTACT_OUTER_MARGIN_PX)
+        if np.array_equal(excluded, _excluded_marker_ids(prepared, masks['exclusion'])):
+            return final, contact, region, masks
+    raise FrameCalibrationError('geometry_rejected',
+        'Contact boundary / excluded-marker iteration did not converge; adjust position or depth')
 
 
 def make_sphere_labels(frame, annotation, sphere, settings, *, center_frame=None,
                        center_sigma_mm=None, geometry=None):
     if center_frame is None:
-        _, center_frame, center_sigma_mm, geometry, _ = fit_ball_center(frame, annotation, settings)
+        contact = sphere_contact_for_annotation(frame, annotation, settings)
+        center_frame, center_sigma_mm = contact.center_frame, contact.center_sigma_mm
+        geometry = compute_surface_geometry(frame.systems.observation.xyz, frame.systems.observation.valid_mask)
     a, _, _, n0 = center_frame
     center_rays, center_ray_valid = unproject_rays(np.asarray(annotation.center_px)[None], frame.camera)
     _, candidates, root_valid = intersect_sphere_rays(np.zeros(3), center_rays, sphere)
@@ -443,26 +503,22 @@ def finalize_image(prepared: FrameCalibrationData, reference: FrameCalibrationDa
     settings.require_sphere()
     if annotation is None or annotation.semantics != 'contact_boundary':
         raise FrameCalibrationError('annotation_missing', 'An explicit contact_boundary annotation is required')
+    _require_contact_offset(prepared.contact_offset_mm, settings.contact_offset_mm, 'Prepared frame')
+    _require_contact_offset(reference.contact_offset_mm, settings.contact_offset_mm, 'Reference frame')
     if prepared.chart.chart_id != reference.chart.chart_id or not np.array_equal(prepared.template_xy_mm, reference.template_xy_mm):
         raise FrameCalibrationError('coordinate_chart_invalid', 'Prepared/reference chart or template mismatch')
     if (not np.array_equal(prepared.camera.matrix, reference.camera.matrix)
             or not np.array_equal(prepared.camera.distortion, reference.camera.distortion)):
         raise FrameCalibrationError('coordinate_chart_invalid', 'Prepared/reference camera mismatch')
+    prepared = initial_calibration_surface(prepared, reference)
     try:
-        masks = region_masks(annotation, prepared.linear_rgb.shape, outer_margin_px=CONTACT_OUTER_MARGIN_PX)
+        final, contact, annotation, masks = _fit_contact_surface(prepared, reference, annotation, settings)
+    except FrameCalibrationError:
+        raise
     except ValueError as exc:
-        raise FrameCalibrationError('annotation_missing', str(exc)) from exc
-    provider = _provider_from_frame(prepared)
-    try:
-        systems = provider.fit_tracked_frame(_specs(prepared), prepared.surface_mask, masks['exclusion'], reference.coefficients)
-    except (ValueError, RuntimeError) as exc:
-        raise FrameCalibrationError('geometry_rejected', str(exc)) from exc
-    result = provider.last_frame_result
-    final = replace(prepared, coefficients=result['coefficients'],
-                    surface=BicubicSurfaceAdapter(provider.session.model, result['coefficients']),
-                    systems=systems, geometry_stage='final', fit_info=result['info'], marker_fit_valid=result['marker_fit_valid'])
+        raise FrameCalibrationError('sphere_contact_failed', str(exc)) from exc
     colors = compute_frame_colors(final, reference, settings)
-    outside = sample_mask_to_surface(~masks['exclusion'], systems.observation.uv)
+    outside = sample_mask_to_surface(~masks['exclusion'], final.systems.observation.uv)
     background_valid = colors['photometric_valid_mask'] & outside
     denominator = np.count_nonzero(colors['photometric_valid_mask'])
     fraction = float(background_valid.sum()/max(denominator, 1))
@@ -472,7 +528,13 @@ def finalize_image(prepared: FrameCalibrationData, reference: FrameCalibrationDa
                    sample_count=0, reprojection_rms_px=final.fit_info.get('reprojection_rms_px'),
                    metric_max_error=final.fit_info.get('metric_max_error'),
                    marker_fit_count=int(final.marker_fit_valid.sum()))
-    record = dict(frame=final, reference_image=str(reference.source_image), **colors, metrics=metrics)
+    geometry = compute_surface_geometry(final.systems.observation.xyz, final.systems.observation.valid_mask)
+    record = dict(frame=final, reference_image=str(reference.source_image), **colors, metrics=metrics,
+                  contact_boundary_px=contact.boundary_px,
+                  contact_center_parameters=contact.center_parameters,
+                  indentation_depth_mm=annotation.indentation_depth_mm,
+                  principal_curvatures_per_mm=geometry['principal_curvatures'].astype(np.float32),
+                  curvature_valid_mask=geometry['valid'])
     errors = []
     if median is None or fraction < settings.background_min_fraction or median > settings.background_max_abs:
         error = FrameCalibrationError('background_mismatch',
@@ -483,10 +545,13 @@ def finalize_image(prepared: FrameCalibrationData, reference: FrameCalibrationDa
             raise error
         errors.append(error)
     try:
-        sphere, center_frame, sigma, geometry, sphere_metrics = fit_ball_center(final, annotation, settings)
-        metrics.update(sphere_metrics)
-        labels = make_sphere_labels(final, annotation, sphere, settings, center_frame=center_frame,
-                                    center_sigma_mm=sigma, geometry=geometry)
+        residual_mm = np.linalg.norm(contact.boundary_xyz-contact.sphere.center, axis=1)-contact.sphere.radius_mm
+        metrics.update(boundary_valid_count=len(contact.boundary_px), boundary_max_missing=0,
+                       sphere_boundary_rms=float(np.sqrt(np.mean(residual_mm**2)) / contact.center_sigma_mm),
+                       indentation_depth_mm=annotation.indentation_depth_mm)
+        labels = make_sphere_labels(final, annotation, contact.sphere, settings,
+                                    center_frame=contact.center_frame,
+                                    center_sigma_mm=contact.center_sigma_mm, geometry=geometry)
         valid = (colors['geometry_valid_mask'] & colors['photometric_valid_mask']
                  & labels['contact_mask'] & labels['sphere_label_valid'])
         metrics['sample_count'] = int(valid.sum())
@@ -538,6 +603,7 @@ def export_normal_samples(frame_records, settings, output_path):
         if record.get('preview_errors'):
             raise FrameCalibrationError('geometry_rejected', 'Rejected previews cannot supply training samples')
         frame = record['frame']
+        _require_contact_offset(frame.contact_offset_mm, settings.contact_offset_mm, 'Sample frame')
         if (frame.geometry_stage != 'final' or frame.chart.chart_id != first.chart.chart_id
                 or record['reference_image'] != records[0]['reference_image']):
             raise FrameCalibrationError('coordinate_chart_invalid', 'Samples need final geometry and one frozen chart')
@@ -559,9 +625,10 @@ def export_normal_samples(frame_records, settings, output_path):
 
 
 def _reference_sampling_grid_values(settings, metadata):
-    reference = load_frame_calibration_data(settings.work_dir/'reference_surface.npz')
+    reference = load_frame_calibration_data(settings.work_dir/'reference_surface.npz', settings)
     expected = dict(coordinate_kind=COORDINATE_KIND, coordinate_chart_id=reference.chart.chart_id,
-                    frame_convention=FRAME_CONVENTION, residual_domain='material_grid', color_space='linear_rgb')
+                    frame_convention=FRAME_CONVENTION, residual_domain='material_grid', color_space='linear_rgb',
+                    contact_offset_mm=settings.contact_offset_mm)
     for key, value in expected.items():
         if metadata.get(key) != value:
             raise ValueError(f'LUT/reference {key} mismatch; regenerate samples from this reference')
@@ -571,7 +638,8 @@ def _reference_sampling_grid_values(settings, metadata):
     values = build_material_sampling_grid(reference.surface, reference.chart, shape,
                                           reference.template_xy_mm, reference.camera)
     values.update(reference_image=np.asarray(str(reference.source_image)),
-                  coordinate_chart_file=np.asarray(os.path.relpath(reference.chart_file, settings.work_dir)))
+                  coordinate_chart_file=np.asarray(os.path.relpath(reference.chart_file, settings.work_dir)),
+                  contact_offset_mm=np.asarray(settings.contact_offset_mm, np.float64))
     return values
 
 
@@ -608,9 +676,14 @@ def _fit_and_validate_samples(sample_path, settings):
             raise ValueError('Expected nonempty paired Nx3 colors and Nx2 slopes')
         if not np.isfinite(colors).all() or not np.isfinite(slopes).all():
             raise ValueError('Training samples must be finite')
+        if 'contact_offset_mm' not in data:
+            raise ValueError('Training samples predate contact-surface calibration; rerun prepare and samples')
+        _require_contact_offset(data['contact_offset_mm'], settings.contact_offset_mm, 'Training samples')
         if 'image_index' not in data:
             calibration = build_normal_lut(colors, slopes, **settings.lut_options())
-            calibration = replace(calibration, metadata=dict(validation_status='unvalidated_external_samples'))
+            calibration = replace(calibration, metadata=dict(
+                validation_status='unvalidated_external_samples',
+                contact_offset_mm=settings.contact_offset_mm))
             calibration.save(settings.output, total_sample_count=len(colors))
             report = dict(status='unvalidated_external_samples', total_sample_count=len(colors))
             _save_json(settings.work_dir/'verification'/'validation.json', report)
@@ -625,8 +698,9 @@ def _fit_and_validate_samples(sample_path, settings):
         # 超参数检查
         required = ('coordinate_kind', 'coordinate_chart_id', 'coordinate_chart_file', 'frame_convention',
                     'residual_domain', 'color_space', 'rgb_transfer_function', 'reference_image',
-                    'sphere_radius_mm', 'sphere_side', 'boundary_model')
+                    'sphere_radius_mm', 'sphere_side', 'boundary_model', 'contact_offset_mm')
         metadata = {key: data[key].item() for key in required}
+        _require_contact_offset(metadata['contact_offset_mm'], settings.contact_offset_mm, 'Training samples')
         for key, expected in dict(coordinate_kind=COORDINATE_KIND, frame_convention=FRAME_CONVENTION,
                                   residual_domain='material_grid', color_space='linear_rgb',
                                   boundary_model='zero_boundary_displacement').items():
@@ -724,7 +798,7 @@ def _write_report(settings, reports):
     path.parent.mkdir(parents=True, exist_ok=True)
     columns = ['image_key', 'stage', 'status', 'reason', 'message', 'sample_count', 'marker_fit_count',
                'reprojection_rms_px', 'metric_max_error', 'background_fraction', 'background_median_max_abs',
-               'boundary_valid_count', 'boundary_max_missing', 'sphere_boundary_rms']
+               'boundary_valid_count', 'boundary_max_missing', 'sphere_boundary_rms', 'indentation_depth_mm']
     temporary = path.with_suffix('.csv.tmp')
     with temporary.open('w', newline='', encoding='utf-8') as stream:
         writer = csv.DictWriter(stream, fieldnames=columns, extrasaction='ignore')
@@ -734,7 +808,14 @@ def _write_report(settings, reports):
 
 
 def run_prepare(config_path, settings):
-    paths = sorted({str(Path(path).resolve()) for pattern in settings.images for path in glob.glob(pattern) if Path(path).is_file()})
+    work_dir = settings.work_dir.resolve()
+    output_files = {settings.input_file.resolve(), settings.output.resolve(),
+                    settings.output.with_name(settings.output.stem+'_train.npz').resolve()}
+    paths = {Path(path).resolve() for pattern in settings.images
+             for path in glob.iglob(pattern, recursive=True) if Path(path).is_file()}
+    # Exclude calibration outputs even when an image pattern matches them.
+    paths = sorted(str(path) for path in paths
+                   if not path.is_relative_to(work_dir) and path not in output_files)
     if not paths:
         raise ValueError('No calibration images matched images/--images')
     root = Path(os.path.commonpath([str(Path(path).parent) for path in paths]))
@@ -764,7 +845,7 @@ def run_prepare(config_path, settings):
 def run_samples(settings):
     settings.require_sphere()
     manifest = load_manifest(settings)
-    reference = load_frame_calibration_data(settings.work_dir/'reference_surface.npz')
+    reference = load_frame_calibration_data(settings.work_dir/'reference_surface.npz', settings)
     regions = load_regions(settings.annotations_file, image_root=manifest['image_root'])
     records, reports = [], []
     for entry in manifest['images']:
@@ -777,7 +858,7 @@ def run_samples(settings):
             row.update(status='skip', reason='', message='Annotation marked skip')
         else:
             try:
-                frame = load_frame_calibration_data(settings.work_dir/'prepared'/f"{entry['index']:06d}.npz")
+                frame = load_frame_calibration_data(settings.work_dir/'prepared'/f"{entry['index']:06d}.npz", settings)
                 if annotation is None or annotation.status != 'accepted':
                     raise FrameCalibrationError('annotation_missing', 'No accepted contact_boundary')
                 record = finalize_image(frame, reference, annotation, settings)

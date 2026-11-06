@@ -45,6 +45,11 @@ get_surface:
     config_file: reconstruction/surface_reconstruction/config.json
     row_direction: auto
 
+# 接触面相对 marker 曲面沿模板 X×Y 法向的有符号距离，单位 mm。
+# 标定和完整重建共用；独立整体重建仍输出 marker 曲面。
+contact_surface:
+  offset_mm: 7.0
+
 # 三套网格共用冻结参考弧长图；coordinates 为反解的原生材料参数，st 为规则弧长坐标。
 material_coordinates:
   geometry:
@@ -68,7 +73,7 @@ normal_calibration:
   annotations_file: assets/normal_calibration/manual_regions.yaml
   work_dir: assets/normal_calibration
   input_file: assets/normal_calibration/normal_samples.npz
-  output: ~/recon_stable/assets/normal_calibration/normal_lut.npz
+  output: assets/normal_calibration/normal_lut.npz
   lut_size: 64
   maximum_rms_angle_degrees: 5.0
   checks:
@@ -82,13 +87,13 @@ reconstruction:
   reference_image: assets/reference.npz
   # 图片法向标定通过后，根据本批 reference 自动重建此网格。
   material_grid_file: assets/normal_calibration/lut_material_grid.npz
-  # 结果 NPZ 保存到 output_dir/pc，不自动生成预览图片。
+  # 重建结果 NPZ 保存到 output_dir/pc，完整重建的预览 PNG 保存到 assets/reconstruction/pics。
   output_dir: assets/reconstruction
   # 求解网格按当前整体曲面的实际长宽配比，长边点数取 observation 的较大维度。
   match_surface_aspect: true
 
 local_reconstruction:
-  calibration_file: ~/recon_stable/assets/normal_calibration/normal_lut.npz
+  calibration_file: assets/normal_calibration/normal_lut.npz
   input_file: null
   output_file: null
   zero_color_protection:

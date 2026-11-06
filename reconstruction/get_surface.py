@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 
 from utils.color_difference import CAMERA_RGB_TRANSFER_FUNCTION
-from utils.config import ConfigError, load_config
+from utils.config import ConfigError, load_config, load_contact_surface_offset_mm
 from utils.image_io import load_linear_image, linear_rgb_to_tracking_bgr8, validate_linear_rgb
 from utils.reconstruction_interface import (
     MaterialCoordinateSystems,
@@ -40,7 +40,7 @@ def reconstruct_material_coordinates(
 
 
 def build_reconstruction_provider(
-    config_path: str | Path,
+    config_path: str | Path, *, contact_surface: bool = False,
 ) -> SurfaceReconstructionProvider:
     path = Path(config_path).expanduser().resolve()
     config = load_config(path)
@@ -74,7 +74,8 @@ def build_reconstruction_provider(
             "get_surface.overall_reconstruction.row_direction "
             "必须是 auto/down/up/left/right"
         )
-    return SurfaceReconstructionProvider(provider_config, direction)
+    offset = load_contact_surface_offset_mm(path) if contact_surface else 0.0
+    return SurfaceReconstructionProvider(provider_config, direction, contact_offset_mm=offset)
 
 
 def save_material_coordinates(
@@ -92,8 +93,8 @@ def save_material_coordinates(
     output = Path(output_path).expanduser()
     frame_linear_rgb = validate_linear_rgb(frame_linear_rgb)
     output.parent.mkdir(parents=True, exist_ok=True)
-    if geometry_stage not in {"final", "preview_reference"}:
-        raise ValueError("geometry_stage must be final or preview_reference")
+    if geometry_stage not in {"final", "initial", "preview_reference"}:
+        raise ValueError("geometry_stage must be final, initial or preview_reference")
     observation = systems.observation
     if observation.st is not None:
         chart = provider.coordinate_chart

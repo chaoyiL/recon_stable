@@ -24,6 +24,13 @@ def _check_declarations(data, calibration, keys=DECLARATIONS):
     for key in keys:
         if str(data[key]) != calibration.metadata.get(key):
             raise ValueError(f'Visualization input/LUT {key} mismatch')
+    try:
+        offsets = np.asarray([data['contact_offset_mm'], calibration.metadata['contact_offset_mm']], np.float64)
+    except (KeyError, TypeError, ValueError):
+        raise ValueError('Visualization input/LUT requires contact_offset_mm') from None
+    if (offsets.shape != (2,) or not np.isfinite(offsets).all()
+            or not np.isclose(offsets[0], offsets[1], rtol=0, atol=1e-9)):
+        raise ValueError('Visualization input/LUT contact_offset_mm mismatch')
     if 'color_space' in keys:
         transfer = str(data['rgb_transfer_function']) if 'rgb_transfer_function' in data else None
         if transfer != calibration.metadata.get('rgb_transfer_function'):

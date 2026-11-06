@@ -49,36 +49,6 @@ def unproject_rays(pixels: np.ndarray, camera: CameraModel) -> tuple[np.ndarray,
     return np.where(valid[..., None], rays, 0), valid
 
 
-def projected_circle_radius_px(
-    center_px: tuple[float, float],
-    radius_mm: float,
-    depth_mm: float,
-    camera: CameraModel,
-) -> float:
-    """Fit an image-space circle inside a projected camera-parallel physical disk.
-
-    center_px uses original, distorted image pixels; depth_mm is camera Z.
-    The physical disk has radius_mm and its center projects to center_px.
-    Return the smallest projected radius over 128 boundary directions, including
-    lens distortion. Without distortion this is min(fx, fy) * radius_mm / depth_mm.
-    The disk may extend beyond the image; image clipping does not change its size.
-    """
-    if not np.isfinite([radius_mm, depth_mm]).all() or min(radius_mm, depth_mm) <= 0:
-        raise ValueError('Physical radius and camera depth must be positive and finite')
-    rays, valid = unproject_rays(np.asarray(center_px)[None], camera)
-    if not valid[0] or rays[0, 2] <= 0:
-        raise ValueError('Circle center must have a finite forward camera ray')
-    center = rays[0] * (depth_mm / rays[0, 2])
-    angles = np.arange(128) * (2 * np.pi / 128)
-    boundary = center + radius_mm * np.column_stack(
-        (np.cos(angles), np.sin(angles), np.zeros_like(angles)))
-    pixels, _ = project_points(boundary, camera)
-    radii = np.linalg.norm(pixels - center_px, axis=-1)
-    if not np.isfinite(radii).all() or radii.min() <= 0:
-        raise ValueError('Physical disk must have a finite positive projected radius')
-    return float(radii.min())
-
-
 @dataclass(frozen=True)
 class ProjectionInverse:
     parameters: np.ndarray
@@ -96,18 +66,46 @@ def _grid_field(grid, name):
     return getattr(grid, name)
 
 
-def invert_surface_projection(pixels, surface, camera: CameraModel, seed_grid, annotation_sigma_px=1.0) -> ProjectionInverse:
-    if not np.isfinite(annotation_sigma_px) or annotation_sigma_px <= 0:
-        raise ValueError('annotation_sigma_px must be positive')
-    pixels = np.asarray(pixels, np.float64)
-    shape = pixels.shape[:-1]
-    targets = pixels.reshape(-1, 2)
+@dataclass(frozen=True)
+class ProjectionTriangles:
+    """Projected seed triangles and corresponding native surface parameters."""
+
+    uv: np.ndarray
+    parameters: np.ndarray
+    edge1: np.ndarray
+    edge2: np.ndarray
+    determinants: np.ndarray
+    lower: np.ndarray
+    upper: np.ndarray
+
+    def containing(self, pixel: np.ndarray, candidates=None) -> tuple[np.ndarray, np.ndarray]:
+        """Return triangle indices and barycentric weights containing a pixel."""
+        if candidates is None:
+            candidates = np.arange(len(self.uv))
+        candidates = np.asarray(candidates, dtype=int)
+        in_bounds = ((pixel >= self.lower[candidates]-1e-6)
+                     & (pixel <= self.upper[candidates]+1e-6)).all(axis=1)
+        ids = candidates[in_bounds]
+        delta = pixel-self.uv[ids, 0]
+        edge1, edge2, det = self.edge1[ids], self.edge2[ids], self.determinants[ids]
+        u = (delta[:, 0]*edge2[:, 1]-delta[:, 1]*edge2[:, 0])/det
+        v = (edge1[:, 0]*delta[:, 1]-edge1[:, 1]*delta[:, 0])/det
+        weights = np.column_stack((1-u-v, u, v))
+        inside = (weights >= -1e-6).all(axis=1)
+        return ids[inside], weights[inside]
+
+
+def build_projection_triangles(seed_grid) -> ProjectionTriangles:
+    """Prepare the finite, nondegenerate projected cells of a fixed seed grid."""
     uv = np.asarray(_grid_field(seed_grid, 'uv'), np.float64)
     parameters = np.asarray(_grid_field(seed_grid, 'parameters'), np.float64)
     if isinstance(seed_grid, dict):
         mask = np.asarray(seed_grid.get('geometry_valid_mask', seed_grid.get('valid_mask')), bool)
     else:
         mask = np.asarray(seed_grid.valid_mask, bool)
+    if (uv.ndim != 3 or uv.shape[-1] != 2 or min(uv.shape[:2]) < 2
+            or parameters.shape != uv.shape or mask.shape != uv.shape[:2]):
+        raise ValueError('seed_grid must contain matching uv, parameters and validity arrays')
     mask = mask & np.isfinite(uv).all(axis=-1) & np.isfinite(parameters).all(axis=-1)
     quads = mask[:-1, :-1] & mask[:-1, 1:] & mask[1:, :-1] & mask[1:, 1:]
     rr, cc = np.nonzero(quads)
@@ -122,7 +120,22 @@ def invert_surface_projection(pixels, surface, camera: CameraModel, seed_grid, a
     good = np.abs(determinants) >= 1e-8
     triangles_uv, triangles_ab = triangles_uv[good], triangles_ab[good]
     edge1, edge2, determinants = edge1[good], edge2[good], determinants[good]
-    lower, upper = triangles_uv.min(axis=1), triangles_uv.max(axis=1)
+    return ProjectionTriangles(triangles_uv, triangles_ab, edge1, edge2, determinants,
+                               triangles_uv.min(axis=1), triangles_uv.max(axis=1))
+
+
+def invert_surface_projection(
+    pixels, surface, camera: CameraModel, seed_grid, annotation_sigma_px=1.0,
+    *, triangles: ProjectionTriangles | None = None,
+) -> ProjectionInverse:
+    """Invert pixels; cached triangles must come from the same unchanged seed grid."""
+    if not np.isfinite(annotation_sigma_px) or annotation_sigma_px <= 0:
+        raise ValueError('annotation_sigma_px must be positive')
+    pixels = np.asarray(pixels, np.float64)
+    shape = pixels.shape[:-1]
+    targets = pixels.reshape(-1, 2)
+    if triangles is None:
+        triangles = build_projection_triangles(seed_grid)
     bounds = np.asarray(surface.parameter_bounds)
     lo, span = bounds[[0, 2]], bounds[[1, 3]]-bounds[[0, 2]]
     count = len(targets)
@@ -138,15 +151,8 @@ def invert_surface_projection(pixels, surface, camera: CameraModel, seed_grid, a
     for i, target in enumerate(targets):
         if not np.isfinite(target).all():
             continue
-        ids = np.flatnonzero(((target >= lower-1e-6) & (target <= upper+1e-6)).all(1))
-        if not len(ids):
-            continue
-        delta = target-triangles_uv[ids, 0]
-        u = (delta[:, 0]*edge2[ids, 1]-delta[:, 1]*edge2[ids, 0])/determinants[ids]
-        v = (edge1[ids, 0]*delta[:, 1]-edge1[ids, 1]*delta[:, 0])/determinants[ids]
-        weights = np.column_stack((1-u-v, u, v))
-        inside = (weights >= -1e-6).all(1)
-        seeds = np.sum(triangles_ab[ids[inside]]*weights[inside, :, None], axis=1)
+        ids, weights = triangles.containing(target)
+        seeds = np.sum(triangles.parameters[ids]*weights[:, :, None], axis=1)
         solutions = []
         for seed in seeds:
             initial = np.clip((seed-lo)/span, 0, 1)

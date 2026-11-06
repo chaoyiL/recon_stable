@@ -16,7 +16,6 @@ assets/
 # 运行时生成的标定输出
 camera_calibration.yaml
 
-# 解析仿真的运行产物（配置与代码单独保留）
-/physical_model/render_results/
-/physical_model/lut/
-/physical_model/compensate_results/
+# 暂时废弃的光场路线：旧代码、配置和历史产物仅在本地保留
+/physical_model/
+/sim2real_trial/
