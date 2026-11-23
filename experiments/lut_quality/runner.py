@@ -17,7 +17,9 @@ from typing import Any
 import numpy as np
 
 from calibrate.utils.norm_pipeline import parse_settings
+from utils.calibration_store import resolve_artifacts
 from utils.normal_mapping import NormalCalibration
+from utils.normal_models import load_normal_model
 
 from . import metric
 
@@ -317,7 +319,11 @@ def _resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, float, P
     if args.lut:
         lut_path = Path(args.lut).expanduser().resolve()
     else:
-        lut_path = settings.output.with_name(f"{settings.output.stem}_train{settings.output.suffix}")
+        model_path = resolve_artifacts(config_path).model_file
+        training = model_path.with_name(f"{model_path.stem}_train{model_path.suffix}")
+        if not training.is_file():
+            training = model_path.parent / "normal_lut_train.npz"
+        lut_path = training if training.is_file() else model_path
     output_path = Path(args.out).expanduser().resolve() if args.out else settings.work_dir / "quality"
     return config_path, sample_path, lut_path, settings.contact_offset_mm, output_path
 
@@ -330,8 +336,13 @@ def _check_output_path(path: Path) -> None:
             raise FileExistsError(f"Refusing to overwrite nonempty output directory: {path}")
 
 
-def _validation_status(settings: Any, sample_path: Path) -> tuple[str, Path | None]:
-    report_path = (settings.work_dir / "verification" / "validation.json").resolve()
+def _validation_status(settings: Any, sample_path: Path, lut_path: Path) -> tuple[str, Path | None]:
+    report_path = lut_path.parent / "validation.json"
+    if not report_path.is_file():
+        legacy_train = settings.output.with_name(f"{settings.output.stem}_train{settings.output.suffix}")
+        if lut_path in (settings.output, legacy_train):
+            report_path = settings.work_dir / "verification" / "validation.json"
+    report_path = report_path.resolve()
     if not report_path.is_file():
         return "unknown", None
     try:
@@ -482,7 +493,10 @@ def _write_top_bins(
 
 def _load_calibration(path: Path) -> NormalCalibration:
     try:
-        return NormalCalibration.load(path)
+        model = load_normal_model(path)
+        if not isinstance(model, NormalCalibration):
+            raise ValueError("MLP calibration has no 3D LUT; use calibrate-norm --stage compare")
+        return model
     except (OSError, ValueError, KeyError) as exc:
         raise ValueError(f"Could not load signed normal LUT {path}: {exc}") from exc
 
@@ -551,13 +565,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     config_path, sample_path, lut_path, expected_offset, output_path = _resolve_paths(args)
     if not config_path.is_file():
         raise FileNotFoundError(f"Config does not exist: {config_path}")
-    if not sample_path.is_file():
-        raise FileNotFoundError(f"Samples do not exist: {sample_path}")
     if not lut_path.is_file():
         raise FileNotFoundError(f"LUT does not exist: {lut_path}")
 
-    samples, sample_metadata = _read_samples(sample_path)
     lut = _load_calibration(lut_path)
+    if not sample_path.is_file():
+        raise FileNotFoundError(f"Samples do not exist: {sample_path}")
+    samples, sample_metadata = _read_samples(sample_path)
     warnings = _validate_metadata(sample_metadata, lut, expected_offset)
     source_manifest_path = sample_path.parent / "manifest.json"
     source_manifest = _read_source_manifest(source_manifest_path)
@@ -589,7 +603,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _check_output_path(output_path)
     output_path.mkdir(parents=True, exist_ok=True)
     settings = parse_settings(config_path)
-    calibration_status, validation_path = _validation_status(settings, sample_path)
+    calibration_status, validation_path = _validation_status(settings, sample_path, lut_path)
     input_files = {"samples": sample_path, "lut": lut_path, "config": config_path}
     if source_manifest is not None:
         input_files["source_manifest"] = source_manifest_path.resolve()

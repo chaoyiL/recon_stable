@@ -1,7 +1,7 @@
 """单张图片的 marker 整体拟合、参考颜色配对和局部重建。"""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -19,15 +19,18 @@ from reconstruction.local_recon import (
 )
 from reconstruction.surface_reconstruction.markers import build_marker_image_mask, marker_reference_sizes
 from reconstruction.surface_reconstruction.surface import BicubicSurfaceAdapter
-from utils.config import load_config, load_contact_surface_offset_mm
-from utils.normal_mapping import NormalCalibration
+from utils.calibration_store import resolve_artifacts
+from utils.config import get_curvature_smoothing_half_width_mm, load_config, load_contact_surface_offset_mm
+from utils.normal_models import load_normal_model
 from utils.reconstruction_interface import MaterialCoordinateMap, load_material_coordinate_specs
 from utils.surface_coordinates import (
-    COORDINATE_KIND, FRAME_CONVENTION, load_arclength_chart, sample_surface_grid,
+    COORDINATE_KIND, FRAME_CONVENTION, load_arclength_chart,
 )
 from utils.surface_projection import CameraModel, project_points
 from utils.surface_sampling import bilinear_sample, sample_mask_to_surface
 from utils.surface_geometry import OffsetSurface, surface_grid_curve_lengths
+from utils.surface_curvature import compute_surface_curvature
+from utils.surface_domain import DOMAIN_KIND, extend_surface
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / 'config.yaml'
@@ -35,11 +38,12 @@ DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / 'config.yaml'
 
 @dataclass(frozen=True)
 class MaterialSamplingGrid:
-    """LUT-bound native material parameters (mm) and regular st grid."""
+    """Model-bound native material parameters (mm) and regular st grid."""
 
     parameters: np.ndarray
     st: np.ndarray
     chart_id: str
+    parameter_bounds: tuple[float, float, float, float]
 
 
 def _offset_value(value, label: str) -> float:
@@ -60,7 +64,7 @@ def _require_contact_offset(value, expected: float, label: str) -> None:
 
 
 def load_sampling_grid(
-    path: str | Path, calibration: NormalCalibration, surface: OffsetSurface,
+    path: str | Path, calibration,
     camera: CameraModel, shape: tuple[int, int], *, template_xy_mm: np.ndarray,
     contact_offset_mm: float,
 ) -> MaterialSamplingGrid:
@@ -71,30 +75,36 @@ def load_sampling_grid(
     """
     metadata = calibration.metadata
     if 'contact_offset_mm' not in metadata:
-        raise ValueError('LUT is missing contact_offset_mm; rerun normal calibration')
+        raise ValueError('Normal model is missing contact_offset_mm; rerun normal calibration')
     try:
         _require_contact_offset(metadata['contact_offset_mm'], contact_offset_mm,
-                                'LUT contact_offset_mm')
+                                'Normal model contact_offset_mm')
     except ValueError as exc:
         raise ValueError(f'{exc}; rerun normal calibration') from exc
-    for key, expected in dict(coordinate_kind=COORDINATE_KIND, frame_convention=FRAME_CONVENTION,
+    for key, expected in dict(coordinate_kind=COORDINATE_KIND, domain_kind=DOMAIN_KIND, frame_convention=FRAME_CONVENTION,
                               residual_domain='material_grid', color_space='linear_rgb').items():
         if metadata.get(key) != expected:
-            raise ValueError(f'LUT requires {key}={expected}')
+            raise ValueError(f'Normal model requires {key}={expected}')
     with np.load(path, allow_pickle=False) as data:
         if 'st_table' in data:
             chart = load_arclength_chart(path)
             chart_id = chart.chart_id
             if chart_id != metadata.get('coordinate_chart_id'):
-                raise ValueError('LUT/material-grid coordinate_chart_id mismatch')
-            grid = sample_surface_grid(surface, chart, *shape)
-            return MaterialSamplingGrid(grid.parameters, grid.st, chart_id)
+                raise ValueError('Normal model/material-grid coordinate_chart_id mismatch')
+            if chart.domain_kind != DOMAIN_KIND:
+                raise ValueError('Coordinate chart predates black-frame domains; rerun prepare, samples and fit')
+            ss, tt = np.meshgrid(np.linspace(0, 1, shape[1]), np.linspace(0, 1, shape[0]))
+            st = np.stack((ss, tt), axis=-1)
+            parameters, valid = chart.to_parameters(st)
+            if not valid.all():
+                raise ValueError('Regular st grid inversion failed')
+            return MaterialSamplingGrid(parameters, st, chart_id, chart.parameter_bounds)
         if (int(data['format_version']) != 1
                 or str(data['grid_kind']) != 'frozen_material_grid'):
             raise ValueError('Unsupported frozen material-grid format')
-        for key in ('coordinate_kind', 'coordinate_chart_id', 'frame_convention', 'residual_domain', 'color_space'):
-            if str(data[key]) != metadata.get(key):
-                raise ValueError(f'LUT/material-grid {key} mismatch')
+        for key in ('coordinate_kind', 'coordinate_chart_id', 'domain_kind', 'frame_convention', 'residual_domain', 'color_space'):
+            if key not in data or str(data[key]) != metadata.get(key):
+                raise ValueError(f'Normal model/material-grid {key} mismatch')
         if 'contact_offset_mm' not in data:
             raise ValueError('Material grid is missing contact_offset_mm; regenerate it from the calibrated reference')
         _require_contact_offset(data['contact_offset_mm'], contact_offset_mm,
@@ -106,12 +116,18 @@ def load_sampling_grid(
         parameters = np.asarray(data['material_coordinates'], np.float64)
         st = np.asarray(data['st'], np.float64)
         chart_id = str(data['coordinate_chart_id'])
+        if 'parameter_bounds' not in data:
+            raise ValueError('Material grid has no black-frame domain bounds; rerun prepare, samples and fit')
+        bounds = np.asarray(data['parameter_bounds'], np.float64)
+    if (bounds.shape != (4,) or not np.isfinite(bounds).all()
+            or bounds[1] <= bounds[0] or bounds[3] <= bounds[2]):
+        raise ValueError('Invalid frozen material-grid parameter bounds')
     if (parameters.ndim != 3 or parameters.shape[-1] != 2
             or min(parameters.shape[:2]) < 2 or st.shape != parameters.shape):
         raise ValueError('Invalid frozen material-grid shape')
     source_shape = parameters.shape[:2]
-    lo = np.asarray(surface.parameter_bounds)[[0, 2]]
-    hi = np.asarray(surface.parameter_bounds)[[1, 3]]
+    lo = bounds[[0, 2]]
+    hi = bounds[[1, 3]]
     ss, tt = np.meshgrid(np.linspace(0, 1, source_shape[1]), np.linspace(0, 1, source_shape[0]))
     if (not np.isfinite(parameters).all() or not np.isfinite(st).all()
             or np.any(parameters < lo) or np.any(parameters > hi)
@@ -124,8 +140,10 @@ def load_sampling_grid(
         sampled = bilinear_sample(parameters, query, allow_boundary=True)
         if not sampled.valid.all():
             raise ValueError('Frozen material-grid resampling failed')
-        parameters = sampled.values
-    return MaterialSamplingGrid(parameters, st, chart_id)
+        # Bilinear weights form a convex combination. Remove only the rounding
+        # error of that interpolation at already validated native boundaries.
+        parameters = np.clip(sampled.values, lo, hi)
+    return MaterialSamplingGrid(parameters, st, chart_id, tuple(bounds))
 
 
 def sample_material_map(
@@ -166,7 +184,7 @@ def make_reconstruction_input(
         surface_mask=surface_mask, reference_surface_mask=reference_mask,
         marker_image_mask=marker_mask, reference_marker_image_mask=reference_marker_mask,
         photometric_valid_mask=current_map.valid_mask & reference_map.valid_mask,
-        coordinate_kind=COORDINATE_KIND, coordinate_chart_id=current_map.chart_id,
+        coordinate_kind=COORDINATE_KIND, coordinate_chart_id=current_map.chart_id, domain_kind=DOMAIN_KIND,
         frame_convention=FRAME_CONVENTION, residual_domain='material_grid', color_space='linear_rgb',
         rgb_transfer_function=CAMERA_RGB_TRANSFER_FUNCTION,
         contact_offset_mm=float(contact_offset_mm))
@@ -209,6 +227,7 @@ def reconstruct_image(
     config_path = Path(config_path).expanduser().resolve()
     image_path = Path(image_path).expanduser().resolve()
     config = load_config(config_path)
+    curvature_smoothing_half_width_mm = get_curvature_smoothing_half_width_mm(config)
     raw = config.get('reconstruction')
     if not isinstance(raw, dict):
         raise ValueError('config.yaml 缺少 reconstruction 配置段')
@@ -220,8 +239,11 @@ def reconstruct_image(
         raise ValueError('reconstruction.match_surface_aspect 必须是布尔值')
     reference_path = (Path(reference_image).expanduser().resolve() if reference_image is not None
                       else _configured_path(raw.get('reference_image'), config_path.parent, 'reference_image'))
-    grid_path = (Path(material_grid_file).expanduser().resolve() if material_grid_file is not None
-                 else _configured_path(raw.get('material_grid_file'), config_path.parent, 'material_grid_file'))
+    artifacts = resolve_artifacts(config_path, model_override=calibration_file,
+                                  grid_override=material_grid_file)
+    grid_path = artifacts.grid_file
+    if grid_path is None:
+        raise ValueError('所选标定模型缺少配套材料网格；请提供 --material-grid')
     output_path = (Path(output).expanduser() if output is not None else
                    default_reconstruction_output(
                        config_path, raw.get('output_dir'), image_path.stem + '_local_result.npz'))
@@ -231,23 +253,29 @@ def reconstruct_image(
         raise ValueError('重建输出不能覆盖图片或材料网格')
     settings = load_local_reconstruction_settings(
         config_path, input_override=str(image_path), output_override=str(output_path),
-        calibration_override=calibration_file, lsmr_atol_override=lsmr_atol,
+        calibration_override=str(artifacts.model_file), lsmr_atol_override=lsmr_atol,
         lsmr_btol_override=lsmr_btol, lsmr_max_iterations_override=lsmr_max_iterations)
     if output_path.resolve() == settings.calibration_file.resolve():
-        raise ValueError('重建输出不能覆盖 LUT')
-    calibration = NormalCalibration.load(settings.calibration_file)
+        raise ValueError('重建输出不能覆盖法向模型')
+    calibration = load_normal_model(settings.calibration_file)
+    if calibration.metadata.get('domain_kind') != DOMAIN_KIND:
+        raise ValueError('Normal model predates black-frame domains; rerun prepare, samples and fit')
+    calibrated_reference = calibration.metadata.get('reference_image')
+    if calibrated_reference is None or Path(calibrated_reference).expanduser().resolve() != reference_path.resolve():
+        raise ValueError('Reconstruction reference differs from the normal model reference; rerun prepare, samples and fit')
     image, reference = load_linear_image(image_path), load_linear_image(reference_path)
     provider = build_reconstruction_provider(config_path)
     session = provider.session
     reference_fit = _fit_frame(session, reference, '参考图')
     contact_offset_mm = load_contact_surface_offset_mm(config_path)
-    reference_surface = OffsetSurface(
-        BicubicSurfaceAdapter(session.model, reference_fit['coefficients']), contact_offset_mm)
+    reference_marker_surface = BicubicSurfaceAdapter(session.model, reference_fit['coefficients'])
     camera = CameraModel(session.camera, session.distortion, reference.shape[:2])
     spec = load_material_coordinate_specs(config_path).observation
     grid = load_sampling_grid(
-        grid_path, calibration, reference_surface, camera, (spec.rows, spec.columns),
+        grid_path, calibration, camera, (spec.rows, spec.columns),
         template_xy_mm=session.xy, contact_offset_mm=contact_offset_mm)
+    reference_surface = OffsetSurface(
+        extend_surface(reference_marker_surface, grid.parameter_bounds), contact_offset_mm)
     reference_mask = reference_fit['inner_region'].mask
     reference_tracking_bgr = linear_rgb_to_tracking_bgr8(reference)
     sizes = marker_reference_sizes(
@@ -260,7 +288,8 @@ def reconstruct_image(
     session.model.reset()
     current_fit = _fit_frame(session, image, '当前图')
     current_surface = OffsetSurface(
-        BicubicSurfaceAdapter(session.model, current_fit['coefficients']), contact_offset_mm)
+        extend_surface(BicubicSurfaceAdapter(session.model, current_fit['coefficients']),
+                       grid.parameter_bounds), contact_offset_mm)
     current_mask = current_fit['inner_region'].mask
     if match_aspect:
         pilot_map = sample_material_map(current_surface, camera, grid, current_mask)
@@ -271,7 +300,7 @@ def reconstruct_image(
         else:
             shape = (max(3, 1+round((long_edge_points-1)*height/width)), long_edge_points)
         grid = load_sampling_grid(
-            grid_path, calibration, current_surface, camera, shape,
+            grid_path, calibration, camera, shape,
             template_xy_mm=session.xy, contact_offset_mm=contact_offset_mm)
     reference_map = sample_material_map(reference_surface, camera, grid, reference_mask)
     current_map = sample_material_map(current_surface, camera, grid, current_mask)
@@ -282,7 +311,14 @@ def reconstruct_image(
     data = make_reconstruction_input(current_map, reference_map, image, reference,
                                      current_mask, reference_mask, marker_mask, reference_marker_mask,
                                      contact_offset_mm)
+    template_lo, template_hi = session.xy.min(axis=0), session.xy.max(axis=0)
+    data['extrapolated_mask'] = np.any((grid.parameters < template_lo) | (grid.parameters > template_hi), axis=-1)
     print(f"整体重建完成: marker={int(current_fit['tracking']['valid'].sum())} "
           f"reprojection_rms_px={current_fit['info']['reprojection_rms_px']:.6g} "
           f"solver_grid={current_map.xyz.shape[0]}x{current_map.xyz.shape[1]}")
-    return reconstruct_from_input(data, calibration, settings), output_path
+    curvature = compute_surface_curvature(
+        current_map.xyz, current_map.valid_mask, current_map.coordinates, session.xy,
+        smoothing_half_width_mm=curvature_smoothing_half_width_mm)
+    result = reconstruct_from_input(data, calibration, settings)
+    return replace(result, overall_curvature=curvature, st=current_map.st,
+                   coordinate_chart_id=current_map.chart_id), output_path

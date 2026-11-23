@@ -1,0 +1,506 @@
+{
+  "lut_method": "table",
+  "image": "assets/test_pics/3b/3b2.npz",
+  "scan": "accurate_models/scan.ply",
+  "learned_background": "optical_learning/generation_03/runs/initial/margin_40/background/model.npz",
+  "reference_image": "assets/reference.npz",
+  "coordinate_chart_id": "964da13e-3ace-4fae-a45a-0721e5aee9a0",
+  "grid_shape": [
+    400,
+    159
+  ],
+  "photometric_points": 46013,
+  "contact_offset_mm": 7.0,
+  "background_smoothing_half_width_mm": 2.0,
+  "comparison_depth_mm": 0.4,
+  "depth_scan": {
+    "step_mm": 0.02,
+    "min_fit_points": 100,
+    "stable_steps": 5,
+    "rmse_atol_mm": 0.005,
+    "rmse_rtol": 0.01
+  },
+  "scan_spheres": [
+    {
+      "contact": 1,
+      "cap_points": 20459,
+      "fit_points": 15696,
+      "center_xyz_mm": [
+        -117.7980653673369,
+        -69.62160511470096,
+        -184.54251196431235
+      ],
+      "radius_mm": 2.0,
+      "radial_rms_mm": 0.040443342545266645,
+      "jacobian_condition": 1.5955802734035047
+    },
+    {
+      "contact": 2,
+      "cap_points": 11907,
+      "fit_points": 9902,
+      "center_xyz_mm": [
+        -127.02658264363293,
+        -69.77660520651419,
+        -183.99405748424797
+      ],
+      "radius_mm": 1.5,
+      "radial_rms_mm": 0.03588826498660158,
+      "jacobian_condition": 1.5429915975729867
+    },
+    {
+      "contact": 3,
+      "cap_points": 4851,
+      "fit_points": 4067,
+      "center_xyz_mm": [
+        -136.24662023034077,
+        -69.88563328003058,
+        -184.7192467248122
+      ],
+      "radius_mm": 1.0,
+      "radial_rms_mm": 0.038734392728193456,
+      "jacobian_condition": 1.650625234903635
+    }
+  ],
+  "scan_center_distances_mm": {
+    "1-2": 9.246099635200732,
+    "1-3": 18.45129053971347,
+    "2-3": 9.249155618528103
+  },
+  "background_difference_rms": 0.04297343300563171,
+  "right_background_difference_rms": 0.06281191317177623,
+  "methods": {
+    "reference": {
+      "spheres": [
+        {
+          "thickness_mm": 7.0,
+          "method": "reference",
+          "contact": 1,
+          "radius_mm": 2.0,
+          "fit_depth_mm": 0.4,
+          "status": "ok",
+          "error": null,
+          "geometric_region_count": 2568,
+          "candidate_count": 2325,
+          "fit_count": 168,
+          "meets_100_region_points": true,
+          "meets_100_fit_points": true,
+          "deepest_indentation_mm": 1.9838365316390991,
+          "maximum_depth_range_mm": 1.7838123440742493,
+          "radial_rmse_mm": 0.03907282050050878,
+          "center_x_mm": -12.833059108326042,
+          "center_y_mm": -3.8776758635846553,
+          "center_z_mm": 51.07469922907299,
+          "jacobian_condition": 3.3531164356171907,
+          "convergence_status": "not_converged",
+          "converged_depth_mm": null,
+          "converged_rmse_mm": null,
+          "converged_fit_count": null
+        },
+        {
+          "thickness_mm": 7.0,
+          "method": "reference",
+          "contact": 2,
+          "radius_mm": 1.5,
+          "fit_depth_mm": 0.4,
+          "status": "ok",
+          "error": null,
+          "geometric_region_count": 456,
+          "candidate_count": 369,
+          "fit_count": 158,
+          "meets_100_region_points": true,
+          "meets_100_fit_points": true,
+          "deepest_indentation_mm": 0.9865607619285583,
+          "maximum_depth_range_mm": 0.7857545912265778,
+          "radial_rmse_mm": 0.09143080284943776,
+          "center_x_mm": -2.5985231303047027,
+          "center_y_mm": -3.794031313049005,
+          "center_z_mm": 49.503609046508416,
+          "jacobian_condition": 2.417314974264649,
+          "convergence_status": "not_converged",
+          "converged_depth_mm": null,
+          "converged_rmse_mm": null,
+          "converged_fit_count": null
+        },
+        {
+          "thickness_mm": 7.0,
+          "method": "reference",
+          "contact": 3,
+          "radius_mm": 1.0,
+          "fit_depth_mm": 0.4,
+          "status": "ok",
+          "error": null,
+          "geometric_region_count": 173,
+          "candidate_count": 173,
+          "fit_count": 57,
+          "meets_100_region_points": true,
+          "meets_100_fit_points": false,
+          "deepest_indentation_mm": 0.8882101774215698,
+          "maximum_depth_range_mm": 0.6880822628736496,
+          "radial_rmse_mm": 0.06129739431942973,
+          "center_x_mm": 7.664247659331332,
+          "center_y_mm": -4.004414139850963,
+          "center_z_mm": 49.226521411040636,
+          "jacobian_condition": 2.6948849585720445,
+          "convergence_status": "not_converged",
+          "converged_depth_mm": null,
+          "converged_rmse_mm": null,
+          "converged_fit_count": null
+        }
+      ],
+      "position_comparison": [
+        {
+          "method": "reference",
+          "depth_mm": 0.4,
+          "contact_a": 1,
+          "contact_b": 2,
+          "distance_mm": 10.354759652353033,
+          "scan_distance_mm": 9.246099635200732,
+          "error_mm": 1.1086600171523013
+        },
+        {
+          "method": "reference",
+          "depth_mm": 0.4,
+          "contact_a": 1,
+          "contact_b": 3,
+          "distance_mm": 20.58085053065569,
+          "scan_distance_mm": 18.45129053971347,
+          "error_mm": 2.129559990942223
+        },
+        {
+          "method": "reference",
+          "depth_mm": 0.4,
+          "contact_a": 2,
+          "contact_b": 3,
+          "distance_mm": 10.268666065860208,
+          "scan_distance_mm": 9.249155618528103,
+          "error_mm": 1.0195104473321042
+        }
+      ],
+      "components": [
+        {
+          "component": 1,
+          "assigned_contact": 1,
+          "status": "matched",
+          "geometry_count": 2568,
+          "candidate_count": 2325,
+          "pixel_u_px": 198.12664885748,
+          "pixel_v_px": 211.89095869518462,
+          "candidate_contact_ids": [
+            1
+          ],
+          "anchor_distance_px": 2.3057412603208762,
+          "anchor_limit_px": 34.80919418774299
+        },
+        {
+          "component": 2,
+          "assigned_contact": 2,
+          "status": "matched",
+          "geometry_count": 456,
+          "candidate_count": 369,
+          "pixel_u_px": 282.4768618813044,
+          "pixel_v_px": 209.582094602947,
+          "candidate_contact_ids": [
+            2
+          ],
+          "anchor_distance_px": 0.7826286590793906,
+          "anchor_limit_px": 34.80919418774299
+        },
+        {
+          "component": 3,
+          "assigned_contact": 3,
+          "status": "matched",
+          "geometry_count": 173,
+          "candidate_count": 173,
+          "pixel_u_px": 371.12548988743833,
+          "pixel_v_px": 209.0527897884971,
+          "candidate_contact_ids": [
+            3
+          ],
+          "anchor_distance_px": 0.1361413736483338,
+          "anchor_limit_px": 35.2
+        }
+      ],
+      "contact_anchors_uv_px": [
+        [
+          196.0,
+          211.0
+        ],
+        [
+          283.0,
+          209.0
+        ],
+        [
+          371.0,
+          209.0
+        ]
+      ],
+      "anchor_diagnostics": [
+        {
+          "contact": 1,
+          "window_radius_px": 30.0,
+          "deepest_indentation_mm": 1.9838365316390991,
+          "below_minus_0p2_mm": 1585
+        },
+        {
+          "contact": 2,
+          "window_radius_px": 30.0,
+          "deepest_indentation_mm": 0.9865607619285583,
+          "below_minus_0p2_mm": 456
+        },
+        {
+          "contact": 3,
+          "window_radius_px": 30.0,
+          "deepest_indentation_mm": 0.8882101774215698,
+          "below_minus_0p2_mm": 173
+        }
+      ],
+      "rigid_aligned_center_error_mm": [
+        1.0796876183410242,
+        0.03408529832983371,
+        1.049938247755135
+      ],
+      "distance_rmse_mm": 1.5059387261631076,
+      "training": {
+        "sample_count": 30581,
+        "image_count": 36,
+        "valid_nodes": 10198,
+        "options": {
+          "size": 64,
+          "maximum_rms_angle_degrees": 5.0
+        }
+      },
+      "model_supported_points": 46013,
+      "equation_points": 46013,
+      "right_photometric_points_over_0p2_mm": 15,
+      "solver_status": 2,
+      "solver_iterations": 346
+    },
+    "learned": {
+      "spheres": [
+        {
+          "thickness_mm": 7.0,
+          "method": "learned",
+          "contact": 1,
+          "radius_mm": 2.0,
+          "fit_depth_mm": 0.4,
+          "status": "ok",
+          "error": null,
+          "geometric_region_count": 1614,
+          "candidate_count": 1472,
+          "fit_count": 160,
+          "meets_100_region_points": true,
+          "meets_100_fit_points": true,
+          "deepest_indentation_mm": 2.087567090988159,
+          "maximum_depth_range_mm": 1.8874384313821793,
+          "radial_rmse_mm": 0.047103556904414624,
+          "center_x_mm": -13.001028241521565,
+          "center_y_mm": -4.165170540246588,
+          "center_z_mm": 51.03421959541142,
+          "jacobian_condition": 3.44640697683502,
+          "convergence_status": "converged",
+          "converged_depth_mm": 0.36,
+          "converged_rmse_mm": 0.045772268749907856,
+          "converged_fit_count": 134
+        },
+        {
+          "thickness_mm": 7.0,
+          "method": "learned",
+          "contact": 2,
+          "radius_mm": 1.5,
+          "fit_depth_mm": 0.4,
+          "status": "ok",
+          "error": null,
+          "geometric_region_count": 322,
+          "candidate_count": 255,
+          "fit_count": 135,
+          "meets_100_region_points": true,
+          "meets_100_fit_points": true,
+          "deepest_indentation_mm": 0.9297756552696228,
+          "maximum_depth_range_mm": 0.7264697551727295,
+          "radial_rmse_mm": 0.05287198932150142,
+          "center_x_mm": -2.5434425053643763,
+          "center_y_mm": -3.975382955864109,
+          "center_z_mm": 49.66286476914831,
+          "jacobian_condition": 2.7689554613763976,
+          "convergence_status": "not_converged",
+          "converged_depth_mm": null,
+          "converged_rmse_mm": null,
+          "converged_fit_count": null
+        },
+        {
+          "thickness_mm": 7.0,
+          "method": "learned",
+          "contact": 3,
+          "radius_mm": 1.0,
+          "fit_depth_mm": 0.4,
+          "status": "contact_not_detected",
+          "error": "No supported component inside the image anchor window",
+          "geometric_region_count": 0,
+          "candidate_count": 0,
+          "fit_count": 0,
+          "meets_100_region_points": false,
+          "meets_100_fit_points": false,
+          "deepest_indentation_mm": null,
+          "maximum_depth_range_mm": null,
+          "radial_rmse_mm": null,
+          "center_x_mm": null,
+          "center_y_mm": null,
+          "center_z_mm": null,
+          "jacobian_condition": null,
+          "convergence_status": "not_available",
+          "converged_depth_mm": null,
+          "converged_rmse_mm": null,
+          "converged_fit_count": null
+        }
+      ],
+      "position_comparison": [
+        {
+          "method": "learned",
+          "depth_mm": 0.4,
+          "contact_a": 1,
+          "contact_b": 2,
+          "distance_mm": 10.548826134493789,
+          "scan_distance_mm": 9.246099635200732,
+          "error_mm": 1.3027264992930565
+        }
+      ],
+      "components": [
+        {
+          "component": 1,
+          "assigned_contact": 1,
+          "status": "matched",
+          "geometry_count": 1614,
+          "candidate_count": 1472,
+          "pixel_u_px": 196.74410696029662,
+          "pixel_v_px": 210.26759061813354,
+          "candidate_contact_ids": [
+            1
+          ],
+          "anchor_distance_px": 1.0440874824495723,
+          "anchor_limit_px": 34.80919418774299
+        },
+        {
+          "component": 2,
+          "assigned_contact": null,
+          "status": "outside_anchor_windows",
+          "geometry_count": 236,
+          "candidate_count": 222,
+          "pixel_u_px": 208.74667468371692,
+          "pixel_v_px": 125.25243518588779,
+          "candidate_contact_ids": [],
+          "anchor_distance_px": null,
+          "anchor_limit_px": null
+        },
+        {
+          "component": 3,
+          "assigned_contact": 2,
+          "status": "matched",
+          "geometry_count": 322,
+          "candidate_count": 255,
+          "pixel_u_px": 282.7136192039207,
+          "pixel_v_px": 208.6659038402416,
+          "candidate_contact_ids": [
+            2
+          ],
+          "anchor_distance_px": 0.4400388668382783,
+          "anchor_limit_px": 34.80919418774299
+        },
+        {
+          "component": 4,
+          "assigned_contact": null,
+          "status": "outside_anchor_windows",
+          "geometry_count": 5266,
+          "candidate_count": 4744,
+          "pixel_u_px": 507.92996554904516,
+          "pixel_v_px": 155.64930291823399,
+          "candidate_contact_ids": [],
+          "anchor_distance_px": null,
+          "anchor_limit_px": null
+        }
+      ],
+      "contact_anchors_uv_px": [
+        [
+          196.0,
+          211.0
+        ],
+        [
+          283.0,
+          209.0
+        ],
+        [
+          371.0,
+          209.0
+        ]
+      ],
+      "anchor_diagnostics": [
+        {
+          "contact": 1,
+          "window_radius_px": 30.0,
+          "deepest_indentation_mm": 2.087567090988159,
+          "below_minus_0p2_mm": 1449
+        },
+        {
+          "contact": 2,
+          "window_radius_px": 30.0,
+          "deepest_indentation_mm": 0.9297756552696228,
+          "below_minus_0p2_mm": 322
+        },
+        {
+          "contact": 3,
+          "window_radius_px": 30.0,
+          "deepest_indentation_mm": 0.29105144739151,
+          "below_minus_0p2_mm": 17
+        }
+      ],
+      "training": {
+        "sample_count": 30581,
+        "image_count": 36,
+        "valid_nodes": 9007,
+        "options": {
+          "size": 64,
+          "maximum_rms_angle_degrees": 5.0
+        }
+      },
+      "model_supported_points": 46013,
+      "equation_points": 46013,
+      "right_photometric_points_over_0p2_mm": 4646,
+      "solver_status": 2,
+      "solver_iterations": 336
+    }
+  },
+  "shared_depth_comparison": [
+    {
+      "contacts": [
+        1,
+        2
+      ],
+      "depth_count": 32,
+      "depth_range_mm": [
+        0.1,
+        0.72
+      ],
+      "reference_lower_error_count": 32,
+      "learned_lower_error_count": 0
+    },
+    {
+      "contacts": [
+        1,
+        3
+      ],
+      "depth_count": 0,
+      "depth_range_mm": null,
+      "reference_lower_error_count": 0,
+      "learned_lower_error_count": 0
+    },
+    {
+      "contacts": [
+        2,
+        3
+      ],
+      "depth_count": 0,
+      "depth_range_mm": null,
+      "reference_lower_error_count": 0,
+      "learned_lower_error_count": 0
+    }
+  ]
+}

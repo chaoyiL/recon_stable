@@ -23,7 +23,10 @@ from scipy.spatial import cKDTree
 from scipy.spatial.distance import pdist
 
 from calibrate.utils.visualize_norm import _check_declarations, _frame_paths, _load_samples
+from utils.calibration_store import resolve_artifacts
+from utils.config import load_config
 from utils.normal_mapping import NormalCalibration, build_normal_lut, find_ambiguous_color_pairs, lookup_slopes_raw
+from utils.normal_models import load_normal_model
 from utils.image_io import cached_linear_rgb
 from utils.region_annotations import load_regions
 from utils.surface_geometry import local_slopes_to_normals
@@ -32,6 +35,58 @@ from utils.surface_geometry import local_slopes_to_normals
 MODE_NAMES = ('sparse', 'connected_spread', 'dominant_with_sparse_alternative',
               'multiple_supported_components', 'fragmented_low_support')
 BRANCH_NAMES = ('no_outer_support', 'main_support', 'multiple_branches')
+DEFAULT_CONFIG = Path(__file__).resolve().parents[2]/'config.yaml'
+
+
+def _analysis_model_paths(work, config_path, calibration_file=None, training_calibration_file=None):
+    """Resolve the selected bundle or an explicitly supplied legacy model pair."""
+    if calibration_file is not None:
+        calibration_path = Path(calibration_file).expanduser().resolve()
+    else:
+        try:
+            calibration_path = resolve_artifacts(config_path).model_file
+        except (FileNotFoundError, ValueError):
+            raw = load_config(config_path).get('normal_calibration') or {}
+            legacy = work/'normal_lut.npz'
+            if not isinstance(raw, dict) or 'method' in raw or 'lut_dir' in raw or not legacy.is_file():
+                raise
+            calibration_path = legacy
+    if training_calibration_file is not None:
+        training_path = Path(training_calibration_file).expanduser().resolve()
+    else:
+        training_path = calibration_path.parent/'normal_lut_train.npz'
+        alternate = calibration_path.with_name(calibration_path.stem+'_train.npz')
+        if not training_path.is_file() and alternate.is_file():
+            training_path = alternate
+    return calibration_path, training_path
+
+
+def _analysis_lut(path):
+    model = load_normal_model(path)
+    if not isinstance(model, NormalCalibration):
+        raise ValueError('MLP calibration has no 3D LUT; use calibrate-norm --stage compare')
+    return model
+
+
+def _check_training_split(model, training_model, samples):
+    if training_model.metadata.get('validation_status') != 'training_only':
+        raise ValueError('Training LUT must declare training_only validation_status')
+    _check_declarations(training_model.metadata, model)
+    training = training_model.metadata.get('training_images')
+    validation = training_model.metadata.get('validation_images')
+    if not isinstance(training, list) or not isinstance(validation, list) or not training or not validation:
+        raise ValueError('Training LUT must declare nonempty training and held-out image lists')
+    training_set, validation_set = set(training), set(validation)
+    names = samples['image_paths'][samples['image_index']]
+    if training_set & validation_set or training_set | validation_set != set(names.tolist()):
+        raise ValueError('Training LUT must declare a disjoint, complete image split')
+    report = model.metadata.get('validation')
+    if report and (set(report.get('training_images', [])) != training_set
+                   or set(report.get('validation_images', [])) != validation_set):
+        raise ValueError('Training LUT does not match the final LUT validation split')
+    expected_count = training_model.metadata.get('total_sample_count')
+    if expected_count is not None and expected_count != int(np.isin(names, training).sum()):
+        raise ValueError('Training LUT/sample count mismatch')
 
 
 def _normals(slopes):
@@ -649,11 +704,10 @@ def _prediction_score(prediction, truth, groups, names):
                         for group in np.unique(groups)])
 
 
-def _remedy_experiments(work, samples, st, color_threshold, angle_threshold, output):
+def _remedy_experiments(model, samples, st, color_threshold, angle_threshold, output):
     colors, slopes, groups, names = (samples[key] for key in
         ('color_residual_samples', 'slope_samples', 'image_index', 'image_paths'))
     normals = _normals(slopes)
-    model = NormalCalibration.load(work/'normal_lut_train.npz')
     train = np.isin(names[groups], model.metadata['training_images'])
     held = np.isin(names[groups], model.metadata['validation_images'])
     if not (np.all(train | held) and not np.any(train & held)):
@@ -735,6 +789,9 @@ def _write_point_csv(output, samples, context, bad, near_degree, bad_degree, til
 
 
 def analyze_ambiguities(work_dir: str | Path, output_dir: str | Path | None = None, *,
+                        config_path: str | Path = DEFAULT_CONFIG,
+                        calibration_file: str | Path | None = None,
+                        training_calibration_file: str | Path | None = None,
                         color_distance_threshold: float = .01,
                         normal_angle_threshold_degrees: float = 20.,
                         dominance_fraction: float = .8) -> Path:
@@ -743,6 +800,17 @@ def analyze_ambiguities(work_dir: str | Path, output_dir: str | Path | None = No
     output = Path(output_dir).expanduser().resolve() if output_dir else work/'ambiguity_analysis'
     if output == work or output in work.parents:
         raise ValueError('Analysis output must not contain calibration inputs')
+    calibration_path, training_path = _analysis_model_paths(
+        work, config_path, calibration_file, training_calibration_file)
+    if any(output == path or output in path.parents for path in (calibration_path, training_path)):
+        raise ValueError('Analysis output must not contain calibration models')
+    model = _analysis_lut(calibration_path)
+    if not training_path.is_file():
+        raise FileNotFoundError(f'Training LUT not found: {training_path}; '
+                                'provide --training-calibration with the matching training model')
+    training_model = _analysis_lut(training_path)
+    samples = _load_samples(work/'normal_samples.npz', model)
+    _check_training_split(model, training_model, samples)
     if output.exists():
         prior = output/'analysis.json'
         if not prior.is_file() or json.loads(prior.read_text()).get('report_kind') != 'normal_ambiguity_analysis':
@@ -754,12 +822,10 @@ def analyze_ambiguities(work_dir: str | Path, output_dir: str | Path | None = No
                      'branch_classification_pairs.csv', 'branch_classification_points.csv'}
         if any(path.name not in generated or not path.is_file() for path in output.iterdir()):
             raise ValueError('Analysis output contains unrelated files')
-    sources = [work/'normal_samples.npz', work/'normal_lut.npz', work/'normal_lut_train.npz',
+    sources = [work/'normal_samples.npz', calibration_path, training_path,
                work/'manual_regions.yaml', *sorted((work/'frames').glob('*.npz')),
                *sorted((work/'overall').glob('*.npz'))]
     hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in sources}
-    model = NormalCalibration.load(work/'normal_lut.npz')
-    samples = _load_samples(work/'normal_samples.npz', model)
     frame_paths = _frame_paths(work, samples, model)
     with np.load(work/'normal_samples.npz', allow_pickle=False) as data:
         st = data['st_samples'].astype(float)
@@ -789,7 +855,7 @@ def analyze_ambiguities(work_dir: str | Path, output_dir: str | Path | None = No
             normal_angle_threshold_degrees, staging, classes, dominance_fraction)
         _continuation_figure(samples, continuation, staging)
         _classification_figure(samples, expanded_classes, continuation['expanded_classification'], staging)
-        experiments = _remedy_experiments(work, samples, st, color_distance_threshold,
+        experiments = _remedy_experiments(training_model, samples, st, color_distance_threshold,
                                          normal_angle_threshold_degrees, staging)
         _remedy_figure(experiments, staging)
         _write_point_csv(staging, samples, context, bad, near_degree, bad_degree, tilt, classes, expanded_classes)

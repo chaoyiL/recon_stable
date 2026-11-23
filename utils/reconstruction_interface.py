@@ -51,7 +51,9 @@ class MaterialCoordinateMap:
     def __post_init__(self) -> None:
         xyz = np.asarray(self.xyz, np.float32)
         uv = np.asarray(self.uv, np.float32)
-        coordinates = np.asarray(self.coordinates, np.float32)
+        # Frozen native boundaries must survive serialization without moving
+        # outside the chart through float32 rounding.
+        coordinates = np.asarray(self.coordinates, np.float64)
         valid = np.asarray(self.valid_mask, np.bool_)
         shape = xyz.shape[:2]
         if xyz.ndim != 3 or xyz.shape[-1] != 3:

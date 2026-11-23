@@ -12,6 +12,11 @@ tests/
 
 # 本地采集/标定数据（体积过大，不纳入版本控制）
 assets/
+accurate_models/
+
+# 所有版本的离散 LUT、神经标定模型及配套网格
+/lut/
+/lut_stable/
 
 # 运行时生成的标定输出
 camera_calibration.yaml

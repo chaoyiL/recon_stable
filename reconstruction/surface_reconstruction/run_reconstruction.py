@@ -18,14 +18,14 @@ try:
     from .surface import SurfaceModel, local_coordinates
     from .tracking import TrackingSeed, MarkerTracker, require_regular_template
     from .display import SurfaceView, marker_overlay
-    from .markers import inspect_cross_candidates, find_inner_region
+    from .markers import inspect_cross_candidates, find_tracking_region
 except ImportError:  # Keep ``python run_reconstruction.py`` working.
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from surface import SurfaceModel, local_coordinates
     from tracking import TrackingSeed, MarkerTracker, require_regular_template
     from display import SurfaceView, marker_overlay
-    from markers import inspect_cross_candidates, find_inner_region
+    from markers import inspect_cross_candidates, find_tracking_region
 
 try:
     from utils.color_difference import bgr8_to_linear_rgb
@@ -113,7 +113,8 @@ class SurfaceReconstructionSession:
             self.shape_failed_frames = 0
         except (ValueError, RuntimeError, cv2.error) as exc:
             self.shape_failed_frames += 1
-            info = {'status': 'insufficient_observations' if fit_valid.sum() < 32 else 'fit_rejected'}
+            status = 'insufficient_observations' if fit_valid.sum() < self.model.minimum_observations else 'fit_rejected'
+            info = {'status': status}
             error = str(exc)
         return dict(tracking=tracking, marker_fit_valid=fit_valid, points=points,
                     coefficients=coefficients, info=info, error=error, segment=self.segment)
@@ -130,12 +131,11 @@ class SurfaceReconstructionSession:
                         valid=np.zeros(len(self.ids), bool), confidence=np.zeros(len(self.ids)))
         region = None
         try:
-            gray = cv2.cvtColor(tracking_bgr, cv2.COLOR_BGR2GRAY)
-            region = find_inner_region(gray)
+            gray, region = find_tracking_region(tracking_bgr)
             if self.tracker is None:
                 seed, _, _ = TrackingSeed.build(
                     frame_linear_rgb, self.ids, self.xy, self.row_direction,
-                    region=region, tracking_bgr=tracking_bgr)
+                    region=region, tracking_bgr=tracking_bgr, tracking_gray=gray)
                 self.tracker = MarkerTracker(seed)
                 self.model.reset()
                 self.segment += 1
@@ -144,7 +144,7 @@ class SurfaceReconstructionSession:
                                 confidence=np.ones(len(self.ids)))
             else:
                 tracking = self.tracker.update(
-                    frame_linear_rgb, tracking_bgr=tracking_bgr)
+                    frame_linear_rgb, tracking_bgr=tracking_bgr, tracking_gray=gray)
                 # Invalid slots still locate conservative photometric holes.
                 tracking['pixels'] = np.where(np.isfinite(tracking['pixels']),
                                              tracking['pixels'], self.tracker.positions)
@@ -192,9 +192,14 @@ class SurfaceReconstructionProvider:
             from .surface import BicubicSurfaceAdapter
         except ImportError:
             from surface import BicubicSurfaceAdapter
+        from utils.surface_domain import DOMAIN_KIND
         bounds = BicubicSurfaceAdapter(self.session.model, np.zeros((16, 3))).parameter_bounds
-        if not np.allclose(bounds, chart.parameter_bounds, atol=1e-12, rtol=0):
-            raise ValueError('Coordinate chart does not match physical template')
+        if chart.domain_kind != DOMAIN_KIND:
+            raise ValueError('Coordinate chart predates black-frame domain; rerun prepare and calibration')
+        domain = np.asarray(chart.parameter_bounds, np.float64)
+        template = np.asarray(bounds, np.float64)
+        if np.any(domain[[0, 2]] > template[[0, 2]]) or np.any(domain[[1, 3]] < template[[1, 3]]):
+            raise ValueError('Coordinate chart does not contain the physical marker template')
         self.coordinate_chart = chart
 
     def reset(self, *, clear_coordinate_chart=False):
@@ -226,16 +231,23 @@ class SurfaceReconstructionProvider:
             from .surface import BicubicSurfaceAdapter
         except ImportError:
             from surface import BicubicSurfaceAdapter
-        surface = BicubicSurfaceAdapter(self.session.model, coefficients)
-        if self.contact_offset_mm != 0:
-            from utils.surface_geometry import OffsetSurface
-            surface = OffsetSurface(surface, self.contact_offset_mm)
-        if self.coordinate_chart is None:
-            self.bind_coordinate_chart(build_arclength_chart(surface))
-        chart = self.coordinate_chart
-        mask = self._surface_mask(surface_mask)
+        from utils.surface_domain import DOMAIN_KIND, estimate_reference_bounds, extend_surface
+        from utils.surface_geometry import OffsetSurface
+        marker_surface = BicubicSurfaceAdapter(self.session.model, coefficients)
         camera = CameraModel(self.session.camera, self.session.distortion,
                              self.session.expected_size[::-1])
+        mask = self._surface_mask(surface_mask)
+        if self.coordinate_chart is None:
+            reference_mask = self._surface_mask(None)
+            if reference_mask is None:
+                raise ValueError('Reference black-frame mask is required to establish the material domain')
+            bounds = estimate_reference_bounds(marker_surface, self.contact_offset_mm, camera, reference_mask)
+            surface = OffsetSurface(extend_surface(marker_surface, bounds), self.contact_offset_mm)
+            self.bind_coordinate_chart(build_arclength_chart(surface, domain_kind=DOMAIN_KIND))
+        else:
+            bounds = self.coordinate_chart.parameter_bounds
+            surface = OffsetSurface(extend_surface(marker_surface, bounds), self.contact_offset_mm)
+        chart = self.coordinate_chart
         maps = {}
         for name in ('geometry', 'lightfield', 'observation'):
             spec = getattr(specs, name)

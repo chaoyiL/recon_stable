@@ -1,0 +1,526 @@
+{
+  "lut_method": "table",
+  "image": "assets/test_pics/3b/3b2.npz",
+  "scan": "accurate_models/scan.ply",
+  "learned_background": "optical_learning/generation_04/runs/paired_curvature/per_frame/model.npz",
+  "reference_image": "assets/reference.npz",
+  "coordinate_chart_id": "964da13e-3ace-4fae-a45a-0721e5aee9a0",
+  "grid_shape": [
+    400,
+    159
+  ],
+  "photometric_points": 46013,
+  "contact_offset_mm": 7.0,
+  "background_smoothing_half_width_mm": 2.0,
+  "comparison_depth_mm": 0.4,
+  "depth_scan": {
+    "step_mm": 0.02,
+    "min_fit_points": 100,
+    "stable_steps": 5,
+    "rmse_atol_mm": 0.005,
+    "rmse_rtol": 0.01
+  },
+  "scan_spheres": [
+    {
+      "contact": 1,
+      "cap_points": 20459,
+      "fit_points": 15696,
+      "center_xyz_mm": [
+        -117.7980653673369,
+        -69.62160511470096,
+        -184.54251196431235
+      ],
+      "radius_mm": 2.0,
+      "radial_rms_mm": 0.040443342545266645,
+      "jacobian_condition": 1.5955802734035047
+    },
+    {
+      "contact": 2,
+      "cap_points": 11907,
+      "fit_points": 9902,
+      "center_xyz_mm": [
+        -127.02658264363293,
+        -69.77660520651419,
+        -183.99405748424797
+      ],
+      "radius_mm": 1.5,
+      "radial_rms_mm": 0.03588826498660158,
+      "jacobian_condition": 1.5429915975729867
+    },
+    {
+      "contact": 3,
+      "cap_points": 4851,
+      "fit_points": 4067,
+      "center_xyz_mm": [
+        -136.24662023034077,
+        -69.88563328003058,
+        -184.7192467248122
+      ],
+      "radius_mm": 1.0,
+      "radial_rms_mm": 0.038734392728193456,
+      "jacobian_condition": 1.650625234903635
+    }
+  ],
+  "scan_center_distances_mm": {
+    "1-2": 9.246099635200732,
+    "1-3": 18.45129053971347,
+    "2-3": 9.249155618528103
+  },
+  "background_difference_rms": 0.02237504685102822,
+  "right_background_difference_rms": 0.026851615155532197,
+  "methods": {
+    "reference": {
+      "spheres": [
+        {
+          "thickness_mm": 7.0,
+          "method": "reference",
+          "contact": 1,
+          "radius_mm": 2.0,
+          "fit_depth_mm": 0.4,
+          "status": "ok",
+          "error": null,
+          "geometric_region_count": 2568,
+          "candidate_count": 2325,
+          "fit_count": 168,
+          "meets_100_region_points": true,
+          "meets_100_fit_points": true,
+          "deepest_indentation_mm": 1.9838365316390991,
+          "maximum_depth_range_mm": 1.7838123440742493,
+          "radial_rmse_mm": 0.03907282050050878,
+          "center_x_mm": -12.833059108326042,
+          "center_y_mm": -3.8776758635846553,
+          "center_z_mm": 51.07469922907299,
+          "jacobian_condition": 3.3531164356171907,
+          "convergence_status": "not_converged",
+          "converged_depth_mm": null,
+          "converged_rmse_mm": null,
+          "converged_fit_count": null
+        },
+        {
+          "thickness_mm": 7.0,
+          "method": "reference",
+          "contact": 2,
+          "radius_mm": 1.5,
+          "fit_depth_mm": 0.4,
+          "status": "ok",
+          "error": null,
+          "geometric_region_count": 456,
+          "candidate_count": 369,
+          "fit_count": 158,
+          "meets_100_region_points": true,
+          "meets_100_fit_points": true,
+          "deepest_indentation_mm": 0.9865607619285583,
+          "maximum_depth_range_mm": 0.7857545912265778,
+          "radial_rmse_mm": 0.09143080284943776,
+          "center_x_mm": -2.5985231303047027,
+          "center_y_mm": -3.794031313049005,
+          "center_z_mm": 49.503609046508416,
+          "jacobian_condition": 2.417314974264649,
+          "convergence_status": "not_converged",
+          "converged_depth_mm": null,
+          "converged_rmse_mm": null,
+          "converged_fit_count": null
+        },
+        {
+          "thickness_mm": 7.0,
+          "method": "reference",
+          "contact": 3,
+          "radius_mm": 1.0,
+          "fit_depth_mm": 0.4,
+          "status": "ok",
+          "error": null,
+          "geometric_region_count": 173,
+          "candidate_count": 173,
+          "fit_count": 57,
+          "meets_100_region_points": true,
+          "meets_100_fit_points": false,
+          "deepest_indentation_mm": 0.8882101774215698,
+          "maximum_depth_range_mm": 0.6880822628736496,
+          "radial_rmse_mm": 0.06129739431942973,
+          "center_x_mm": 7.664247659331332,
+          "center_y_mm": -4.004414139850963,
+          "center_z_mm": 49.226521411040636,
+          "jacobian_condition": 2.6948849585720445,
+          "convergence_status": "not_converged",
+          "converged_depth_mm": null,
+          "converged_rmse_mm": null,
+          "converged_fit_count": null
+        }
+      ],
+      "position_comparison": [
+        {
+          "method": "reference",
+          "depth_mm": 0.4,
+          "contact_a": 1,
+          "contact_b": 2,
+          "distance_mm": 10.354759652353033,
+          "scan_distance_mm": 9.246099635200732,
+          "error_mm": 1.1086600171523013
+        },
+        {
+          "method": "reference",
+          "depth_mm": 0.4,
+          "contact_a": 1,
+          "contact_b": 3,
+          "distance_mm": 20.58085053065569,
+          "scan_distance_mm": 18.45129053971347,
+          "error_mm": 2.129559990942223
+        },
+        {
+          "method": "reference",
+          "depth_mm": 0.4,
+          "contact_a": 2,
+          "contact_b": 3,
+          "distance_mm": 10.268666065860208,
+          "scan_distance_mm": 9.249155618528103,
+          "error_mm": 1.0195104473321042
+        }
+      ],
+      "components": [
+        {
+          "component": 1,
+          "assigned_contact": 1,
+          "status": "matched",
+          "geometry_count": 2568,
+          "candidate_count": 2325,
+          "pixel_u_px": 198.12664885748,
+          "pixel_v_px": 211.89095869518462,
+          "candidate_contact_ids": [
+            1
+          ],
+          "anchor_distance_px": 2.3057412603208762,
+          "anchor_limit_px": 34.80919418774299
+        },
+        {
+          "component": 2,
+          "assigned_contact": 2,
+          "status": "matched",
+          "geometry_count": 456,
+          "candidate_count": 369,
+          "pixel_u_px": 282.4768618813044,
+          "pixel_v_px": 209.582094602947,
+          "candidate_contact_ids": [
+            2
+          ],
+          "anchor_distance_px": 0.7826286590793906,
+          "anchor_limit_px": 34.80919418774299
+        },
+        {
+          "component": 3,
+          "assigned_contact": 3,
+          "status": "matched",
+          "geometry_count": 173,
+          "candidate_count": 173,
+          "pixel_u_px": 371.12548988743833,
+          "pixel_v_px": 209.0527897884971,
+          "candidate_contact_ids": [
+            3
+          ],
+          "anchor_distance_px": 0.1361413736483338,
+          "anchor_limit_px": 35.2
+        }
+      ],
+      "contact_anchors_uv_px": [
+        [
+          196.0,
+          211.0
+        ],
+        [
+          283.0,
+          209.0
+        ],
+        [
+          371.0,
+          209.0
+        ]
+      ],
+      "anchor_diagnostics": [
+        {
+          "contact": 1,
+          "window_radius_px": 30.0,
+          "deepest_indentation_mm": 1.9838365316390991,
+          "below_minus_0p2_mm": 1585
+        },
+        {
+          "contact": 2,
+          "window_radius_px": 30.0,
+          "deepest_indentation_mm": 0.9865607619285583,
+          "below_minus_0p2_mm": 456
+        },
+        {
+          "contact": 3,
+          "window_radius_px": 30.0,
+          "deepest_indentation_mm": 0.8882101774215698,
+          "below_minus_0p2_mm": 173
+        }
+      ],
+      "rigid_aligned_center_error_mm": [
+        1.0796876183410242,
+        0.03408529832983371,
+        1.049938247755135
+      ],
+      "distance_rmse_mm": 1.5059387261631076,
+      "training": {
+        "sample_count": 30581,
+        "image_count": 36,
+        "valid_nodes": 10198,
+        "options": {
+          "size": 64,
+          "maximum_rms_angle_degrees": 5.0
+        }
+      },
+      "model_supported_points": 46013,
+      "equation_points": 46013,
+      "right_photometric_points_over_0p2_mm": 15,
+      "solver_status": 2,
+      "solver_iterations": 346
+    },
+    "learned": {
+      "spheres": [
+        {
+          "thickness_mm": 7.0,
+          "method": "learned",
+          "contact": 1,
+          "radius_mm": 2.0,
+          "fit_depth_mm": 0.4,
+          "status": "ok",
+          "error": null,
+          "geometric_region_count": 1471,
+          "candidate_count": 1356,
+          "fit_count": 186,
+          "meets_100_region_points": true,
+          "meets_100_fit_points": true,
+          "deepest_indentation_mm": 1.746917724609375,
+          "maximum_depth_range_mm": 1.5468752533197403,
+          "radial_rmse_mm": 0.03716725426881103,
+          "center_x_mm": -12.934281025286364,
+          "center_y_mm": -3.959230475059084,
+          "center_z_mm": 51.34297995004025,
+          "jacobian_condition": 3.1462926820392387,
+          "convergence_status": "converged",
+          "converged_depth_mm": 0.36,
+          "converged_rmse_mm": 0.034013209702424066,
+          "converged_fit_count": 167
+        },
+        {
+          "thickness_mm": 7.0,
+          "method": "learned",
+          "contact": 2,
+          "radius_mm": 1.5,
+          "fit_depth_mm": 0.4,
+          "status": "ok",
+          "error": null,
+          "geometric_region_count": 337,
+          "candidate_count": 261,
+          "fit_count": 141,
+          "meets_100_region_points": true,
+          "meets_100_fit_points": true,
+          "deepest_indentation_mm": 0.9643988013267517,
+          "maximum_depth_range_mm": 0.7620630860328674,
+          "radial_rmse_mm": 0.07052575687090742,
+          "center_x_mm": -2.5596588655108956,
+          "center_y_mm": -3.8871965825456702,
+          "center_z_mm": 49.56853925868077,
+          "jacobian_condition": 2.745158350379406,
+          "convergence_status": "converged",
+          "converged_depth_mm": 0.32,
+          "converged_rmse_mm": 0.07031179152857536,
+          "converged_fit_count": 127
+        },
+        {
+          "thickness_mm": 7.0,
+          "method": "learned",
+          "contact": 3,
+          "radius_mm": 1.0,
+          "fit_depth_mm": 0.4,
+          "status": "ok",
+          "error": null,
+          "geometric_region_count": 136,
+          "candidate_count": 136,
+          "fit_count": 82,
+          "meets_100_region_points": true,
+          "meets_100_fit_points": false,
+          "deepest_indentation_mm": 0.7378636598587036,
+          "maximum_depth_range_mm": 0.534382089972496,
+          "radial_rmse_mm": 0.07201341458870031,
+          "center_x_mm": 7.626204346444521,
+          "center_y_mm": -3.9693834358338136,
+          "center_z_mm": 49.29650618982944,
+          "jacobian_condition": 2.115697399777014,
+          "convergence_status": "not_converged",
+          "converged_depth_mm": null,
+          "converged_rmse_mm": null,
+          "converged_fit_count": null
+        }
+      ],
+      "position_comparison": [
+        {
+          "method": "learned",
+          "depth_mm": 0.4,
+          "contact_a": 1,
+          "contact_b": 2,
+          "distance_mm": 10.52552201113689,
+          "scan_distance_mm": 9.246099635200732,
+          "error_mm": 1.2794223759361572
+        },
+        {
+          "method": "learned",
+          "depth_mm": 0.4,
+          "contact_a": 1,
+          "contact_b": 3,
+          "distance_mm": 20.662084034651578,
+          "scan_distance_mm": 18.45129053971347,
+          "error_mm": 2.210793494938109
+        },
+        {
+          "method": "learned",
+          "depth_mm": 0.4,
+          "contact_a": 2,
+          "contact_b": 3,
+          "distance_mm": 10.18982659528948,
+          "scan_distance_mm": 9.249155618528103,
+          "error_mm": 0.9406709767613766
+        }
+      ],
+      "components": [
+        {
+          "component": 1,
+          "assigned_contact": 1,
+          "status": "matched",
+          "geometry_count": 1471,
+          "candidate_count": 1356,
+          "pixel_u_px": 196.73253278834846,
+          "pixel_v_px": 211.50412208803237,
+          "candidate_contact_ids": [
+            1
+          ],
+          "anchor_distance_px": 0.8892375192532634,
+          "anchor_limit_px": 34.80919418774299
+        },
+        {
+          "component": 2,
+          "assigned_contact": 2,
+          "status": "matched",
+          "geometry_count": 337,
+          "candidate_count": 261,
+          "pixel_u_px": 282.6149413196753,
+          "pixel_v_px": 208.95064431048453,
+          "candidate_contact_ids": [
+            2
+          ],
+          "anchor_distance_px": 0.38820892748741337,
+          "anchor_limit_px": 34.80919418774299
+        },
+        {
+          "component": 3,
+          "assigned_contact": 3,
+          "status": "matched",
+          "geometry_count": 136,
+          "candidate_count": 136,
+          "pixel_u_px": 371.39592314929496,
+          "pixel_v_px": 209.41710402325887,
+          "candidate_contact_ids": [
+            3
+          ],
+          "anchor_distance_px": 0.5750920851188753,
+          "anchor_limit_px": 35.2
+        }
+      ],
+      "contact_anchors_uv_px": [
+        [
+          196.0,
+          211.0
+        ],
+        [
+          283.0,
+          209.0
+        ],
+        [
+          371.0,
+          209.0
+        ]
+      ],
+      "anchor_diagnostics": [
+        {
+          "contact": 1,
+          "window_radius_px": 30.0,
+          "deepest_indentation_mm": 1.746917724609375,
+          "below_minus_0p2_mm": 1310
+        },
+        {
+          "contact": 2,
+          "window_radius_px": 30.0,
+          "deepest_indentation_mm": 0.9643988013267517,
+          "below_minus_0p2_mm": 337
+        },
+        {
+          "contact": 3,
+          "window_radius_px": 30.0,
+          "deepest_indentation_mm": 0.7378636598587036,
+          "below_minus_0p2_mm": 136
+        }
+      ],
+      "rigid_aligned_center_error_mm": [
+        1.1625577290719746,
+        0.13294328881381198,
+        1.0493463286830365
+      ],
+      "distance_rmse_mm": 1.571558820601166,
+      "training": {
+        "sample_count": 30581,
+        "image_count": 36,
+        "valid_nodes": 10378,
+        "options": {
+          "size": 64,
+          "maximum_rms_angle_degrees": 5.0
+        }
+      },
+      "model_supported_points": 46013,
+      "equation_points": 46013,
+      "right_photometric_points_over_0p2_mm": 6,
+      "solver_status": 2,
+      "solver_iterations": 301
+    }
+  },
+  "shared_depth_comparison": [
+    {
+      "contacts": [
+        1,
+        2
+      ],
+      "depth_count": 35,
+      "depth_range_mm": [
+        0.08,
+        0.76
+      ],
+      "reference_lower_error_count": 35,
+      "learned_lower_error_count": 0
+    },
+    {
+      "contacts": [
+        1,
+        3
+      ],
+      "depth_count": 12,
+      "depth_range_mm": [
+        0.3,
+        0.52
+      ],
+      "reference_lower_error_count": 10,
+      "learned_lower_error_count": 2
+    },
+    {
+      "contacts": [
+        2,
+        3
+      ],
+      "depth_count": 12,
+      "depth_range_mm": [
+        0.3,
+        0.52
+      ],
+      "reference_lower_error_count": 0,
+      "learned_lower_error_count": 12
+    }
+  ]
+}

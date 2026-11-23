@@ -30,6 +30,12 @@ packages = [
     "experiments",
     "experiments.lut_quality",
     "experiments.indentation_analysis",
+    "optical_learning",
+    "optical_learning.generation_02",
+    "optical_anno",
+    "optical_anno.generation_01",
+    "optical_anno.generation_02",
+    "optical_anno.generation_03",
 ]
 py-modules = ["capture"]
 
@@ -41,7 +47,9 @@ capture = "capture:main"
 calibrate-camera = "calibrate.calibrate_camera:main"
 get-surface = "reconstruction.get_surface:main"
 calibrate-norm = "calibrate.calibrate_norm:main"
+draw-contact-area = "calibrate.draw_contact_area:main"
 recon = "reconstruction.recon:main"
+recon-batch = "reconstruction.recon_batch:main"
 local-recon = "reconstruction.local_recon:local_main"
 recon-local = "reconstruction.local_recon:local_main"
 lut-quality = "experiments.lut_quality.runner:main"

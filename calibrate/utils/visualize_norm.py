@@ -12,6 +12,7 @@ from matplotlib.figure import Figure
 
 from utils.color_difference import signed_difference_preview
 from utils.normal_mapping import NormalCalibration, find_ambiguous_color_pairs, lookup_slopes_raw
+from utils.normal_models import load_normal_model
 from utils.surface_geometry import local_slopes_to_normals
 from utils.surface_sampling import rasterize_surface_grid
 
@@ -196,14 +197,20 @@ def _mapping_figures(calibration, samples, predicted, output, slope_limit):
 
 
 def _validation_predictions(calibration_file, calibration, samples):
+    train_path = calibration_file.with_name(calibration_file.stem+'_train.npz')
+    if not train_path.is_file():
+        train_path = calibration_file.parent/'normal_lut_train.npz'
+    if not train_path.is_file():
+        return None, None, None
     report = calibration.metadata.get('validation', {})
     names = samples['image_paths']
     held_out = set(report.get('validation_images', []))
     training = set(report.get('training_images', []))
     if not held_out or training & held_out or training | held_out != set(names.tolist()):
         raise ValueError('LUT must declare the training/held-out image split')
-    train_path = calibration_file.with_name(calibration_file.stem+'_train.npz')
-    train = NormalCalibration.load(train_path)
+    train = load_normal_model(train_path)
+    if not isinstance(train, NormalCalibration):
+        raise ValueError('The training model is an MLP; use calibrate-norm --stage compare')
     if (train.metadata.get('validation_status') != 'training_only'
             or set(train.metadata.get('training_images', [])) != training
             or set(train.metadata.get('validation_images', [])) != held_out):
@@ -225,6 +232,12 @@ def _summary_figure(calibration, samples, predicted, angles, held_prediction, he
         (predicted, np.ones(len(truth), bool), 'All-sample LUT: calibration fit'),
         (held_prediction, held_mask, 'Training-only LUT: held-out images'),
     )):
+        if selected is None:
+            for axis in axes[row, :2]:
+                axis.axis('off')
+                axis.text(.5, .5, 'Training-only LUT unavailable', ha='center', va='center',
+                          transform=axis.transAxes)
+            continue
         ids = np.flatnonzero(selected)
         shown = ids[np.linspace(0, len(ids)-1, min(8000, len(ids)), dtype=int)]
         for component, name in enumerate(('p', 'q')):
@@ -238,21 +251,26 @@ def _summary_figure(calibration, samples, predicted, angles, held_prediction, he
     axes[0, 2].hist(angles[np.isfinite(angles)], bins=50, color='#2878a0')
     axes[0, 2].set(title='All-sample LUT normal-angle differences', xlabel='Angle (degrees)', ylabel='Samples')
     keys = samples['image_paths']
-    metrics = [_statistics(held_angles[(samples['image_index'] == i) & held_mask])
-               for i in range(len(keys)) if held_mask[samples['image_index'] == i].any()]
-    labels = [f'{i:06d}' for i in range(len(keys)) if held_mask[samples['image_index'] == i].any()]
     axis = axes[1, 2]
-    axis.bar(labels, [m['rms_degrees'] for m in metrics], color='#c57a24', label='Held-out RMS')
-    threshold = calibration.metadata['validation']['thresholds']['rms_degrees']
-    axis.axhline(threshold, color='red', linestyle='--', label=f'Limit {threshold:g} deg')
-    axis.set(title='Independent held-out validation', xlabel='Image index (see summary.json)', ylabel='RMS (degrees)')
-    axis.legend(fontsize=8)
+    if held_mask is None:
+        axis.axis('off')
+        axis.text(.5, .5, 'Held-out predictions unavailable', ha='center', va='center', transform=axis.transAxes)
+    else:
+        metrics = [_statistics(held_angles[(samples['image_index'] == i) & held_mask])
+                   for i in range(len(keys)) if held_mask[samples['image_index'] == i].any()]
+        labels = [f'{i:06d}' for i in range(len(keys)) if held_mask[samples['image_index'] == i].any()]
+        axis.bar(labels, [m['rms_degrees'] for m in metrics], color='#c57a24', label='Held-out RMS')
+        threshold = calibration.metadata['validation']['thresholds']['rms_degrees']
+        axis.axhline(threshold, color='red', linestyle='--', label=f'Limit {threshold:g} deg')
+        axis.set(title='Independent held-out validation', xlabel='Image index (see summary.json)', ylabel='RMS (degrees)')
+        axis.legend(fontsize=8)
     supported = int(np.count_nonzero(calibration.original_valid)) if calibration.original_valid is not None else 0
     final_rms = _statistics(angles)['rms_degrees']
-    held_rms = _statistics(held_angles[held_mask])['rms_degrees']
+    held_label = ('held-out RMS: unavailable' if held_mask is None else
+                  f"held-out RMS: {_statistics(held_angles[held_mask])['rms_degrees']:.2f} deg")
     figure.suptitle(f'LUT {calibration.size}^3 | supported nodes {supported}/{calibration.size**3} | '
                    f'{_validation_label(calibration)}\n'
-                   f'All-sample fit RMS: {final_rms:.2f} deg | held-out RMS: {held_rms:.2f} deg')
+                   f'All-sample fit RMS: {final_rms:.2f} deg | {held_label}')
     _save_figure(figure, output/'calibration_summary.png')
 
 
@@ -365,13 +383,15 @@ def generate_calibration_visualizations(
 
     Per-image plots use original distorted image pixels and conservative display
     interpolation; statistics use original material-grid samples. Held-out plots
-    query the sibling *_train.npz, never the final all-sample LUT.
+    use a sibling training LUT when present and are omitted otherwise.
     """
     calibration_file, sample_file, work_dir = (Path(p).expanduser().resolve()
                                                for p in (calibration_file, sample_file, work_dir))
     output = (work_dir/'visualization' if output_dir is None else Path(output_dir).expanduser().resolve())
+    calibration = load_normal_model(calibration_file)
+    if not isinstance(calibration, NormalCalibration):
+        raise ValueError('MLP calibration cannot be shown as a 3D LUT; use calibrate-norm --stage compare')
     _check_output_directory(output, (calibration_file, sample_file, work_dir/'frames', work_dir/'overall'))
-    calibration = NormalCalibration.load(calibration_file)
     status = calibration.metadata.get('validation_status')
     if status not in {'passed', 'failed'}:
         raise ValueError('Visualization requires a validated or failed diagnostic image LUT and its paired samples')
@@ -399,7 +419,7 @@ def generate_calibration_visualizations(
             group = samples['image_index'] == index
             row = dict(index=index, image_key=key, final_LUT=_statistics(angles[group]),
                        color_figure=f'color_difference/{index:06d}.png', pq_figure=f'pq_mapping/{index:06d}.png')
-            if (held_mask & group).any():
+            if held_mask is not None and (held_mask & group).any():
                 row['held_out_training_LUT'] = _statistics(held_angles[group & held_mask])
             rows.append(row)
             _frame_figures(paths[key], index, key, samples, calibration, work_dir, staging, slope_limit)
@@ -412,9 +432,12 @@ def generate_calibration_visualizations(
                       retained_sample_count=(int(np.sum(calibration.sample_counts))
                                              if calibration.sample_counts is not None else None),
                       ambiguities=ambiguities,
-                      final_LUT=_statistics(angles), held_out_training_LUT=_statistics(held_angles[held_mask]),
-                      images=rows, note='Raw LUT. All-sample plots describe fit; held-out metrics use training-only LUT. '
-                                       'Failed diagnostic LUTs are not published for reconstruction.')
+                      final_LUT=_statistics(angles),
+                      held_out_training_LUT=(_statistics(held_angles[held_mask]) if held_mask is not None else None),
+                      images=rows, note=('Raw LUT. All-sample plots describe fit. '
+                          + ('Held-out metrics use the training-only LUT. ' if held_mask is not None else
+                             'Training-only LUT unavailable; held-out predictions omitted. ')
+                          + 'Failed diagnostic LUTs are not published for reconstruction.'))
         (staging/'summary.json').write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding='utf-8')
         previous = Path(temporary)/'previous'
         if output.exists():

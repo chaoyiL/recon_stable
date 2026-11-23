@@ -14,23 +14,56 @@ COORDINATE_KIND = 'reference_arclength'
 FRAME_CONVENTION = 'st_grid_columns_rows'
 
 
+def _piecewise_curve_lengths(surface, a_axis, b_axis, breakpoints):
+    """Integrate each coordinate curve without spanning a derivative jump."""
+    lengths = []
+    for axis, (nodes, fixed) in enumerate(((a_axis, b_axis), (b_axis, a_axis))):
+        breaks = np.asarray(breakpoints[axis], np.float64)
+        breaks = breaks[(breaks > nodes[0]) & (breaks < nodes[-1])]
+        integration_axis = np.unique(np.concatenate((nodes, breaks)))
+        half_steps = np.diff(integration_axis) / 2
+        middle = (integration_axis[:-1] + integration_axis[1:]) / 2
+        samples = (middle[:, None] + half_steps[:, None] * np.array([-1., 1.]) / np.sqrt(3)).ravel()
+        sample_mesh, fixed_mesh = np.meshgrid(samples, fixed)
+        parameters = (np.stack((sample_mesh, fixed_mesh), axis=-1) if axis == 0
+                      else np.stack((fixed_mesh, sample_mesh), axis=-1))
+        da, db = surface.first_derivatives(parameters.reshape(-1, 2))
+        da, db = np.asarray(da, np.float64), np.asarray(db, np.float64)
+        cross = np.linalg.norm(np.cross(da, db), axis=-1)
+        speed_a, speed_b = np.linalg.norm(da, axis=-1), np.linalg.norm(db, axis=-1)
+        if (not np.isfinite(da).all() or not np.isfinite(db).all()
+                or np.any(speed_a <= 1e-12) or np.any(speed_b <= 1e-12)
+                or np.any(cross <= 1e-12 * speed_a * speed_b)):
+            raise ValueError('Degenerate surface metric or coordinate speed')
+        speed = (speed_a if axis == 0 else speed_b).reshape(len(fixed), -1, 2)
+        increments = speed.sum(axis=-1) * half_steps
+        cumulative = np.pad(np.cumsum(increments, axis=1), ((0, 0), (1, 0)))
+        curve = cumulative[:, np.searchsorted(integration_axis, nodes)]
+        lengths.append(curve if axis == 0 else curve.T)
+    return lengths
+
+
 def measure_coordinate_curve_lengths(surface: ParametricSurface, parameter_bounds, integration_shape) -> dict[str, np.ndarray]:
     amin, amax, bmin, bmax = parameter_bounds
     nb, na = integration_shape
     if not np.isfinite(parameter_bounds).all() or amax <= amin or bmax <= bmin:
         raise ValueError('Invalid parameter bounds')
     a, b = np.linspace(amin, amax, na), np.linspace(bmin, bmax, nb)
-    aa, bb = np.meshgrid(a, b)
-    da, db = surface.first_derivatives(np.column_stack((aa.ravel(), bb.ravel())))
-    da, db = np.asarray(da, np.float64).reshape(nb, na, 3), np.asarray(db, np.float64).reshape(nb, na, 3)
-    speed_a, speed_b = np.linalg.norm(da, axis=-1), np.linalg.norm(db, axis=-1)
-    area = np.linalg.norm(np.cross(da, db), axis=-1)
-    if (not np.isfinite(da).all() or not np.isfinite(db).all()
-            or np.any(speed_a <= 1e-12) or np.any(speed_b <= 1e-12)
-            or np.any(area <= 1e-12 * speed_a * speed_b)):
-        raise ValueError('Degenerate surface metric or coordinate speed')
-    la = cumulative_trapezoid(speed_a, x=a, axis=1, initial=0)
-    lb = cumulative_trapezoid(speed_b, x=b, axis=0, initial=0)
+    breakpoints = getattr(surface, 'integration_breakpoints', ((), ()))
+    if any(len(points) for points in breakpoints):
+        la, lb = _piecewise_curve_lengths(surface, a, b, breakpoints)
+    else:
+        aa, bb = np.meshgrid(a, b)
+        da, db = surface.first_derivatives(np.column_stack((aa.ravel(), bb.ravel())))
+        da, db = np.asarray(da, np.float64).reshape(nb, na, 3), np.asarray(db, np.float64).reshape(nb, na, 3)
+        speed_a, speed_b = np.linalg.norm(da, axis=-1), np.linalg.norm(db, axis=-1)
+        area = np.linalg.norm(np.cross(da, db), axis=-1)
+        if (not np.isfinite(da).all() or not np.isfinite(db).all()
+                or np.any(speed_a <= 1e-12) or np.any(speed_b <= 1e-12)
+                or np.any(area <= 1e-12 * speed_a * speed_b)):
+            raise ValueError('Degenerate surface metric or coordinate speed')
+        la = cumulative_trapezoid(speed_a, x=a, axis=1, initial=0)
+        lb = cumulative_trapezoid(speed_b, x=b, axis=0, initial=0)
     if np.any(la[:, -1] <= 1e-12) or np.any(lb[-1, :] <= 1e-12):
         raise ValueError('Degenerate coordinate curve length')
     return dict(a_axis=a, b_axis=b, arc_lengths_mm=np.stack((la, lb), axis=-1),
@@ -48,11 +81,12 @@ class ArcLengthChart:
     row_lengths_mm: np.ndarray
     column_lengths_mm: np.ndarray
     coordinate_kind: str = COORDINATE_KIND
+    domain_kind: str = 'parameter_bounds'
     _tree: object = field(default=None, init=False, repr=False, compare=False)
     _cache: dict = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def __post_init__(self):
-        if not self.chart_id or self.coordinate_kind != COORDINATE_KIND:
+        if not self.chart_id or self.coordinate_kind != COORDINATE_KIND or not self.domain_kind:
             raise ValueError('Invalid coordinate chart identity')
         bounds = np.asarray(self.parameter_bounds, np.float64)
         if bounds.shape != (4,) or not np.isfinite(bounds).all() or np.any(bounds[[1, 3]] <= bounds[[0, 2]]):
@@ -157,7 +191,8 @@ class ArcLengthChart:
         return np.where(valid[:, None], parameters, np.nan).reshape(shape), valid.reshape(shape[:-1])
 
 
-def build_arclength_chart(surface: ParametricSurface, *, initial_size=129, maximum_size=1025, tolerance=1e-5) -> ArcLengthChart:
+def build_arclength_chart(surface: ParametricSurface, *, initial_size=129, maximum_size=1025,
+                          tolerance=1e-5, domain_kind='parameter_bounds') -> ArcLengthChart:
     if initial_size < 3 or maximum_size < 2*initial_size-1 or tolerance <= 0:
         raise ValueError('Invalid chart integration settings')
     previous = None
@@ -173,7 +208,8 @@ def build_arclength_chart(surface: ParametricSurface, *, initial_size=129, maxim
             error_lengths = max(np.max(np.abs(lengths[key][::2]/old[key]-1))
                                 for key in ('row_lengths_mm', 'column_lengths_mm'))
             if error_st <= tolerance and error_lengths <= tolerance:
-                return ArcLengthChart(str(uuid4()), tuple(surface.parameter_bounds), st_table=st, **lengths)
+                return ArcLengthChart(str(uuid4()), tuple(surface.parameter_bounds), st_table=st,
+                                      domain_kind=domain_kind, **lengths)
         previous = st, lengths
         size = 2*size-1
     raise ValueError('Reference arc-length integration did not converge')
@@ -226,7 +262,9 @@ def build_material_sampling_grid(
     return dict(
         format_version=np.asarray(1, np.int32), grid_kind=np.asarray('frozen_material_grid'),
         material_coordinates=grid.parameters, st=grid.st,
+        parameter_bounds=np.asarray(chart.parameter_bounds, np.float64),
         coordinate_kind=np.asarray(chart.coordinate_kind), coordinate_chart_id=np.asarray(chart.chart_id),
+        domain_kind=np.asarray(chart.domain_kind),
         frame_convention=np.asarray(FRAME_CONVENTION), residual_domain=np.asarray('material_grid'),
         color_space=np.asarray('linear_rgb'), template_xy_mm=np.asarray(template_xy_mm, np.float64),
         camera_matrix=camera.matrix, dist_coeffs=camera.distortion,
@@ -237,19 +275,20 @@ def build_material_sampling_grid(
 def save_arclength_chart(path: str | Path, chart: ArcLengthChart) -> Path:
     path = Path(path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
-    values = {key: getattr(chart, key) for key in ('chart_id', 'coordinate_kind', 'parameter_bounds',
+    values = {key: getattr(chart, key) for key in ('chart_id', 'coordinate_kind', 'domain_kind', 'parameter_bounds',
               'a_axis', 'b_axis', 'st_table', 'arc_lengths_mm', 'row_lengths_mm', 'column_lengths_mm')}
     temporary = path.with_suffix(path.suffix+'.tmp')
     with temporary.open('wb') as stream:
-        np.savez_compressed(stream, format_version=np.int32(1), **values)
+        np.savez_compressed(stream, format_version=np.int32(2), **values)
     temporary.replace(path)
     return path
 
 
 def load_arclength_chart(path: str | Path) -> ArcLengthChart:
     with np.load(Path(path).expanduser(), allow_pickle=False) as data:
-        if int(data['format_version']) != 1:
-            raise ValueError('Unsupported coordinate chart version')
+        if int(data['format_version']) != 2:
+            raise ValueError('Coordinate chart predates explicit reconstruction domains; rerun prepare, samples and fit')
         values = {key: data[key] for key in ('parameter_bounds', 'a_axis', 'b_axis', 'st_table',
                   'arc_lengths_mm', 'row_lengths_mm', 'column_lengths_mm')}
-        return ArcLengthChart(str(data['chart_id']), coordinate_kind=str(data['coordinate_kind']), **values)
+        return ArcLengthChart(str(data['chart_id']), coordinate_kind=str(data['coordinate_kind']),
+                              domain_kind=str(data['domain_kind']), **values)

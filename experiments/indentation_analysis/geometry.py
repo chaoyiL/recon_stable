@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import combinations
+from numbers import Real
 from typing import Sequence
 
 import numpy as np
@@ -52,47 +53,163 @@ class LineAnalysis:
     pairs: list[PairAngles]
 
 
-def fit_sphere(points: np.ndarray) -> SphereFit:
-    """Fit a sphere by ordinary least squares on signed radial distances.
+def sphere_indentation_depth(center_xyz_mm: np.ndarray, radius_mm: float,
+                             projection_xyz_mm: np.ndarray,
+                             positive_normal: np.ndarray) -> tuple[float, float]:
+    """Return signed center height and sphere indentation depth in millimetres.
 
-    ``points`` is a finite N×3 array in millimetres, with N >= 4. A centered
-    algebraic fit initializes the geometric fit; its RMS is in millimetres.
-    The Jacobian condition number describes conditioning, not fit uncertainty.
-    Coplanar or otherwise unidentifiable point sets raise ValueError.
+    The XYZ inputs share a Cartesian frame. ``projection_xyz_mm`` must be the
+    nearest normal projection of the fitted sphere center onto the baseline
+    surface. ``positive_normal`` establishes the positive side and may differ
+    from the surface normal at the projection. The signed height is the full
+    3D center-to-projection distance; depth is ``radius_mm - height`` and may
+    have either sign. A nonzero displacement with an alignment within 1e-12 of
+    orthogonal has an ambiguous side and raises ValueError.
+    """
+    if not isinstance(radius_mm, Real) or isinstance(radius_mm, (bool, np.bool_)):
+        raise ValueError('radius_mm must be a finite positive real number')
+    try:
+        radius = float(radius_mm)
+    except (OverflowError, ValueError) as error:
+        raise ValueError('radius_mm must be a finite positive real number') from error
+    if not np.isfinite(radius) or radius <= 0:
+        raise ValueError('radius_mm must be a finite positive real number')
+
+    vectors = []
+    for name, value in (('center_xyz_mm', center_xyz_mm),
+                        ('projection_xyz_mm', projection_xyz_mm),
+                        ('positive_normal', positive_normal)):
+        try:
+            if np.iscomplexobj(value):
+                raise ValueError(f'{name} must be a finite real XYZ vector')
+            vector = np.asarray(value, np.float64)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(f'{name} must be a finite XYZ vector') from error
+        if vector.shape != (3,) or not np.isfinite(vector).all():
+            raise ValueError(f'{name} must be a finite XYZ vector')
+        vectors.append(vector)
+    center, projection, normal = vectors
+
+    normal_scale = np.max(np.abs(normal))
+    if normal_scale == 0:
+        raise ValueError('positive_normal must be nonzero')
+    normal = normal / normal_scale
+    normal /= np.linalg.norm(normal)
+
+    with np.errstate(over='ignore', invalid='ignore'):
+        displacement = center - projection
+    if not np.isfinite(displacement).all():
+        raise ValueError('center-to-projection distance must be finite')
+    scale = np.max(np.abs(displacement))
+    if scale == 0:
+        return 0., radius
+
+    direction = displacement / scale
+    direction_length = np.linalg.norm(direction)
+    alignment = float((direction / direction_length) @ normal)
+    if abs(alignment) <= 1e-12:
+        raise ValueError('positive_normal gives an ambiguous center side')
+    with np.errstate(over='ignore'):
+        distance = float(scale * direction_length)
+    height = distance if alignment > 0 else -distance
+    depth = radius - height
+    if not np.isfinite(height) or not np.isfinite(depth):
+        raise ValueError('center height and indentation depth must be finite')
+    return height, depth
+
+
+def fit_sphere(points: np.ndarray, radius_mm: float, *,
+               side_normal: np.ndarray | None = None) -> SphereFit:
+    """Fit a known-radius sphere by ordinary least squares on radial distances.
+
+    ``points`` is finite N×3 XYZ in millimetres, N >= 4; ``radius_mm`` is a
+    finite, strictly positive physical radius, held fixed during fitting. If
+    supplied, ``side_normal`` selects centers on its positive side of the point
+    centroid. Otherwise both sides are searched and an indistinguishable
+    mirrored solution is rejected. Finite multi-start search is not a proof of
+    a global optimum for arbitrary non-spherical point clouds. The condition
+    number belongs to the three-center-parameter Jacobian, not an uncertainty.
     """
     xyz = np.asarray(points, np.float64)
     if xyz.ndim != 2 or xyz.shape[1] != 3 or len(xyz) < 4 or not np.isfinite(xyz).all():
         raise ValueError('Sphere fit requires at least four finite Nx3 points')
+    if (not isinstance(radius_mm, Real) or isinstance(radius_mm, (bool, np.bool_))
+            or not np.isfinite(radius_mm) or radius_mm <= 0):
+        raise ValueError('radius_mm must be a finite positive real number')
+    radius = float(radius_mm)
     origin = xyz.mean(axis=0)
     delta = xyz - origin
-    design = np.column_stack((2 * delta, np.ones(len(delta))))
-    solution, _, rank, _ = np.linalg.lstsq(design, np.sum(delta * delta, axis=1), rcond=None)
-    radius2 = solution[3] + solution[:3] @ solution[:3]
-    if rank < 4 or not np.isfinite(radius2) or radius2 <= 0:
-        raise ValueError('Sphere fit is degenerate or lacks a positive radius')
+    _, spread, axes = np.linalg.svd(delta, full_matrices=False)
+    if spread[0] <= 0 or spread[1] <= 1e-10 * spread[0]:
+        raise ValueError('Sphere fit is degenerate: points are collinear')
+    normal = axes[-1]
+    tangential = delta - (delta @ normal)[:, None] * normal
+    height = np.sqrt(max(radius ** 2 - np.mean(np.sum(tangential ** 2, axis=1)),
+                         (.1 * radius) ** 2))
+    seeds = [height * normal, -height * normal]
+
+    # The free algebraic center is only an initializer, never an output or a
+    # reason to choose a side; include its reflection for shallow noisy caps.
+    scale = spread[0] / np.sqrt(len(delta))
+    normalized = delta / scale
+    design = np.column_stack((2 * normalized, np.ones(len(delta))))
+    solution, _, rank, _ = np.linalg.lstsq(design, np.sum(normalized ** 2, axis=1), rcond=None)
+    if rank == 4 and np.isfinite(solution).all():
+        initial = solution[:3] * scale
+        seeds.extend((initial, initial - 2 * np.dot(initial, normal) * normal))
+
+    basis = np.eye(3)
+    bounds = (-np.inf, np.inf)
+    if side_normal is not None:
+        positive = np.asarray(side_normal, np.float64)
+        if positive.shape != (3,) or not np.isfinite(positive).all() or np.linalg.norm(positive) <= 1e-12:
+            raise ValueError('side_normal must be a finite nonzero XYZ direction')
+        positive = positive / np.linalg.norm(positive)
+        axis = np.eye(3)[np.argmin(np.abs(positive))]
+        tangent = np.cross(positive, axis)
+        tangent /= np.linalg.norm(tangent)
+        basis = np.column_stack((tangent, np.cross(positive, tangent), positive))
+        bounds = ([-np.inf, -np.inf, 0.], np.inf)
 
     def residual(value):
-        return np.linalg.norm(delta - value[:3], axis=1) - value[3]
+        return np.linalg.norm(delta - basis @ value, axis=1) - radius
 
     def jacobian(value):
-        difference = value[:3] - delta
+        difference = basis @ value - delta
         length = np.linalg.norm(difference, axis=1)
-        return np.column_stack((difference / np.maximum(length[:, None], 1e-15),
-                                -np.ones(len(delta))))
+        return (difference / np.maximum(length[:, None], 1e-15)) @ basis
 
-    result = least_squares(
-        residual, np.r_[solution[:3], np.sqrt(radius2)], jac=jacobian,
-        bounds=([-np.inf, -np.inf, -np.inf, 1e-12], np.inf), x_scale='jac',
-        ftol=1e-11, xtol=1e-11, gtol=1e-11, max_nfev=400,
-    )
-    if not result.success or not np.isfinite(result.x).all() or not np.isfinite(result.fun).all():
+    candidates = []
+    for seed in seeds:
+        initial = basis.T @ seed
+        if side_normal is not None:
+            initial[2] = max(abs(initial[2]), 1e-8 * max(1., radius))
+        try:
+            # Parameter/gradient stopping resolves candidate centers to the
+            # same precision even when the residual remains large.
+            result = least_squares(residual, initial, jac=jacobian, bounds=bounds, x_scale='jac',
+                                   ftol=None, xtol=1e-11, gtol=1e-11, max_nfev=400)
+        except (ValueError, RuntimeError, FloatingPointError):
+            continue
+        if result.success and np.isfinite(result.x).all() and np.isfinite(result.fun).all():
+            center = basis @ result.x
+            rms = float(np.sqrt(np.mean(result.fun ** 2)))
+            candidates.append((rms, center, result))
+    if not candidates:
         raise ValueError('Sphere fit did not converge to a finite solution')
+    candidates.sort(key=lambda candidate: candidate[0])
+    rms, center, result = candidates[0]
+    for other_rms, other_center, _ in candidates[1:]:
+        if np.linalg.norm(other_center - center) > 1e-6 * max(1., radius):
+            if other_rms - rms <= max(1e-9 * max(1., radius), .01 * other_rms):
+                raise ValueError('Sphere center is ambiguous between distinct solutions')
+            break
+    if side_normal is not None and result.x[2] <= 1e-8 * max(1., radius):
+        raise ValueError('Sphere center is ambiguous at the requested side boundary')
     singular = np.linalg.svd(result.jac, compute_uv=False)
-    if singular[-1] <= 1e-12 * singular[0] or result.x[3] <= 1e-12:
+    if singular[-1] <= 1e-12 * singular[0]:
         raise ValueError('Sphere fit is not identifiable')
-    return SphereFit(origin + result.x[:3], float(result.x[3]),
-                     float(np.sqrt(np.mean(result.fun ** 2))),
-                     float(singular[0] / singular[-1]))
+    return SphereFit(origin + center, radius, rms, float(singular[0] / singular[-1]))
 
 
 class SurfaceProjector:

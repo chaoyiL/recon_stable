@@ -6,6 +6,7 @@ from pathlib import Path
 
 from calibrate.utils.norm_pipeline import parse_settings
 from calibrate.utils.visualize_norm import generate_calibration_visualizations
+from utils.calibration_store import resolve_artifacts
 
 
 def main() -> None:
@@ -21,7 +22,9 @@ def main() -> None:
                         help='不良映射的局部法向夹角下限（严格大于），默认 20 度')
     args = parser.parse_args()
     settings = parse_settings(args.config)
-    output = generate_calibration_visualizations(args.calibration or settings.output,
+    calibration = (Path(args.calibration).expanduser().resolve() if args.calibration else
+                   resolve_artifacts(args.config).model_file)
+    output = generate_calibration_visualizations(calibration,
                                                 args.samples or settings.input_file,
                                                 args.work_dir or settings.work_dir, args.output_dir,
                                                 color_distance_threshold=args.color_distance_threshold,

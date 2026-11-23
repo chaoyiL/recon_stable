@@ -114,6 +114,12 @@ def region_boundary_points(region: RegionAnnotation, count=BOUNDARY_SAMPLE_COUNT
     return polygon[ids]+edges[ids]*((samples-cumulative[ids])/lengths[ids])[:, None]
 
 
+def dilate_contact_mask(mask: np.ndarray, margin_px: int) -> np.ndarray:
+    """Expand an image-space contact mask with an elliptical pixel-radius kernel."""
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * margin_px + 1, 2 * margin_px + 1))
+    return cv2.dilate(np.asarray(mask, np.uint8), kernel).astype(bool)
+
+
 def region_masks(region, image_shape, *, outer_margin_px):
     if tuple(region.image_size) != tuple(image_shape[:2][::-1]):
         raise ValueError('Annotation image_size differs from source image')
@@ -122,7 +128,4 @@ def region_masks(region, image_shape, *, outer_margin_px):
     cv2.fillPoly(mask, [np.rint(contour).astype(np.int32)], 1)
     if not cv2.pointPolygonTest(contour.astype(np.float32), tuple(map(float, region.center_px)), False) > 0:
         raise ValueError('Representative contact center must be inside boundary')
-    def kernel(radius):
-        return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*radius+1, 2*radius+1))
-    excluded = cv2.dilate(mask, kernel(outer_margin_px))
-    return dict(contact=mask.astype(bool), exclusion=excluded.astype(bool))
+    return dict(contact=mask.astype(bool), exclusion=dilate_contact_mask(mask, outer_margin_px))

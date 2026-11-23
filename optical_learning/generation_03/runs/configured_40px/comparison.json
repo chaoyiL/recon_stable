@@ -1,0 +1,27 @@
+[
+  {
+    "margin_px": 40,
+    "training_observations": 801931,
+    "all_observations": 1261272,
+    "covered_material_points": 43390,
+    "holdout_rmse": 0.023106992756919905,
+    "holdout_samples": 459341,
+    "reference_rmse": 0.018141460980666088,
+    "reference_samples": 41482,
+    "target_background_difference_rms": 0.04297343300563171,
+    "target_right_background_difference_rms": 0.06281191317177623,
+    "target_photometric_points": 46013,
+    "right_press_points": 4646,
+    "sphere_states": [
+      "ok",
+      "ok",
+      "contact_not_detected"
+    ],
+    "sphere_window_points": [
+      1449,
+      322,
+      17
+    ],
+    "center_distance_rmse_mm": null
+  }
+]

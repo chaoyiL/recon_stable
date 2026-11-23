@@ -176,6 +176,10 @@ class SurfaceModel:
 
         return evaluate
 
+    @property
+    def minimum_observations(self) -> int:
+        return max(12, int(np.ceil(0.65 * len(self.xy))))
+
     def fit(self, pixels, visible=None, confidence=None, allow_trim=True):
         pixels = np.asarray(pixels, float)
         if pixels.shape != (len(self.xy), 2):
@@ -185,7 +189,7 @@ class SurfaceModel:
             if visible is None
             else np.asarray(visible, bool) & np.isfinite(pixels).all(1)
         )
-        if visible.sum() < max(12, int(np.ceil(0.65 * len(self.xy)))):
+        if visible.sum() < self.minimum_observations:
             raise ValueError("Too few observed marks for a reliable surface fit")
         if np.any(np.ptp(self.xy[visible], axis=0) < 0.75 * np.ptp(self.xy, axis=0)):
             raise ValueError("Observed marks do not cover the surface")
@@ -247,7 +251,7 @@ class SurfaceModel:
             median = np.median(errors)
             threshold = max(2.5, median + 3.0 * 1.4826 * np.median(np.abs(errors - median)))
             bad = np.flatnonzero(visible)[errors > threshold]
-            if 0 < len(bad) <= 0.2 * visible.sum() and visible.sum() - len(bad) >= 32:
+            if 0 < len(bad) <= 0.2 * visible.sum() and visible.sum() - len(bad) >= self.minimum_observations:
                 kept = visible.copy()
                 kept[bad] = False
                 q, c, info = self.fit(pixels, kept, confidence, allow_trim=False)

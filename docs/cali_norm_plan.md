@@ -78,7 +78,7 @@
 | `s,t / st` | 参考曲面上两族材料曲线的归一化累计弧长 | 无量纲 |
 | `u,v / uv` | 带相机畸变的原图坐标 | pixel |
 
-已有 provider 能从原生参数计算 XYZ 和 UV，尚未实现弧长积分及其逆映射。
+现有 provider 已实现参考弧长积分、可逆性校验及逆映射，以下说明其坐标约定与计算方法。
 
 沿参考曲面的两族曲线 `a→Q_ref(a,b_const)`、`b→Q_ref(a_const,b)` 定义：
 
@@ -193,15 +193,15 @@ source_valid = surface_mask & ~marker_image_mask & unsaturated
 
 三面板依次显示原图、投影回原图的曲面色差、整体主曲率预览或重算后的球面法向。宽度为 640、960、280 px，图像区高 720 px；鼠标位置扣除中间面板偏移、除以显示比例后转换为含畸变原图像素。
 
-拖动绿色轮廓任意位置平移接触锚点，滚轮每格改变 `0.01R` mm 的法向压入量。每次移动或深度变化都立即求解第 5 节的交线；轮廓由三维曲面和投影确定，可以不是圆或椭圆。保留 `c` 设置锚点、`z` 撤回、`g` 重算、`Enter` 验证并接受、`x` 跳过及 `Esc` 保存草稿退出；不提供手调半径、旋转或顶点编辑。
+拖动绿色轮廓任意位置平移接触锚点，滚轮每格改变 `0.01R` mm 的法向压入量。每次移动或深度变化都立即求解第 5 节的交线；轮廓由三维曲面和投影确定，可以不是圆或椭圆。保留 `c` 设置锚点、`z` 撤回、`g` 重算、`Enter` 验证并接受、`x` 跳过及 `q/Q/Esc` 保存草稿退出；不提供手调半径、旋转或顶点编辑。
 
-深度约束为 `0<d≤R`，允许达到 `d=R`。零深度接触退化为点，不能用于面域标定；编辑下限为 `1e-4R`。面板显示当前和最大压入量，橙线显示当前锚点处 `d=R` 的投影轮廓；最大轮廓超出可见曲面时不画橙线，不影响更浅的有效接触。无效拖动恢复上次有效状态并显示原因。重算导致轮廓变化时清除过期结果，须再次重算才可接受。
+深度约束为 `0<d≤R`，允许达到 `d=R`。零深度接触退化为点，不能用于面域标定；编辑下限为 `1e-4R`。面板显示当前和最大压入量，橙线显示当前锚点处 `d=R` 的投影轮廓；最大轮廓超出可见曲面时不画橙线，不影响更浅的有效接触。无效拖动恢复上次有效状态并显示原因。一次 `g` 内完成最终拟合及法向预览，一次 `Enter` 内完成重算及接受。回调同步最终轮廓后再检查一致性；输入改变或轮廓仍不一致时才清除过期结果，不能接受。
 
 标注语义保持 `contact_boundary`，`center_px` 现在明确表示压入轴与未局部变形的整体曲面的交点投影，不是三维球心投影。普通 ROI 或可见球外轮廓不能当作接触边界。
 
 ### 4.2 标注、mask 与旧数据
 
-标注使用 `shape=sphere_contact`、`indentation_depth_mm` 和求解得到的 `contour_px`，位置与深度是重算输入，保存轮廓用于回放。接触轮廓填充为标签区域，不内缩；外扩 20 px 仅用于整体拟合与背景统计排除。
+标注使用 `shape=sphere_contact`、`indentation_depth_mm` 和求解得到的 `contour_px`，位置与深度是重算输入，保存轮廓用于回放。标签覆盖最终接触轮廓的内部。整体拟合用外扩 20 px 的轮廓排除 marker。背景统计和光场训练采样按 `normal_calibration.background_contact_exclusion_margin_px` 外扩，当前为 40 px。
 
 旧圆、椭圆及多边形 YAML 仍能读取。打开旧接触标注时保留中心，用其三维边界尺度估计初始深度，再由新模型生成轮廓并要求人工确认；不会继续走旧的自由球心拟合。已有新格式 accepted/skip 默认复用，`--edit` 可重开。文件格式见第 10.3 节。
 
@@ -526,6 +526,8 @@ def find_ambiguous_color_pairs(colors, slopes, *, color_distance_threshold=0.01,
 
 ```yaml
 normal_calibration:
+  method: table                     # table / mlp3 / mlp5 / mlp8
+  lut_dir: lut
   input_mode: images
   images: ["assets/cali_norm_pics/*.npz"]
   reference_image: assets/reference.npz
@@ -535,7 +537,6 @@ normal_calibration:
   annotations_file: assets/normal_calibration/manual_regions.yaml
   work_dir: assets/normal_calibration
   input_file: assets/normal_calibration/normal_samples.npz
-  output: assets/normal_calibration/normal_lut.npz
   lut_size: 64
   maximum_rms_angle_degrees: 5.0
   checks:
@@ -544,6 +545,7 @@ normal_calibration:
     validation_fraction: 0.2
     validation_rms_degrees: 5.0
     maximum_out_of_range_fraction: 0.05
+    maximum_unsupported_fraction: 0.05
 ```
 
 旧样本模式默认值仍为 `input_mode: samples`。图片、底色路径、半径和球心侧必须来自本次数据，不从旧标注猜测。
@@ -555,6 +557,7 @@ uv run calibrate-norm --config config.yaml --stage prepare
 uv run calibrate-norm --config config.yaml --stage annotate
 uv run calibrate-norm --config config.yaml --stage samples
 uv run calibrate-norm --config config.yaml --stage fit
+uv run calibrate-norm --config config.yaml --stage compare
 ```
 
 `--input` 继续覆盖现有 `input_file` 配置键。图片按解析后的路径去重排序，生成六位索引缓存名，manifest 固定保存 index、key、源路径和参考路径。标注变化后从 samples 重跑；坐标图、模板或相机变化后从 prepare 重跑。
@@ -563,7 +566,7 @@ uv run calibrate-norm --config config.yaml --stage fit
 
 ### 10.1 输出布局
 
-原始拍照图像保存在 `assets/cali_norm_pics/`，默认生成产物集中在 `assets/normal_calibration/`。修改 `work_dir` 时，未显式指定的标注、样本和 LUT 路径跟随该目录；图片扫描会排除整个产物目录，递归 glob 不会重新读入缓存。
+原始拍照图像保存在 `assets/cali_norm_pics/`，标注、样本和几何缓存位于 `assets/normal_calibration/`。所有版本模型及配套网格保存到 `lut/<方法>/<版本>/`，由 `normal_calibration.method` 同时选择训练与读取方法；完整实现及当前验证约定见 [MLP 调研与实现](mlp_lut_research.md)。图片扫描排除缓存及模型目录。
 
 ```text
 assets/normal_calibration/
@@ -575,14 +578,22 @@ assets/normal_calibration/
   frames/000000.npz
   manual_regions.yaml
   normal_samples.npz
-  normal_lut_train.npz
-  normal_lut.npz
-  lut_material_grid.npz
   verification/report.csv
   verification/validation.json
+
+lut/<方法>/
+  current.json                       # 只指向通过验证的完整版本
+  <版本>/normal_lut_train.npz
+  <版本>/normal_lut.npz
+  <版本>/lut_material_grid.npz
+  <版本>/reference_coordinates.npz
+  <版本>/validation.json
+lut/comparisons/<版本>/              # 显式 compare 时生成五方法同分组对照
+lut/legacy/                          # assets 中历史模型的精确归档
+lut/migration_manifest.json          # 可核验、可逆的迁移清单
 ```
 
-每图输出缓存和一行报告，不自动导出检查 PNG。标注窗口直接显示线性原图、轮廓/marker 屏蔽、曲面色差/sample mask、球面法向/拟合结果；反投影图仅用于显示。几何缓存 v3 保存 `observed_linear_rgb` 浮点整图；旧 v2 缓存在读取入口解码。
+每图输出缓存和一行报告，不自动导出检查 PNG。标注窗口直接显示线性原图、轮廓/marker 屏蔽、曲面色差/sample mask、球面法向/拟合结果；反投影图仅用于显示。当前图片标定几何缓存为 v5，保存线性 RGB、两层偏移和黑框域声明；旧几何缓存需从 prepare 重算。
 
 ### 10.2 NPZ 字段
 
@@ -591,7 +602,7 @@ assets/normal_calibration/
 | 文件 | 版本与必需内容 |
 |---|---|
 | reference_coordinates | v1；chart_id、coordinate_kind、parameter_bounds、a_axis、b_axis、st_table、arc_lengths_mm、row_lengths_mm、column_lengths_mm；数值全部 float64 |
-| reference_surface / prepared / overall | v4；保留现有三套 XYZ/UV/coordinates/mask；新增各套 st、surface_coefficients(16×3)、camera_matrix、dist_coeffs、material_bounds_mm、template_xy_mm、image_shape、source_image、geometry_stage、surface_mask、principal_curvatures_per_mm、curvature_valid_mask |
+| reference_surface / prepared / overall | v5；显式保存黑框域 `domain_kind`；保留现有三套 XYZ/UV/coordinates/mask；新增各套 st、surface_coefficients(16×3)、camera_matrix、dist_coeffs、material_bounds_mm、template_xy_mm、image_shape、source_image、geometry_stage、surface_mask、principal_curvatures_per_mm、curvature_valid_mask |
 | prepared 附加 | image_key/index、marker_pixels/valid/confidence、reference_marker_sizes、marker_image_mask；足以重新拟合，不仅保存渲染结果 |
 | overall 附加 | marker_fit_valid、最终系数与 fit_info；geometry_stage=final |
 | frames | xyz/uv/st/material_coordinates、reference_color_grid、observed_color_grid、color_residual_grid、geometry_valid_mask、photometric_valid_mask、sample_valid_mask、slope_grid、normal_gt_grid、sphere_center_xyz、sphere_radius_mm、sphere_root_sign、sphere_side、boundary_model、indentation_depth_mm、contact_center_parameters、contact_boundary_px、principal_curvatures_per_mm、curvature_valid_mask |
@@ -604,7 +615,7 @@ assets/normal_calibration/
 
 坐标图单独保存，不在每个文件重复积分表。chart_file 相对当前 NPZ 所在目录；聚合或搬到另一目录时重新计算相对路径。普通 get-surface 自动建图时保存为 `<output_stem>_coordinates.npz`。
 
-本流程要求带接触面偏移声明的 v4 几何缓存；更旧的缓存必须重新 prepare。v4 中旧 `preview_reference` 可从现有观测升级为当前图初始拟合，只有收敛后的 `final` 可生成训练样本。
+本流程要求带接触面偏移和 `domain_kind=black_frame_tangent_v1` 声明的 v5 几何缓存，以及 v2 参考坐标图。旧 marker 范围的缓存须重新 prepare；保留原图标注并重跑 samples、fit。只有收敛后的 `final` 可生成训练样本。
 
 ### 10.3 标注 YAML
 
@@ -659,7 +670,7 @@ image_root 相对 YAML 所在目录解析。region 的 image_size 与实际图�
 | 曲面逆投影 | least_squares 最多 50 次评估，ftol/xtol/gtol=1e-10；原生归一化参数按 1e-4 去重；同变量差分步长 1e-5，边界单边差分 |
 | marker 光度屏蔽 | 搜索半径至少为参考 bbox 半对角线+2 px，并取不小于 ceil(0.35×中位 marker 间距)；中心匹配唯一组件，否则用该保守半径圆盘；结果外扩 1 px（3×3 核） |
 | 球面判别式 | 小于 -1e-9 mm² 无效；仅将此容差内的小负值归零 |
-| 接触区域 | 128 方向闭合交线；使用最终轮廓，不内缩；外扩 20 px 仅用于拟合及背景排除；排除集合最多迭代 6 次 |
+| 接触区域 | 128 方向闭合交线，球标签取轮廓内部。拟合排除 marker 外扩 20 px、最多 6 次迭代。背景排除读取 `normal_calibration.background_contact_exclusion_margin_px`，当前为 40 px |
 
 按依赖顺序实施：
 

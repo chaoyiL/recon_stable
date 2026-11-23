@@ -1,0 +1,77 @@
+[
+  {
+    "margin_px": 20,
+    "training_observations": 879260,
+    "all_observations": 1374535,
+    "covered_material_points": 43461,
+    "holdout_rmse": 0.022208494480844363,
+    "holdout_samples": 418708,
+    "reference_rmse": 0.018089799073679868,
+    "reference_samples": 41482,
+    "target_background_difference_rms": 0.04321771860848508,
+    "target_right_background_difference_rms": 0.0656361248324969,
+    "target_photometric_points": 46013,
+    "right_press_points": 4576,
+    "sphere_states": [
+      "ok",
+      "contact_not_detected",
+      "contact_not_detected"
+    ],
+    "sphere_window_points": [
+      1456,
+      47,
+      0
+    ],
+    "center_distance_rmse_mm": null
+  },
+  {
+    "margin_px": 40,
+    "training_observations": 801931,
+    "all_observations": 1261272,
+    "covered_material_points": 43390,
+    "holdout_rmse": 0.02261315897174185,
+    "holdout_samples": 418708,
+    "reference_rmse": 0.018141460980666088,
+    "reference_samples": 41482,
+    "target_background_difference_rms": 0.04297343300563171,
+    "target_right_background_difference_rms": 0.06281191317177623,
+    "target_photometric_points": 46013,
+    "right_press_points": 4646,
+    "sphere_states": [
+      "ok",
+      "ok",
+      "contact_not_detected"
+    ],
+    "sphere_window_points": [
+      1449,
+      322,
+      17
+    ],
+    "center_distance_rmse_mm": null
+  },
+  {
+    "margin_px": 60,
+    "training_observations": 705934,
+    "all_observations": 1124642,
+    "covered_material_points": 43295,
+    "holdout_rmse": 0.02277856456679141,
+    "holdout_samples": 418708,
+    "reference_rmse": 0.017667416551687378,
+    "reference_samples": 41482,
+    "target_background_difference_rms": 0.040767230191597885,
+    "target_right_background_difference_rms": 0.062035126678674175,
+    "target_photometric_points": 46013,
+    "right_press_points": 5137,
+    "sphere_states": [
+      "ok",
+      "ok",
+      "contact_not_detected"
+    ],
+    "sphere_window_points": [
+      1503,
+      420,
+      0
+    ],
+    "center_distance_rmse_mm": null
+  }
+]

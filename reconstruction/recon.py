@@ -9,18 +9,26 @@ from reconstruction.pipeline import DEFAULT_CONFIG_PATH, reconstruct_image
 from utils.config import load_config
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description='单张图片 → marker 整体曲面 → LUT 局部形变')
+PREVIEW_DIRECTORY = Path(__file__).resolve().parents[1] / 'assets' / 'reconstruction' / 'pics'
+
+
+def add_reconstruction_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add image, reference, display and solver options shared by reconstruction CLIs."""
     parser.add_argument('--config', default=DEFAULT_CONFIG_PATH)
     parser.add_argument('--image', required=True, help='待重建图片')
     parser.add_argument('--reference-image', help='覆盖配置中的无接触参考图')
-    parser.add_argument('--material-grid', help='覆盖与 LUT 配套的材料网格或完整参考弧长图')
-    parser.add_argument('--calibration', help='覆盖 local_reconstruction.calibration_file')
-    parser.add_argument('--output', help='结果 NPZ；默认保存到 reconstruction.output_dir/pc，预览 PNG 保存到 assets/reconstruction/pics')
     parser.add_argument('--show', action='store_true', help='显示结果窗口')
     parser.add_argument('--lsmr-atol', type=float)
     parser.add_argument('--lsmr-btol', type=float)
     parser.add_argument('--lsmr-max-iterations', type=int)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description='单张图片 → marker 整体曲面 → 法向模型局部形变')
+    add_reconstruction_arguments(parser)
+    parser.add_argument('--material-grid', help='覆盖所选法向模型配套的材料网格或完整参考弧长图')
+    parser.add_argument('--calibration', help='覆盖所选法向标定模型')
+    parser.add_argument('--output', help='结果 NPZ；默认保存到 reconstruction.output_dir/pc，预览 PNG 保存到 assets/reconstruction/pics')
     args = parser.parse_args()
     result, output = reconstruct_image(
         args.image, args.config, reference_image=args.reference_image,
@@ -28,7 +36,7 @@ def main() -> None:
         output=args.output,
         lsmr_atol=args.lsmr_atol, lsmr_btol=args.lsmr_btol,
         lsmr_max_iterations=args.lsmr_max_iterations)
-    preview_output = Path(__file__).resolve().parents[1] / 'assets' / 'reconstruction' / 'pics' / f'{output.stem}.png'
+    preview_output = PREVIEW_DIRECTORY / f'{output.stem}.png'
     config_path = Path(args.config).expanduser().resolve()
     if args.reference_image is not None:
         reference_path = Path(args.reference_image).expanduser().resolve()

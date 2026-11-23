@@ -1,0 +1,7 @@
+method,contact,radius_mm,fit_depth_mm,status,geometric_region_count,candidate_count,fit_count,radial_rmse_mm,center_x_mm,center_y_mm,center_z_mm,deepest_indentation_mm,window_points_over_0p2_mm,convergence_status,converged_depth_mm,converged_rmse_mm
+reference,1,2.0,0.4,ok,6518,5727,91,0.041699460289579944,-9.84107915179963,-3.705765022195635,48.39530075807376,3.0198512077331543,1466,converged,1.96,1.6808700237417111
+reference,2,1.5,0.4,ok,350,350,208,0.0645860395048132,0.7122538317559876,-3.876503416982396,48.31961727718472,0.9436154961585999,350,not_converged,,
+reference,3,1.0,0.4,deepest_point_outside_anchor,11707,10135,0,,,,,1.7314108610153198,1149,not_converged,,
+learned,1,2.0,0.4,shared_contact_region,20301,17902,0,,,,,3.135891914367676,1665,not_converged,,
+learned,2,1.5,0.4,shared_contact_region,20301,17902,0,,,,,1.9903603792190552,1579,not_converged,,
+learned,3,1.0,0.4,shared_contact_region,20301,17902,0,,,,,1.4475406408309937,1473,not_converged,,

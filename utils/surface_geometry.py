@@ -35,6 +35,7 @@ class OffsetSurface:
         self.surface = surface
         self.distance_mm = float(distance)
         self._parameter_bounds = tuple(float(value) for value in bounds)
+        self.integration_breakpoints = getattr(surface, 'integration_breakpoints', ((), ()))
 
     @property
     def parameter_bounds(self) -> tuple[float, float, float, float]:
@@ -255,13 +256,15 @@ def compute_surface_geometry(
     # Express the second fundamental form in the orthonormal tangent frame.
     # Eigenvalues are signed principal curvatures in inverse millimetres.
     curvature = k_matrix @ second @ np.swapaxes(k_matrix, -1, -2)
-    principal_curvatures = np.linalg.eigvalsh(
-        np.where(nonsingular[..., None, None], curvature, 0))
+    nonsingular &= np.isfinite(curvature).all(axis=(-1, -2))
+    curvature = np.where(nonsingular[..., None, None], curvature, 0)
+    principal_curvatures = np.linalg.eigvalsh(curvature)
     return {
         "valid":nonsingular,"interior":interior,"boundary":valid&~interior,
         "normal":normal,"frame":frame,"jacobian":jacobian,"metric":g,
         "metric_inverse":g_inverse,"second":second,"k":k_matrix,
         "area":np.sqrt(np.maximum(det,0)),
+        "curvature_tensor":curvature,
         "principal_curvatures":principal_curvatures,
     }
 

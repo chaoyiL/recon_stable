@@ -16,14 +16,17 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import lsmr
 from utils.color_difference import (CAMERA_RGB_TRANSFER_FUNCTION,
                                     require_camera_rgb_transfer, signed_color_difference)
+from utils.calibration_store import resolve_artifacts
 from utils.config import load_config, load_contact_surface_offset_mm
 from utils.color_protection import resolve_zero_color_radii, signed_color_protection_factors
 from utils.image_io import cached_linear_rgb
 
 
-from utils.normal_mapping import NormalCalibration, lookup_slopes_raw
+from utils.normal_models import load_normal_model, predict_normal_model
+from utils.surface_curvature import SurfaceCurvature
 from utils.surface_geometry import compute_surface_geometry as _surface_geometry
 from utils.surface_geometry import local_slopes_to_normals
+from utils.surface_domain import DOMAIN_KIND
 
 
 @dataclass(frozen=True)
@@ -35,7 +38,7 @@ class LocalReconstructionResult:
     slopes: np.ndarray
     observed_normals: np.ndarray
     curvature_correction: np.ndarray
-    confidence: np.ndarray
+    confidence: np.ndarray | None
     valid_mask: np.ndarray
     boundary_mask: np.ndarray
     solver_istop: int
@@ -45,6 +48,14 @@ class LocalReconstructionResult:
     photometric_valid_mask: np.ndarray | None = None
     inferred_mask: np.ndarray | None = None
     contact_offset_mm: float | None = None
+    extrapolated_mask: np.ndarray | None = None
+    domain_kind: str | None = None
+    model_valid_mask: np.ndarray | None = None
+    prior_valid_mask: np.ndarray | None = None
+    equation_valid_mask: np.ndarray | None = None
+    overall_curvature: SurfaceCurvature | None = None
+    st: np.ndarray | None = None
+    coordinate_chart_id: str | None = None
 
     def save(self,path: str | Path) -> Path:
         output=Path(path).expanduser()
@@ -56,22 +67,38 @@ class LocalReconstructionResult:
             "reference_normals":self.reference_normals,"slopes":self.slopes,
             "observed_normals":self.observed_normals,
             "curvature_correction":self.curvature_correction,
-            "confidence":self.confidence,"valid_mask":self.valid_mask,
+            "valid_mask":self.valid_mask,
             "boundary_mask":self.boundary_mask,
             "solver_istop":np.asarray(self.solver_istop,np.int32),
             "solver_iterations":np.asarray(self.solver_iterations,np.int32),
             "solver_residual_norm":np.asarray(
                 self.solver_residual_norm,np.float64),
         }
+        if self.confidence is not None:
+            values["confidence"] = self.confidence
         if self.photometric_valid_mask is not None:
             values["photometric_valid_mask"] = self.photometric_valid_mask
         if self.inferred_mask is not None:
             values["inferred_mask"] = self.inferred_mask
+        for name in ("model_valid_mask", "prior_valid_mask", "equation_valid_mask"):
+            value = getattr(self, name)
+            if value is not None:
+                values[name] = np.asarray(value, np.bool_)
         if self.trusted_no_contact_mask is not None:
             values["trusted_no_contact_mask"]=np.asarray(
                 self.trusted_no_contact_mask,np.bool_)
         if self.contact_offset_mm is not None:
             values["contact_offset_mm"] = np.asarray(self.contact_offset_mm, np.float64)
+        if self.extrapolated_mask is not None:
+            values["extrapolated_mask"] = np.asarray(self.extrapolated_mask, np.bool_)
+        if self.domain_kind is not None:
+            values["domain_kind"] = np.asarray(self.domain_kind)
+        if self.overall_curvature is not None:
+            values.update(self.overall_curvature.npz_fields())
+        if self.st is not None:
+            values["st"] = self.st
+        if self.coordinate_chart_id is not None:
+            values["coordinate_chart_id"] = np.asarray(self.coordinate_chart_id)
         with temporary.open("wb") as stream:
             np.savez_compressed(stream,**values)
         temporary.replace(output)
@@ -275,24 +302,6 @@ def parse_zero_color_protection(config: object) -> tuple[float, float, float, fl
                                     raw.get("negative_inner_radius"), raw.get("negative_outer_radius"))
 
 
-def _configured_path(
-    cli_value: str | None,
-    configured_value: object,
-    *,
-    config_base: Path,
-    name: str,
-) -> Path:
-    if cli_value is not None:
-        if not cli_value:
-            raise ValueError(f"{name} 命令行路径不能为空")
-        return Path(cli_value).expanduser()
-    if not isinstance(configured_value,str) or not configured_value:
-        raise ValueError(
-            f"缺少 local_reconstruction.{name}；请在 config.yaml 配置或用命令行覆盖")
-    path=Path(configured_value).expanduser()
-    return path if path.is_absolute() else config_base/path
-
-
 def _optional_configured_path(
     cli_value: str | None,
     configured_value: object,
@@ -349,14 +358,7 @@ def load_local_reconstruction_settings(
     if input_file is None:
         raise ValueError(
             "local-recon 必须用 --input 指定 NPZ；单张图片重建请使用 recon --image")
-    if calibration_override is not None:
-        calibration_file=_configured_path(
-            calibration_override,None,config_base=source.parent,
-            name="calibration_file")
-    else:
-        calibration_file=_configured_path(
-            None,raw.get("calibration_file"),config_base=source.parent,
-            name="calibration_file")
+    calibration_file=resolve_artifacts(source, model_override=calibration_override).model_file
     output_file=_optional_configured_path(
         output_override,raw.get("output_file"),config_base=source.parent,
         name="output_file")
@@ -406,19 +408,32 @@ def sample_full_resolution_residual(
     return sampled.values,sampled.valid
 
 
-def lookup_slopes(
+@dataclass(frozen=True)
+class _SlopeEvidence:
+    slopes: np.ndarray
+    variance: np.ndarray | None
+    confidence: np.ndarray | None
+    model_valid: np.ndarray
+    prior_valid: np.ndarray
+    equation_valid: np.ndarray
+
+
+def _lookup_slope_evidence(
     color_residual: np.ndarray,
-    calibration: NormalCalibration,
+    calibration,
     valid_mask: np.ndarray | None = None,
     *,
+    st: np.ndarray | None = None,
+    curvature_per_mm: np.ndarray | None = None,
+    curvature_valid_mask: np.ndarray | None = None,
     zero_color_inner_radius: float = 0.,
     zero_color_outer_radius: float = 0.,
     zero_color_negative_inner_radius: float | None = None,
     zero_color_negative_outer_radius: float | None = None,
     trusted_no_contact_mask: np.ndarray | None = None,
     trusted_no_contact_confidence: float = 1.,
-) -> tuple[np.ndarray,np.ndarray,np.ndarray]:
-    """查询完整 LUT；零坡度保护内区按无接触先验赋予零坡度和置信度 1。"""
+) -> _SlopeEvidence:
+    """Combine model support with independent zero-color and no-contact priors."""
     colors=np.asarray(color_residual,np.float32)
     if colors.ndim<1 or colors.shape[-1]!=3:
         raise ValueError("color_residual 最后一维必须是 RGB")
@@ -440,25 +455,88 @@ def lookup_slopes(
         if trusted.shape!=colors.shape[:-1]:
             raise ValueError("trusted_no_contact_mask 尺寸与颜色残差不一致")
         trusted &= valid
-    slopes,variance,confidence=lookup_slopes_raw(colors,calibration,valid)
+    prediction=predict_normal_model(colors,calibration,valid,st=st,
+                                    curvature_per_mm=curvature_per_mm,
+                                    curvature_valid_mask=curvature_valid_mask)
+    model_valid=valid & prediction.supported_mask
     attenuation,zero_slope=signed_color_protection_factors(colors, *radii)
-    slopes *= attenuation[...,None]
-    # LUT variance stays diagnostic; invalid photometry never receives the prior.
-    confidence=np.where(valid & zero_slope,1.,confidence)
-    slopes=np.where(trusted[...,None],0,slopes)
-    confidence=np.where(
-        trusted,np.maximum(confidence,trusted_no_contact_confidence),confidence)
-    slopes=np.where(valid[...,None],slopes,0).astype(np.float32)
-    variance=np.where(valid,variance,0).astype(np.float32)
-    confidence=np.where(valid,confidence,0).astype(np.float32)
-    return slopes,variance,confidence
+    prior_valid=valid & (zero_slope | trusted)
+    equation_valid=model_valid | prior_valid
+    slopes=np.where(model_valid[...,None],prediction.slopes*attenuation[...,None],0)
+    slopes=np.where(prior_valid[...,None],0,slopes).astype(np.float32)
+    variance = (None if prediction.variance is None else
+                np.where(model_valid,prediction.variance,0).astype(np.float32))
+    confidence = prediction.confidence
+    if confidence is not None:
+        confidence=np.where(valid & zero_slope,1.,confidence)
+        confidence=np.where(trusted,np.maximum(confidence,trusted_no_contact_confidence),confidence)
+        confidence=np.where(equation_valid,confidence,0).astype(np.float32)
+    return _SlopeEvidence(slopes,variance,confidence,model_valid,prior_valid,equation_valid)
+
+
+def lookup_slopes(
+    color_residual: np.ndarray,
+    calibration,
+    valid_mask: np.ndarray | None = None,
+    *,
+    st: np.ndarray | None = None,
+    curvature_per_mm: np.ndarray | None = None,
+    curvature_valid_mask: np.ndarray | None = None,
+    zero_color_inner_radius: float = 0.,
+    zero_color_outer_radius: float = 0.,
+    zero_color_negative_inner_radius: float | None = None,
+    zero_color_negative_outer_radius: float | None = None,
+    trusted_no_contact_mask: np.ndarray | None = None,
+    trusted_no_contact_confidence: float = 1.,
+) -> tuple[np.ndarray,np.ndarray | None,np.ndarray | None]:
+    """Predict slopes and apply zero-color and trusted no-contact protection."""
+    evidence = _lookup_slope_evidence(color_residual, calibration, valid_mask, st=st,
+        curvature_per_mm=curvature_per_mm, curvature_valid_mask=curvature_valid_mask,
+        zero_color_inner_radius=zero_color_inner_radius, zero_color_outer_radius=zero_color_outer_radius,
+        zero_color_negative_inner_radius=zero_color_negative_inner_radius,
+        zero_color_negative_outer_radius=zero_color_negative_outer_radius,
+        trusted_no_contact_mask=trusted_no_contact_mask,
+        trusted_no_contact_confidence=trusted_no_contact_confidence)
+    return evidence.slopes, evidence.variance, evidence.confidence
+
+
+def _fill_boundary_normals(points,valid,boundary,normals):
+    """Use valid one-sided tangents where boundary central differences are absent."""
+    result=np.asarray(normals,np.float64).copy()
+    length=np.linalg.norm(result,axis=-1)
+    missing=boundary&(~np.isfinite(length)|(length<=1e-12))
+    result[missing]=0
+    rows,columns=valid.shape
+    for i,j in np.argwhere(missing):
+        tangents=[]
+        for di,dj in ((0,1),(1,0)):
+            before=(i-di,j-dj)
+            after=(i+di,j+dj)
+            has_before=(0<=before[0]<rows and 0<=before[1]<columns and valid[before])
+            has_after=(0<=after[0]<rows and 0<=after[1]<columns and valid[after])
+            if has_before and has_after:
+                tangents.append(points[after]-points[before])
+            elif has_after:
+                tangents.append(points[after]-points[i,j])
+            elif has_before:
+                tangents.append(points[i,j]-points[before])
+            else:
+                break
+        if len(tangents)==2:
+            cross=np.cross(tangents[0],tangents[1])
+            norm=np.linalg.norm(cross)
+            scale=np.linalg.norm(tangents[0])*np.linalg.norm(tangents[1])
+            if np.isfinite(norm) and np.isfinite(scale) and norm>1e-12*scale:
+                result[i,j]=cross/norm
+    return result
 
 
 def reconstruct_local_surface(
     xyz: np.ndarray,
     color_residual_grid: np.ndarray,
-    calibration: NormalCalibration,
+    calibration,
     *,
+    st: np.ndarray | None = None,
     valid_mask: np.ndarray | None = None,
     geometry_valid_mask: np.ndarray | None = None,
     photometric_valid_mask: np.ndarray | None = None,
@@ -507,17 +585,28 @@ def reconstruct_local_surface(
     if not np.isfinite(displacement_zero_lambda_per_mm2) \
             or displacement_zero_lambda_per_mm2<0:
         raise ValueError("displacement_zero_lambda_per_mm2 必须为非负有限数")
-    slopes,_,confidence=lookup_slopes(
-        colors,calibration,photo,
+    geometry=_surface_geometry(points,valid)
+    tensor=geometry['curvature_tensor']
+    curvature_per_mm=np.stack((tensor[...,0,0],tensor[...,0,1],tensor[...,1,1]),axis=-1)
+    evidence=_lookup_slope_evidence(
+        colors,calibration,photo,st=st,curvature_per_mm=curvature_per_mm,
+        curvature_valid_mask=geometry['valid'],
         zero_color_inner_radius=zero_color_inner_radius,
         zero_color_outer_radius=zero_color_outer_radius,
         zero_color_negative_inner_radius=zero_color_negative_inner_radius,
         zero_color_negative_outer_radius=zero_color_negative_outer_radius,
         trusted_no_contact_mask=trusted_no_contact,
         trusted_no_contact_confidence=trusted_no_contact_confidence)
-    geometry=_surface_geometry(points,valid)
-    equation_mask=geometry["valid"]&photo
-    unknown_mask=geometry["interior"]
+    slopes=evidence.slopes
+    # Fix the geometric boundary and its immediate interior neighbour. Their
+    # equal zero displacements enforce a zero one-sided boundary slope; color
+    # holes do not participate in constructing this fixed ring.
+    unknown_mask=cv2.erode(
+        geometry["interior"].astype(np.uint8),np.ones((3,3),np.uint8),iterations=1,
+        borderType=cv2.BORDER_CONSTANT,borderValue=0)>0
+    boundary_mask=valid&~unknown_mask
+    slopes[boundary_mask]=0
+    equation_mask=geometry["valid"]&evidence.equation_valid&unknown_mask
     unknown_index=np.full(points.shape[:2],-1,np.int32)
     unknown_index[unknown_mask]=np.arange(np.count_nonzero(unknown_mask),dtype=np.int32)
     if not np.any(equation_mask & unknown_mask):
@@ -560,8 +649,8 @@ def reconstruct_local_surface(
             row_number+=1
     if row_number==0:
         raise ValueError("局部重建没有可用的颜色方程")
-    # Photometric holes remain displacement unknowns, connected only where colors are missing.
-    for i,j in np.argwhere(unknown_mask & ~photo):
+    # Missing color/model evidence leaves displacement unknown, linked to its neighbours.
+    for i,j in np.argwhere(unknown_mask & ~evidence.equation_valid):
         neighbours=[(ni,nj) for ni,nj in ((i-1,j),(i+1,j),(i,j-1),(i,j+1)) if valid[ni,nj]]
         if not neighbours:
             continue
@@ -635,13 +724,14 @@ def reconstruct_local_surface(
         btol=float(lsmr_btol),maxiter=maximum)
     displacement=np.zeros(points.shape[:2],np.float64)
     displacement[unknown_mask]=solution[0]
-    normal=geometry["normal"]
+    normal=_fill_boundary_normals(points,valid,boundary_mask,geometry["normal"])
     displacement_vectors=displacement[...,None]*normal
     observed,_=local_slopes_to_normals(slopes,normal,frame)
     output=points+displacement_vectors
-    inferred=geometry["valid"] & ~photo
+    inferred=geometry["valid"] & unknown_mask & ~evidence.equation_valid
     inferred_geometry=_surface_geometry(output,valid)
     observed=np.where(inferred[...,None],inferred_geometry["normal"],observed)
+    observed=np.where(boundary_mask[...,None],normal,observed)
     return LocalReconstructionResult(
         xyz_out=output.astype(np.float32),
         displacement=displacement.astype(np.float32),
@@ -650,11 +740,13 @@ def reconstruct_local_surface(
         slopes=slopes.astype(np.float32),
         observed_normals=observed.astype(np.float32),
         curvature_correction=curvature.astype(np.float32),
-        confidence=confidence.astype(np.float32),valid_mask=valid,
-        boundary_mask=valid&~unknown_mask,solver_istop=int(solution[1]),
+        confidence=evidence.confidence,valid_mask=valid,
+        boundary_mask=boundary_mask,solver_istop=int(solution[1]),
         solver_iterations=int(solution[2]),solver_residual_norm=float(solution[3]),
         trusted_no_contact_mask=trusted_no_contact,
-        photometric_valid_mask=photo,inferred_mask=inferred)
+        photometric_valid_mask=photo,inferred_mask=inferred,
+        model_valid_mask=evidence.model_valid,prior_valid_mask=evidence.prior_valid,
+        equation_valid_mask=evidence.equation_valid)
 
 
 def _load_reconstruction_input(path: Path, expected_metadata=None):
@@ -663,22 +755,24 @@ def _load_reconstruction_input(path: Path, expected_metadata=None):
         return load_reconstruction_arrays(data, expected_metadata)
 
 
-def load_reconstruction_arrays(data, expected_metadata=None):
+def load_reconstruction_arrays(data, expected_metadata=None, *, include_st=False):
     """Read an array mapping using the same contract as an offline recon input."""
     import json
     from utils.surface_sampling import sample_linear_rgb_to_surface
     from utils.surface_coordinates import COORDINATE_KIND, FRAME_CONVENTION
     metadata=json.loads(str(data['metadata'])) if 'metadata' in data else {}
     transfer = str(data['rgb_transfer_function']) if 'rgb_transfer_function' in data else metadata.get('rgb_transfer_function')
-    declarations=('coordinate_kind','coordinate_chart_id','frame_convention','residual_domain','color_space')
+    declarations=('coordinate_kind','coordinate_chart_id','domain_kind','frame_convention','residual_domain','color_space')
     actual={key: str(data[key]) if key in data else metadata.get(key) for key in declarations}
     new_path=actual['coordinate_kind']==COORDINATE_KIND
+    if new_path and actual['domain_kind'] != DOMAIN_KIND:
+        raise ValueError('Input predates black-frame reconstruction domains; rerun prepare, samples and fit')
     if expected_metadata is not None:
         expected=dict(expected_metadata)
         if new_path or expected.get('coordinate_kind')==COORDINATE_KIND:
             for key in declarations:
                 if actual[key] is None or expected.get(key) is None or actual[key]!=expected[key]:
-                    raise ValueError(f'LUT/input declaration mismatch: {key}')
+                    raise ValueError(f'Normal model/input declaration mismatch: {key}')
         if (new_path or expected.get('coordinate_kind') == COORDINATE_KIND
                 or 'contact_offset_mm' in expected or 'contact_offset_mm' in data):
             actual_offset = data.get('contact_offset_mm', metadata.get('contact_offset_mm'))
@@ -686,10 +780,10 @@ def load_reconstruction_arrays(data, expected_metadata=None):
             try:
                 offsets = np.asarray([actual_offset, expected_offset], np.float64)
             except (TypeError, ValueError):
-                raise ValueError('LUT/input requires contact_offset_mm; rerun calibration') from None
+                raise ValueError('Normal model/input requires contact_offset_mm; rerun calibration') from None
             if (offsets.shape != (2,) or not np.isfinite(offsets).all()
                     or not np.isclose(offsets[0], offsets[1], rtol=0, atol=1e-9)):
-                raise ValueError('LUT/input contact_offset_mm mismatch; rerun calibration')
+                raise ValueError('Normal model/input contact_offset_mm mismatch; rerun calibration')
     if new_path and (actual['frame_convention']!=FRAME_CONVENTION
                      or actual['residual_domain']!='material_grid' or actual['color_space']!='linear_rgb'):
         raise ValueError('New coordinate input requires shared frames and material-grid linear RGB')
@@ -764,7 +858,7 @@ def load_reconstruction_arrays(data, expected_metadata=None):
                 if transfer is not None:
                     require_camera_rgb_transfer({'rgb_transfer_function': transfer}, '输入图像')
                 if expected_metadata is not None:
-                    require_camera_rgb_transfer(expected_metadata, 'LUT')
+                    require_camera_rgb_transfer(expected_metadata, 'Normal model')
                 transfer = CAMERA_RGB_TRANSFER_FUNCTION
             observed = cached_linear_rgb(data, 'observed')
             reference = cached_linear_rgb(data, 'reference')
@@ -776,7 +870,7 @@ def load_reconstruction_arrays(data, expected_metadata=None):
         background=sample_linear_rgb_to_surface(reference,ref_uv,ref_valid)
         colors,photo=signed_color_difference(current.values,background.values,current.valid & background.valid)
     if expected_metadata is not None and transfer != expected_metadata.get('rgb_transfer_function'):
-        raise ValueError('LUT/input declaration mismatch: rgb_transfer_function')
+        raise ValueError('Normal model/input declaration mismatch: rgb_transfer_function')
     if colors.shape!=xyz.shape or photo.shape!=shape:
         raise ValueError('Material-grid colors and geometry shapes differ')
     if 'photometric_valid_mask' in data:
@@ -790,14 +884,18 @@ def load_reconstruction_arrays(data, expected_metadata=None):
         if trusted.shape!=shape:
             raise ValueError('trusted_no_contact_mask shape mismatch')
         trusted &= photo
+    if include_st:
+        st = np.asarray(data['st']) if 'st' in data else None
+        return xyz,colors,geometry,photo,trusted,st
     return xyz,colors,geometry,photo,trusted
 
 
 def reconstruct_from_input(data, calibration, settings) -> LocalReconstructionResult:
     """Shared inference policy for image pipelines and preassembled NPZ inputs."""
-    xyz, colors, valid, photo, trusted = load_reconstruction_arrays(data, calibration.metadata)
+    xyz, colors, valid, photo, trusted, st = load_reconstruction_arrays(
+        data, calibration.metadata, include_st=True)
     result = reconstruct_local_surface(
-        xyz, colors, calibration, valid_mask=valid, photometric_valid_mask=photo,
+        xyz, colors, calibration, st=st, valid_mask=valid, photometric_valid_mask=photo,
         zero_color_inner_radius=settings.zero_color_inner_radius,
         zero_color_outer_radius=settings.zero_color_outer_radius,
         zero_color_negative_inner_radius=settings.zero_color_negative_inner_radius,
@@ -810,6 +908,12 @@ def reconstruct_from_input(data, calibration, settings) -> LocalReconstructionRe
         lsmr_max_iterations=settings.lsmr_max_iterations)
     if 'contact_offset_mm' in calibration.metadata:
         result = replace(result, contact_offset_mm=float(calibration.metadata['contact_offset_mm']))
+    if 'extrapolated_mask' in data:
+        extrapolated = np.asarray(data['extrapolated_mask'], bool)
+        if extrapolated.shape != valid.shape:
+            raise ValueError('extrapolated_mask shape differs from the reconstruction grid')
+        result = replace(result, extrapolated_mask=extrapolated & result.valid_mask)
+    result = replace(result, domain_kind=calibration.metadata.get('domain_kind'))
     return result
 
 
@@ -839,7 +943,7 @@ def local_main() -> None:
     source.add_argument(
         "--view",metavar="RESULT_NPZ",help="显示已有重建结果，不重新求解")
     parser.add_argument(
-        "--calibration",help="覆盖 local_reconstruction.calibration_file")
+        "--calibration",help="覆盖所选法向标定模型")
     parser.add_argument(
         "--output",help="输出 NPZ；默认保存到 reconstruction.output_dir/pc")
     parser.add_argument("--lsmr-atol",type=float,help="覆盖 LSMR atol")
@@ -862,11 +966,11 @@ def local_main() -> None:
         calibration_override=args.calibration,output_override=args.output,
         lsmr_atol_override=args.lsmr_atol,lsmr_btol_override=args.lsmr_btol,
         lsmr_max_iterations_override=args.lsmr_max_iterations)
-    calibration=NormalCalibration.load(settings.calibration_file)
+    calibration=load_normal_model(settings.calibration_file)
     if 'contact_offset_mm' in calibration.metadata:
         configured_offset = load_contact_surface_offset_mm(args.config)
         if not np.isclose(float(calibration.metadata['contact_offset_mm']), configured_offset, rtol=0, atol=1e-9):
-            raise ValueError('LUT contact_offset_mm differs from configuration; rerun calibration')
+            raise ValueError('Normal model contact_offset_mm differs from configuration; rerun calibration')
     with np.load(settings.input_file, allow_pickle=False) as data:
         result = reconstruct_from_input(data, calibration, settings)
     save_reconstruction_result(result, settings.output_file,

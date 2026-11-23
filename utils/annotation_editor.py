@@ -26,6 +26,14 @@ def _same_state(left, right):
     return True
 
 
+def _same_recompute_inputs(left, right):
+    if left['shape'] == right['shape'] == 'sphere_contact':
+        # The callback can replace this derived boundary with its final fit.
+        left = {name: value for name, value in left.items() if name != 'contour_px'}
+        right = {name: value for name, value in right.items() if name != 'contour_px'}
+    return _same_state(left, right)
+
+
 def _error_message(exc):
     return getattr(exc, 'display_message', str(exc))
 
@@ -246,6 +254,7 @@ class _RegionEditor:
             result = self.recompute_callback(self.region)
         except (ValueError, RuntimeError) as exc:
             error = exc
+        computed = self._snapshot()
         try:
             # The recomputation may have replaced the underlying surface.
             self._refresh_geometry()
@@ -258,10 +267,11 @@ class _RegionEditor:
                 self.status = f'{_error_message(error)}\n{self.status}'
         else:
             self.geometry_valid = True
-            changed = not _same_state(before, self._snapshot())
+            changed = (not _same_recompute_inputs(before, computed)
+                       or not _same_state(computed, self._snapshot()))
             if changed:
                 self.cached = None
-                self.status = 'Surface changed the boundary. g: recompute with updated geometry'
+                self.status = 'Geometry changed during recompute. g: recompute with updated geometry'
                 if error is not None:
                     self.status = f'{_error_message(error)}\n{self.status}'
             elif error is not None:
@@ -269,13 +279,14 @@ class _RegionEditor:
                 self.status = _error_message(error)
             else:
                 self.cached = result
-                self.status = 'Final geometry accepted. Enter saves and continues.'
+                self.status = 'Final geometry ready. Enter saves and continues.'
             if error is not None:
                 self.region.status = 'draft'
                 self.save_callback()
             elif not changed and accept:
                 self.region.status = 'accepted'
                 self.save_callback()
+                self.status = 'Final geometry accepted.'
                 print(f'{self.region.image}: {self.status}', flush=True)
                 return True
         print(f'{self.region.image}: {self.status}', flush=True)
@@ -311,7 +322,7 @@ class _RegionEditor:
                 self.window.show_image(display.image, display.labels)
                 self.dirty = False
             key = self.window.wait_key(30)
-            if key == 27 or self.window.is_closed:
+            if key in (27, ord('q'), ord('Q')) or self.window.is_closed:
                 self.region.status = 'draft'
                 self.save_callback()
                 return False
@@ -340,7 +351,7 @@ def edit_regions(regions, *, panel_callback, recompute_callback, save_callback,
                  panel_height: int = 480,
                  update_geometry: Callable[[RegionAnnotation], None] | None = None,
                  indentation_range_mm: tuple[float, float] | None = None):
-    """Edit original-pixel geometry. Return False after saving an Escape draft.
+    """Edit original-pixel geometry. Return False after saving a draft and exiting.
 
     panel_callback receives the annotation, cached result and status; it returns three
     AnnotationPanel objects containing display-only BGR8 canvases. Linear RGB source
@@ -354,8 +365,10 @@ def edit_regions(regions, *, panel_callback, recompute_callback, save_callback,
     range (mm); each wheel step changes indentation by 1% of its upper bound.
     If updating fails, draft and skip can retain a previous derived contour so the
     center and depth remain editable, but such geometry cannot be accepted.
-    recompute_callback may raise ValueError or RuntimeError, optionally with a
-    display-only preview and a multiline display_message.
+    recompute_callback may replace a sphere_contact's derived contour in place
+    with the boundary used for its result; all other inputs must remain unchanged.
+    It may raise ValueError or RuntimeError, optionally with a display-only preview
+    and a multiline display_message.
     """
     if editable_panel not in (0, 1, 2):
         raise ValueError('editable_panel must be 0, 1 or 2')
@@ -369,7 +382,7 @@ def edit_regions(regions, *, panel_callback, recompute_callback, save_callback,
             raise ValueError('indentation_range_mm needs two increasing, finite positive bounds')
         depth_range = (lower, upper)
 
-    window = AnnotationWindow('Contact boundary | z undo, g recompute, Enter accept, x skip, Esc draft')
+    window = AnnotationWindow('Contact boundary | z undo, g recompute, Enter accept, x skip, q/Esc draft')
     try:
         for region in regions:
             editor = _RegionEditor(region, window, panel_callback=panel_callback,

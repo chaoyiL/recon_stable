@@ -1,0 +1,389 @@
+{
+  "image": "assets/test_pics/3b/3b1.npz",
+  "grid_shape": [
+    400,
+    159
+  ],
+  "photometric_points": 44511,
+  "noncontact_points": 24817,
+  "right_photometric_points": 9857,
+  "right_noncontact_points": 8816,
+  "marker_reprojection_rms_px": 0.38334104943875086,
+  "contact_offset_mm": 7.0,
+  "coordinate_chart_id": "964da13e-3ace-4fae-a45a-0721e5aee9a0",
+  "curvature_smoothing_half_width_mm": 2.0,
+  "model": "optical_learning/generation_04/runs/paired_curvature/per_frame/model.npz",
+  "scan": "accurate_models/scan.ply",
+  "scan_fit_archive": "optical_learning/generation_04/runs/paired_curvature/per_frame/3b2/comparison.json",
+  "scan_center_distances_mm": {
+    "1-2": 9.246099635200732,
+    "1-3": 18.45129053971347,
+    "2-3": 9.249155618528103
+  },
+  "comparison_depth_mm": 0.4,
+  "depth_scan": {
+    "step_mm": 0.02,
+    "min_fit_points": 100,
+    "stable_steps": 5,
+    "rmse_atol_mm": 0.005,
+    "rmse_rtol": 0.01
+  },
+  "anchors_uv": [
+    [
+      226.0,
+      209.0
+    ],
+    [
+      312.0,
+      209.0
+    ],
+    [
+      402.0,
+      208.0
+    ]
+  ],
+  "background_difference_rms": 0.03429899068085455,
+  "methods": {
+    "reference": {
+      "table": "optical_learning/generation_04/runs/paired_curvature/per_frame/3b2/reference/table.npz",
+      "noncontact_rgb_rmse": 0.05263427003198729,
+      "right_noncontact_rgb_rmse": 0.04528787552412507,
+      "right_photometric_points_over_0p2_mm": 5732,
+      "right_noncontact_points_over_0p2_mm": 4822,
+      "right_displacement_rms_mm": 0.3804248672257925,
+      "plateau_face": {
+        "displacement_p10_median_p90_mm": [
+          -1.190900731086731,
+          -0.04957282170653343,
+          0.6140629887580872
+        ],
+        "indentation_fraction": 0.41882693700217233,
+        "elevation_fraction": 0.3781317885590152,
+        "best_fit_plane_rms_mm": 0.3185530059729099
+      },
+      "spheres": [
+        {
+          "method": "reference",
+          "contact": 1,
+          "radius_mm": 2.0,
+          "fit_depth_mm": 0.4,
+          "status": "ok",
+          "geometric_region_count": 6518,
+          "candidate_count": 5727,
+          "fit_count": 91,
+          "radial_rmse_mm": 0.041699460289579944,
+          "center_x_mm": -9.84107915179963,
+          "center_y_mm": -3.705765022195635,
+          "center_z_mm": 48.39530075807376,
+          "deepest_indentation_mm": 3.0198512077331543,
+          "window_points_over_0p2_mm": 1466,
+          "convergence_status": "converged",
+          "converged_depth_mm": 1.96,
+          "converged_rmse_mm": 1.6808700237417111
+        },
+        {
+          "method": "reference",
+          "contact": 2,
+          "radius_mm": 1.5,
+          "fit_depth_mm": 0.4,
+          "status": "ok",
+          "geometric_region_count": 350,
+          "candidate_count": 350,
+          "fit_count": 208,
+          "radial_rmse_mm": 0.0645860395048132,
+          "center_x_mm": 0.7122538317559876,
+          "center_y_mm": -3.876503416982396,
+          "center_z_mm": 48.31961727718472,
+          "deepest_indentation_mm": 0.9436154961585999,
+          "window_points_over_0p2_mm": 350,
+          "convergence_status": "not_converged",
+          "converged_depth_mm": null,
+          "converged_rmse_mm": null
+        },
+        {
+          "method": "reference",
+          "contact": 3,
+          "radius_mm": 1.0,
+          "fit_depth_mm": 0.4,
+          "status": "deepest_point_outside_anchor",
+          "geometric_region_count": 11707,
+          "candidate_count": 10135,
+          "fit_count": 0,
+          "radial_rmse_mm": null,
+          "center_x_mm": null,
+          "center_y_mm": null,
+          "center_z_mm": null,
+          "deepest_indentation_mm": 1.7314108610153198,
+          "window_points_over_0p2_mm": 1149,
+          "convergence_status": "not_converged",
+          "converged_depth_mm": null,
+          "converged_rmse_mm": null
+        }
+      ],
+      "center_distances_at_fixed_depth": {
+        "1-2": {
+          "distance_mm": 10.554985393193908,
+          "error_mm": 1.3088857579931759
+        }
+      },
+      "distance_rmse_mm": null
+    },
+    "learned": {
+      "table": "optical_learning/generation_04/runs/paired_curvature/per_frame/3b2/learned/table.npz",
+      "noncontact_rgb_rmse": 0.044373203561624136,
+      "right_noncontact_rgb_rmse": 0.030229275584051227,
+      "right_photometric_points_over_0p2_mm": 950,
+      "right_noncontact_points_over_0p2_mm": 200,
+      "right_displacement_rms_mm": 0.0842897635311318,
+      "plateau_face": {
+        "displacement_p10_median_p90_mm": [
+          -1.3955268144607544,
+          -0.6955230236053467,
+          -0.3753610372543335
+        ],
+        "indentation_fraction": 1.0,
+        "elevation_fraction": 0.0,
+        "best_fit_plane_rms_mm": 0.6407793584699836
+      },
+      "spheres": [
+        {
+          "method": "learned",
+          "contact": 1,
+          "radius_mm": 2.0,
+          "fit_depth_mm": 0.4,
+          "status": "shared_contact_region",
+          "geometric_region_count": 20301,
+          "candidate_count": 17902,
+          "fit_count": 0,
+          "radial_rmse_mm": null,
+          "center_x_mm": null,
+          "center_y_mm": null,
+          "center_z_mm": null,
+          "deepest_indentation_mm": 3.135891914367676,
+          "window_points_over_0p2_mm": 1665,
+          "convergence_status": "not_converged",
+          "converged_depth_mm": null,
+          "converged_rmse_mm": null
+        },
+        {
+          "method": "learned",
+          "contact": 2,
+          "radius_mm": 1.5,
+          "fit_depth_mm": 0.4,
+          "status": "shared_contact_region",
+          "geometric_region_count": 20301,
+          "candidate_count": 17902,
+          "fit_count": 0,
+          "radial_rmse_mm": null,
+          "center_x_mm": null,
+          "center_y_mm": null,
+          "center_z_mm": null,
+          "deepest_indentation_mm": 1.9903603792190552,
+          "window_points_over_0p2_mm": 1579,
+          "convergence_status": "not_converged",
+          "converged_depth_mm": null,
+          "converged_rmse_mm": null
+        },
+        {
+          "method": "learned",
+          "contact": 3,
+          "radius_mm": 1.0,
+          "fit_depth_mm": 0.4,
+          "status": "shared_contact_region",
+          "geometric_region_count": 20301,
+          "candidate_count": 17902,
+          "fit_count": 0,
+          "radial_rmse_mm": null,
+          "center_x_mm": null,
+          "center_y_mm": null,
+          "center_z_mm": null,
+          "deepest_indentation_mm": 1.4475406408309937,
+          "window_points_over_0p2_mm": 1473,
+          "convergence_status": "not_converged",
+          "converged_depth_mm": null,
+          "converged_rmse_mm": null
+        }
+      ],
+      "center_distances_at_fixed_depth": {},
+      "distance_rmse_mm": null
+    }
+  },
+  "plateau": {
+    "outline_uv": [
+      [
+        174.0,
+        166.0
+      ],
+      [
+        452.0,
+        162.0
+      ],
+      [
+        455.0,
+        253.0
+      ],
+      [
+        174.0,
+        263.0
+      ]
+    ],
+    "face_inset_px": 8.0,
+    "exterior_guard_px": 12.0,
+    "cap_exclusion_radius_px": 30.0,
+    "face_points": 6905
+  },
+  "anchor_window_diagnostic": {
+    "reference": {
+      "spheres": [
+        {
+          "method": "reference",
+          "contact": 1,
+          "radius_mm": 2.0,
+          "fit_depth_mm": 0.4,
+          "status": "ok",
+          "geometric_region_count": 1696,
+          "candidate_count": 1466,
+          "fit_count": 91,
+          "radial_rmse_mm": 0.041699460289579944,
+          "center_x_mm": -9.84107915179963,
+          "center_y_mm": -3.705765022195635,
+          "center_z_mm": 48.39530075807376,
+          "deepest_indentation_mm": 3.0198512077331543,
+          "window_points_over_0p2_mm": 1466,
+          "convergence_status": "not_converged",
+          "converged_depth_mm": null,
+          "converged_rmse_mm": null
+        },
+        {
+          "method": "reference",
+          "contact": 2,
+          "radius_mm": 1.5,
+          "fit_depth_mm": 0.4,
+          "status": "ok",
+          "geometric_region_count": 350,
+          "candidate_count": 350,
+          "fit_count": 208,
+          "radial_rmse_mm": 0.0645860395048132,
+          "center_x_mm": 0.7122538317559876,
+          "center_y_mm": -3.876503416982396,
+          "center_z_mm": 48.31961727718472,
+          "deepest_indentation_mm": 0.9436154961585999,
+          "window_points_over_0p2_mm": 350,
+          "convergence_status": "not_converged",
+          "converged_depth_mm": null,
+          "converged_rmse_mm": null
+        },
+        {
+          "method": "reference",
+          "contact": 3,
+          "radius_mm": 1.0,
+          "fit_depth_mm": 0.4,
+          "status": "ok",
+          "geometric_region_count": 1354,
+          "candidate_count": 1149,
+          "fit_count": 83,
+          "radial_rmse_mm": 0.04448142517403964,
+          "center_x_mm": 11.233697501251504,
+          "center_y_mm": -4.2843300648407,
+          "center_z_mm": 47.690578761023595,
+          "deepest_indentation_mm": 1.7314108610153198,
+          "window_points_over_0p2_mm": 1149,
+          "convergence_status": "not_converged",
+          "converged_depth_mm": null,
+          "converged_rmse_mm": null
+        }
+      ],
+      "center_distances_at_fixed_depth": {
+        "1-2": {
+          "distance_mm": 10.554985393193908,
+          "error_mm": 1.3088857579931759
+        },
+        "1-3": {
+          "distance_mm": 21.094491735467017,
+          "error_mm": 2.643201195753548
+        },
+        "2-3": {
+          "distance_mm": 10.548117790387288,
+          "error_mm": 1.2989621718591842
+        }
+      },
+      "distance_rmse_mm": 1.8607343722870535
+    },
+    "learned": {
+      "spheres": [
+        {
+          "method": "learned",
+          "contact": 1,
+          "radius_mm": 2.0,
+          "fit_depth_mm": 0.4,
+          "status": "ok",
+          "geometric_region_count": 1895,
+          "candidate_count": 1665,
+          "fit_count": 196,
+          "radial_rmse_mm": 0.12884027612143534,
+          "center_x_mm": -10.208107279847416,
+          "center_y_mm": -3.4130004072546654,
+          "center_z_mm": 48.09260023983358,
+          "deepest_indentation_mm": 3.135891914367676,
+          "window_points_over_0p2_mm": 1665,
+          "convergence_status": "converged",
+          "converged_depth_mm": 0.52,
+          "converged_rmse_mm": 0.13520393325696956
+        },
+        {
+          "method": "learned",
+          "contact": 2,
+          "radius_mm": 1.5,
+          "fit_depth_mm": 0.4,
+          "status": "ok",
+          "geometric_region_count": 1649,
+          "candidate_count": 1579,
+          "fit_count": 212,
+          "radial_rmse_mm": 0.0926355746674718,
+          "center_x_mm": 0.619849969045675,
+          "center_y_mm": -3.727735102139552,
+          "center_z_mm": 47.246563137638475,
+          "deepest_indentation_mm": 1.9903603792190552,
+          "window_points_over_0p2_mm": 1579,
+          "convergence_status": "not_converged",
+          "converged_depth_mm": null,
+          "converged_rmse_mm": null
+        },
+        {
+          "method": "learned",
+          "contact": 3,
+          "radius_mm": 1.0,
+          "fit_depth_mm": 0.4,
+          "status": "ok",
+          "geometric_region_count": 1678,
+          "candidate_count": 1473,
+          "fit_count": 98,
+          "radial_rmse_mm": 0.057069840529130715,
+          "center_x_mm": 11.19195467831452,
+          "center_y_mm": -4.273960035926363,
+          "center_z_mm": 47.92099981021925,
+          "deepest_indentation_mm": 1.4475406408309937,
+          "window_points_over_0p2_mm": 1473,
+          "convergence_status": "not_converged",
+          "converged_depth_mm": null,
+          "converged_rmse_mm": null
+        }
+      ],
+      "center_distances_at_fixed_depth": {
+        "1-2": {
+          "distance_mm": 10.865518620402407,
+          "error_mm": 1.6194189852016745
+        },
+        "1-3": {
+          "distance_mm": 21.418061303554435,
+          "error_mm": 2.966770763840966
+        },
+        "2-3": {
+          "distance_mm": 10.607668192744189,
+          "error_mm": 1.3585125742160855
+        }
+      },
+      "distance_rmse_mm": 2.103156598157188
+    }
+  }
+}

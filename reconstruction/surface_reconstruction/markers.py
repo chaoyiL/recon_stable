@@ -33,24 +33,46 @@ MIN_HEIGHT = 2
 MAX_HEIGHT = 30
 
 
-def _analyze_components(gray, roi_rect):
-    """Local threshold; no fixed inset and no erosion of thin cross arms."""
+def _has_four_cross_arms(points, center):
+    """Require four supported arms for a recovered fragmented cross."""
+    dx, dy = (points - center).T
+    for angle in range(0, 90, 15):
+        theta = np.deg2rad(angle)
+        along = dx * np.cos(theta) + dy * np.sin(theta)
+        across = -dx * np.sin(theta) + dy * np.cos(theta)
+        # Four 45-degree sectors represent a pair of perpendicular strokes.
+        limit = np.tan(np.pi / 8)
+        arms = (
+            np.count_nonzero((along >= 2) & (np.abs(across) <= limit * along)),
+            np.count_nonzero((along <= -2) & (np.abs(across) <= -limit * along)),
+            np.count_nonzero((across >= 2) & (np.abs(along) <= limit * across)),
+            np.count_nonzero((across <= -2) & (np.abs(along) <= -limit * across)),
+        )
+        if min(arms) >= 3:
+            return True
+    return False
+
+
+def _has_cross_indents(component):
+    """Require two concave notches, tolerating a missing arm and rotation."""
+    contours, _ = cv2.findContours(component.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    if not contours or len(contours[0]) < 4:
+        return False
+    hull = cv2.convexHull(contours[0], returnPoints=False)
+    if hull is None or len(hull) < 3:
+        return False
+    try:
+        defects = cv2.convexityDefects(contours[0], hull)
+    except cv2.error:
+        return False  # Self-intersecting contours do not define reliable notches.
+    # OpenCV stores notch depth in fixed-point pixels with 8 fractional bits.
+    return defects is not None and np.count_nonzero(defects.reshape(-1, 4)[:, 3] >= 256) >= 2
+
+
+def _component_candidates(binary, contrast, roi_rect):
     x, y, w, h = map(int, roi_rect)
-    if x < 0 or y < 0 or w < 3 or h < 3 or x + w > gray.shape[1] or y + h > gray.shape[0]:
-        raise ValueError("ROI must be a positive rectangle inside the image")
-    # Compute on the full image so the ROI boundary cannot affect thresholding.
-    binary = cv2.adaptiveThreshold(
-        gray,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        LOCAL_BLOCK_SIZE,
-        LOCAL_THRESHOLD_C,
-    )
-    contrast = cv2.morphologyEx(
-        gray, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-    )
-    crop = binary[y : y + h, x : x + w].copy()
+    crop = binary[y:y+h, x:x+w].copy()
     n, labels, stats, _ = cv2.connectedComponentsWithStats(crop, connectivity=8)
     centers, debug, components = [], [], []
     for label in range(1, n):
@@ -66,38 +88,100 @@ def _analyze_components(gray, roi_rect):
             continue
         if not 0.15 <= width / height <= 6.0:
             continue
-        component = labels[top : top + height, left : left + width] == label
-        patch = contrast[y + top : y + top + height, x + left : x + left + width]
+        # Solid occluders are not cross-shaped even when their size and
+        # contrast match a marker. Leave room for thick or distorted arms.
+        if area / (width * height) > 0.8:
+            continue
+        component = labels[top:top+height, left:left+width] == label
+        patch = contrast[y+top:y+top+height, x+left:x+left+width]
         peak = float(patch[component].max())
-        if peak < MIN_PEAK_CONTRAST:
+        if peak < MIN_PEAK_CONTRAST or not _has_cross_indents(component):
             continue
         yy, xx = np.nonzero(component)
         # Local darkness weights reduce the effect of nonuniform illumination.
         weights = patch[component].astype(float)
         cx = x + left + float(np.average(xx, weights=weights))
         cy = y + top + float(np.average(yy, weights=weights))
+        points = np.column_stack((xx+x+left, yy+y+top))
         centers.append([cx, cy])
-        components.append(np.column_stack((xx+x+left, yy+y+top)))
+        components.append(points)
         debug.append(
-            dict(
-                area=area,
-                width=width,
-                height=height,
-                peak_contrast=peak,
-                center=(cx, cy),
-                bbox=(x + left, y + top, width, height),
-            )
+            dict(area=area, width=width, height=height, peak_contrast=peak,
+                 center=(cx, cy), bbox=(x+left, y+top, width, height))
         )
     if len(debug) >= 8:
-        sizes = np.asarray(
-            [(item["width"], item["height"]) for item in debug], dtype=float
-        )
+        sizes = np.asarray([(item["width"], item["height"]) for item in debug], dtype=float)
         min_size = np.maximum((MIN_WIDTH, MIN_HEIGHT), 0.5 * np.median(sizes, axis=0))
         keep = np.all(sizes >= min_size, axis=1)
         centers = np.asarray(centers, dtype=float)[keep].tolist()
         debug = [item for item, accepted in zip(debug, keep) if accepted]
         components = [item for item, accepted in zip(components, keep) if accepted]
     return np.asarray(centers, dtype=float).reshape(-1, 2), crop, debug, components
+
+
+def _fragmented_cross(component, binary, contrast):
+    """Recover only short gaps between four supported arms of a dark cross."""
+    points = component[binary[component[:, 1], component[:, 0]] != 0]
+    if len(points) < MIN_AREA:
+        return None
+    lo, hi = points.min(axis=0), points.max(axis=0)
+    width, height = (hi - lo + 1).tolist()
+    if not 0.5 <= width / height <= 2:
+        return None
+    mask = np.zeros((height, width), np.uint8)
+    mask[points[:, 1]-lo[1], points[:, 0]-lo[0]] = 1
+    count, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if count < 3 or np.count_nonzero(stats[1:, cv2.CC_STAT_AREA] >= 2) < 2:
+        return None
+    weights = contrast[points[:, 1], points[:, 0]].astype(float)
+    if weights.sum() == 0:
+        return None
+    center = np.average(points, axis=0, weights=weights)
+    if not _has_four_cross_arms(points, center):
+        return None
+    info = dict(area=len(points), width=width, height=height,
+                peak_contrast=float(weights.max()), center=tuple(center),
+                bbox=(int(lo[0]), int(lo[1]), width, height))
+    return center, info, points
+
+
+def _analyze_components(gray, roi_rect):
+    """Find crosses, retaining original foreground pixels across small gaps."""
+    x, y, w, h = map(int, roi_rect)
+    if x < 0 or y < 0 or w < 3 or h < 3 or x + w > gray.shape[1] or y + h > gray.shape[0]:
+        raise ValueError("ROI must be a positive rectangle inside the image")
+    # Compute on the full image so the ROI boundary cannot affect thresholding.
+    binary = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV,
+        LOCAL_BLOCK_SIZE, LOCAL_THRESHOLD_C,
+    )
+    contrast = cv2.morphologyEx(
+        gray, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    )
+    centers, crop, debug, components = _component_candidates(binary, contrast, roi_rect)
+
+    # Closing proposes connections only. Existing detections and returned marker
+    # pixels use the original binary so a nearby edge cannot change their masks.
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    _, _, _, proposals = _component_candidates(closed, contrast, roi_rect)
+    accepted_pixels = np.zeros(gray.shape, np.bool_)
+    for component in components:
+        accepted_pixels[component[:, 1], component[:, 0]] = True
+    for component in proposals:
+        if accepted_pixels[component[:, 1], component[:, 0]].any():
+            continue
+        recovered = _fragmented_cross(component, binary, contrast)
+        if recovered is None:
+            continue
+        center, info, points = recovered
+        if len(centers) and np.any(np.linalg.norm(centers-center, axis=1)
+                                   < max(3., .5 * min(info["width"], info["height"]))):
+            continue
+        centers = np.vstack((centers, center))
+        debug.append(info)
+        components.append(points)
+        accepted_pixels[points[:, 1], points[:, 0]] = True
+    return centers, crop, debug, components
 
 
 def _detect_components(gray, roi_rect):
@@ -141,32 +225,87 @@ def filter_centers_by_mask(centers, diagnostics, allowed_mask):
     return centers[keep], [item for item, accepted in zip(diagnostics, keep) if accepted]
 
 
-def _marker_search_mask(frame_mask, roi_rect, diagnostics):
-    """Erode reliable frame edges by one marker size, keeping shadow notches."""
+def _marker_search_mask(frame_mask, diagnostics):
+    """Keep marker centers one typical marker width inside the frame."""
     margin = _marker_edge_margin(diagnostics)
     if margin is None:
         return None
-    x, y, w, h = map(int, roi_rect)
-    box_mask = np.zeros(frame_mask.shape, np.uint8)
-    box_mask[y : y + h, x : x + w] = 1
-    frame_mask = np.asarray(frame_mask, dtype=np.uint8)
-    contour_distance = cv2.distanceTransform(
-        frame_mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE
+    distance = cv2.distanceTransform(
+        np.asarray(frame_mask, dtype=np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE
     )
-    box_distance = cv2.distanceTransform(
-        box_mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE
-    )
-    # The paper contour can cave inward around marker shadows. In those pixels,
-    # use the detected frame rectangle as a fallback rather than clipping marks.
-    distance = np.where(frame_mask != 0, contour_distance, box_distance)
     return distance > margin
 
 
-def find_inner_region(gray):
-    """Find the framed paper interior even when glare breaks a global mask.
+def _matching_frame_mask(gray, threshold, seed, bounds):
+    """Return a closed dark-frame hole matching the seed, if one exists."""
+    binary = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY_INV)[1]
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    contours, hierarchy = cv2.findContours(closed, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    if hierarchy is None:
+        return None
+    seed_area = int(seed.sum())
+    x, y, w, h = bounds
+    dx, dy = max(8, 0.1 * w), max(8, 0.1 * h)
+    matches = []
+    for index, candidate in enumerate(contours):
+        if hierarchy[0, index, 3] < 0:
+            continue
+        area = cv2.contourArea(candidate)
+        if not 0.96 * seed_area <= area <= 1.35 * seed_area:
+            continue
+        cx, cy, cw, ch = cv2.boundingRect(candidate)
+        if (cx < x - dx or cy < y - dy
+                or cx + cw > x + w + dx or cy + ch > y + h + dy):
+            continue
+        mask = np.zeros(gray.shape, np.uint8)
+        cv2.drawContours(mask, [candidate], -1, 1, cv2.FILLED)
+        overlap = np.count_nonzero(seed & mask)
+        # Reject a frame break that leaks into the bright surroundings.
+        if overlap >= 0.98 * seed_area:
+            matches.append((overlap / int(mask.sum()), mask))
+    return max(matches, key=lambda item: item[0])[1] if matches else None
 
-    Closing is applied only to the frame search, never to mark localization.
-    A bounding rectangle retains marks in shadows that indent the white contour.
+
+def _refine_inner_contour(gray, contour):
+    """Trace the dark frame around a candidate without filling real concavities.
+
+    The candidate may exclude dark paper connected to the frame in an Otsu
+    threshold. Estimate the frame and paper levels near that candidate and
+    search for a lower threshold that still forms a closed, matching frame.
+    """
+    seed = np.zeros(gray.shape, np.uint8)
+    cv2.drawContours(seed, [contour], -1, 1, cv2.FILLED)
+    near = np.ones((7, 7), np.uint8)
+    far = np.ones((21, 21), np.uint8)
+    outside = (cv2.dilate(seed, near) != 0) & (seed == 0)
+    inside = (cv2.erode(seed, near) != 0) & (cv2.erode(seed, far) == 0)
+    if outside.any() and inside.any():
+        frame_level = float(np.median(gray[outside]))
+        paper_level = float(np.percentile(gray[inside], 10))
+        if paper_level - frame_level >= 8:
+            for fraction in (0.2, 0.3, 0.4, 0.5, 0.65, 0.8, 0.95):
+                threshold = frame_level + fraction * (paper_level - frame_level)
+                match = _matching_frame_mask(gray, threshold, seed, cv2.boundingRect(contour))
+                if match is not None:
+                    seed = match
+                    break
+
+    # OpenCV's hole contour includes the adjacent foreground pixel. Removing
+    # that pixel keeps the returned interior on the paper side of the frame.
+    seed = cv2.erode(seed, np.ones((3, 3), np.uint8))
+    contours, _ = cv2.findContours(seed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contour = max(contours, key=cv2.contourArea)
+    mask = np.zeros(gray.shape, np.uint8)
+    cv2.drawContours(mask, [contour], -1, 1, cv2.FILLED)
+    return contour, mask.astype(bool)
+
+
+def find_inner_region(gray):
+    """Find the framed paper interior and an inset marker search region.
+
+    Thresholding and closing locate the frame only; marker localization uses
+    the original grayscale image. A darker threshold recovers shaded paper
+    while preserving the shape of a closed black frame.
     """
     local = cv2.adaptiveThreshold(
         gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 51, 7
@@ -189,11 +328,8 @@ def find_inner_region(gray):
                 continue
             if rect not in candidates:
                 _, _, diagnostics, _ = _analyze_components(gray, rect)
-                contour_mask = np.zeros(gray.shape, np.uint8)
-                cv2.drawContours(contour_mask, [contour], -1, 1, cv2.FILLED)
-                marker_mask = _marker_search_mask(
-                    contour_mask, rect, diagnostics
-                )
+                refined_contour, mask = _refine_inner_contour(gray, contour)
+                marker_mask = _marker_search_mask(mask, diagnostics)
                 if marker_mask is None:
                     continue
                 search_roi = cv2.boundingRect(marker_mask.astype(np.uint8))
@@ -205,18 +341,26 @@ def find_inner_region(gray):
                 )
                 if len(centers) >= 8:
                     candidates[rect] = (
-                        (len(centers), -area), search_roi, contour.copy(), marker_mask
+                        (len(centers), -area), search_roi, refined_contour, mask, marker_mask
                     )
     if not candidates:
         raise RuntimeError(
             "Paper border not found; show the complete marked region for initialization"
         )
-    candidate = max(candidates.values(), key=lambda value: value[0])
-    _, roi, contour, marker_mask = candidate
-    mask = np.zeros(gray.shape, np.uint8)
-    cv2.drawContours(mask, [contour], -1, 1, cv2.FILLED)
-    return InnerRegion(roi, contour, mask.astype(bool), marker_mask)
+    _, roi, contour, mask, marker_mask = max(
+        candidates.values(), key=lambda value: value[0]
+    )
+    return InnerRegion(roi, contour, mask, marker_mask)
 
+
+def find_tracking_region(tracking_bgr):
+    """Find the framed region in luminance or the strongest color channel."""
+    gray = cv2.cvtColor(tracking_bgr, cv2.COLOR_BGR2GRAY)
+    try:
+        return gray, find_inner_region(gray)
+    except RuntimeError:
+        strongest_channel = tracking_bgr.max(axis=2)
+        return strongest_channel, find_inner_region(strongest_channel)
 
 
 def find_inner_roi(gray):

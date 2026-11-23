@@ -5,7 +5,7 @@ led_controller:
   right: 4
   bottom: 9
   left: 4
-  skip: 3
+  skip: 1
   # 2026-11-02 实拍校正；保留四边配色，在输出 PWM 时衰减蓝通道。
   brightness: 30
   rgb_scale: [1.0, 1.0, 0.35]
@@ -46,9 +46,11 @@ get_surface:
     row_direction: auto
 
 # 接触面相对 marker 曲面沿模板 X×Y 法向的有符号距离，单位 mm。
-# 标定和完整重建共用；独立整体重建仍输出 marker 曲面。
+# 标定和完整重建共用；独立整体重建默认输出 marker 曲面。
 contact_surface:
   offset_mm: 7.0
+  # 从 marker 外推接缝向两侧过渡的半宽，单位 mm。高斯标准差为半宽的 1/4，0 关闭平滑。
+  curvature_smoothing_half_width_mm: 2.0
 
 # 三套网格共用冻结参考弧长图；coordinates 为反解的原生材料参数，st 为规则弧长坐标。
 material_coordinates:
@@ -64,36 +66,60 @@ material_coordinates:
 
 # 图片模式读取线性 NPZ；历史相机 PNG 仅在统一读取入口解码。
 normal_calibration:
+  # 同时决定生成方法和重建读取的方法：table / mlp3 / mlp5 / mlp6 / mlp8。
+  # mlp3: ΔRGB；mlp5: ΔRGB + st；mlp6: ΔRGB + 曲率；mlp8: ΔRGB + st + 曲率。
+  # 曲率分量为整体基准面局部切基下的 k11、k12、k22，单位 mm⁻¹。
+  method: table
+  lut_dir: lut
   input_mode: images
   images: ["assets/cali_norm_pics/*.npz"]
   reference_image: assets/reference.npz
-  sphere_radius_mm: 3
+  sphere_radius_mm: 4
   sphere_side: positive_normal
   boundary_model: zero_boundary_displacement
   annotations_file: assets/normal_calibration/manual_regions.yaml
-  work_dir: assets/normal_calibration
-  input_file: assets/normal_calibration/normal_samples.npz
-  output: assets/normal_calibration/normal_lut.npz
+  # 原图中接触轮廓向外扩张的像素半径，用于背景检查与光场训练采样。
+  background_contact_exclusion_margin_px: 40
+  work_dir: assets/normal_calibration/black_frame
+  input_file: assets/normal_calibration/black_frame/normal_samples.npz
   lut_size: 64
   maximum_rms_angle_degrees: 5.0
+  mlp:
+    seed: 42
+    epochs: 200
+    patience: 20
+    learning_rate: 0.001
+    batch_size: 1024
+    # 仅从外层训练图片中划出早停开发集。
+    validation_fraction: 0.2
   checks:
     background_max_abs: 0.1
     background_min_fraction: 0.1
     validation_fraction: 0.2
     validation_rms_degrees: 20.0
     maximum_out_of_range_fraction: 0.05
+    # 逐图最多允许 5% 的标签点缺少模型支持；误差仍统计全部标签点。
+    maximum_unsupported_fraction: 0.05
+
+# 按位移图中从上到下（网格行、列排序）配置各压痕对应的真实球半径，单位 mm。
+indentation_analysis:
+  sphere_radii_mm: [2.0, 1.5, 1.0]
+  depth_scan:
+    step_mm: 0.02
+    min_fit_points: 100
+    stable_steps: 5
+    rmse_atol_mm: 0.005
+    rmse_rtol: 0.01
 
 reconstruction:
   reference_image: assets/reference.npz
-  # 图片法向标定通过后，根据本批 reference 自动重建此网格。
-  material_grid_file: assets/normal_calibration/lut_material_grid.npz
+  # 模型与材料网格按 normal_calibration.method 从 lut/ 的同一版本读取。
   # 重建结果 NPZ 保存到 output_dir/pc，完整重建的预览 PNG 保存到 assets/reconstruction/pics。
   output_dir: assets/reconstruction
   # 求解网格按当前整体曲面的实际长宽配比，长边点数取 observation 的较大维度。
   match_surface_aspect: true
 
 local_reconstruction:
-  calibration_file: assets/normal_calibration/normal_lut.npz
   input_file: null
   output_file: null
   zero_color_protection:

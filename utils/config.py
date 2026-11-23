@@ -85,7 +85,7 @@ def load_contact_surface_offset_mm(config_path: str | Path) -> float:
     section = load_config(config_path).get("contact_surface")
     if not isinstance(section, Mapping) or "offset_mm" not in section:
         raise ConfigError("contact_surface.offset_mm 必须明确配置")
-    unknown = set(section) - {"offset_mm"}
+    unknown = set(section) - {"offset_mm", "curvature_smoothing_half_width_mm"}
     if unknown:
         raise ConfigError(f"contact_surface 包含未知字段: {sorted(unknown)}")
     value = section["offset_mm"]
@@ -98,6 +98,24 @@ def load_contact_surface_offset_mm(config_path: str | Path) -> float:
     if not math.isfinite(offset):
         raise ConfigError("contact_surface.offset_mm 必须是有限数字，单位 mm")
     return offset
+
+
+def get_curvature_smoothing_half_width_mm(config: Mapping[str, Any]) -> float:
+    """Read the physical half-width of the marker-border curvature transition."""
+    section = config.get("contact_surface", {})
+    if not isinstance(section, Mapping):
+        raise ConfigError("contact_surface 必须是字典")
+    value = section.get("curvature_smoothing_half_width_mm", 0.0)
+    message = "contact_surface.curvature_smoothing_half_width_mm 必须是有限非负数"
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ConfigError(message)
+    try:
+        width = float(value)
+    except OverflowError as error:
+        raise ConfigError(message) from error
+    if not math.isfinite(width) or width < 0:
+        raise ConfigError(message)
+    return width
 
 
 def require_keys(section: Mapping[str, Any], section_name: str, *keys: str) -> None:

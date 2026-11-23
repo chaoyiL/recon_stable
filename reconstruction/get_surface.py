@@ -11,13 +11,15 @@ from pathlib import Path
 import numpy as np
 
 from utils.color_difference import CAMERA_RGB_TRANSFER_FUNCTION
-from utils.config import ConfigError, load_config, load_contact_surface_offset_mm
+from utils.config import (ConfigError, get_curvature_smoothing_half_width_mm, load_config,
+                          load_contact_surface_offset_mm)
 from utils.image_io import load_linear_image, linear_rgb_to_tracking_bgr8, validate_linear_rgb
 from utils.reconstruction_interface import (
     MaterialCoordinateSystems,
     OverallReconstructionProvider,
     load_material_coordinate_specs,
 )
+from utils.surface_curvature import compute_surface_curvature
 from reconstruction.surface_reconstruction.run_reconstruction import SurfaceReconstructionProvider
 
 
@@ -60,6 +62,7 @@ def build_reconstruction_provider(
         raise ConfigError(
             "get_surface.overall_reconstruction.provider 必须是 marker_bicubic"
         )
+    get_curvature_smoothing_half_width_mm(config)
     config_file = raw.get("config_file")
     if not isinstance(config_file, str) or not config_file.strip():
         raise ConfigError(
@@ -88,6 +91,7 @@ def save_material_coordinates(
     surface_coefficients=None,
     geometry_stage="final",
     metadata=None,
+    curvature_smoothing_half_width_mm: float | None = None,
 ) -> Path:
     """保存几何网格及其 float32 线性 RGB 观测帧。"""
     output = Path(output_path).expanduser()
@@ -121,6 +125,11 @@ def save_material_coordinates(
         "dist_coeffs": np.asarray(provider.session.distortion, np.float64),
         "template_xy_mm": np.asarray(provider.session.xy, np.float64),
     }
+    if curvature_smoothing_half_width_mm is not None:
+        curvature = compute_surface_curvature(
+            observation.xyz, observation.valid_mask, observation.coordinates, provider.session.xy,
+            smoothing_half_width_mm=curvature_smoothing_half_width_mm)
+        values.update(curvature.npz_fields(), contact_offset_mm=np.asarray(provider.contact_offset_mm))
     if observation.st is not None:
         from utils.surface_coordinates import save_arclength_chart, FRAME_CONVENTION
         chart = provider.coordinate_chart
@@ -133,6 +142,7 @@ def save_material_coordinates(
                       coordinate_kind=np.asarray(observation.coordinate_kind),
                       coordinate_chart_id=np.asarray(observation.chart_id),
                       coordinate_chart_file=np.asarray(os.path.relpath(chart_file, output.resolve().parent)),
+                      domain_kind=np.asarray(chart.domain_kind),
                       frame_convention=np.asarray(FRAME_CONVENTION),
                       material_bounds_mm=np.asarray(chart.parameter_bounds, np.float64))
     for name in ("geometry", "lightfield", "observation"):
@@ -203,17 +213,20 @@ def main() -> None:
     parser.add_argument("--image", required=True)
     parser.add_argument("--output", required=True, help="输出三套材料坐标 NPZ")
     parser.add_argument("--coordinate-reference", help="复用已有参考弧长坐标图 NPZ")
+    parser.add_argument("--contact-surface", action="store_true", help="输出法向偏移后的整体接触面")
     args = parser.parse_args()
     image = load_linear_image(Path(args.image).expanduser())
-    provider = build_reconstruction_provider(args.config)
+    provider = build_reconstruction_provider(args.config, contact_surface=args.contact_surface)
     if args.coordinate_reference:
         from utils.surface_coordinates import load_arclength_chart
         provider.bind_coordinate_chart(load_arclength_chart(args.coordinate_reference))
         provider.coordinate_chart_file = Path(args.coordinate_reference).expanduser().resolve()
     systems = reconstruct_material_coordinates(image, provider, args.config)
     mask = provider.last_frame_result["inner_region"].mask
-    output = save_material_coordinates(args.output, systems, mask, image, provider,
-                                       metadata={"source_image": str(Path(args.image).expanduser().resolve())})
+    output = save_material_coordinates(
+        args.output, systems, mask, image, provider,
+        metadata={"source_image": str(Path(args.image).expanduser().resolve())},
+        curvature_smoothing_half_width_mm=get_curvature_smoothing_half_width_mm(load_config(args.config)))
     print(f"三套材料坐标已保存: {output}")
 
 
